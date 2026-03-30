@@ -1,0 +1,6 @@
+package my:crontab;
+
+world crontab {
+    import custom:crontab/scheduler@0.1.0;
+    export custom:crontab/handler@0.1.0;
+}
