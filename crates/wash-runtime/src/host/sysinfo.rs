@@ -1,5 +1,5 @@
 use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
-use tracing::debug;
+use tracing::trace;
 
 /// A wrapper around [`System`] to provide a higher-level API for monitoring system resources.
 #[derive(Debug, Default)]
@@ -49,7 +49,7 @@ impl SystemMonitor {
         let mem = self.memory_usage();
         let cpu = self.cpu_usage();
 
-        debug!(
+        trace!(
             total_memory_mb = mem.total_memory / 1_048_576,
             used_memory_mb = mem.used_memory / 1_048_576,
             available_memory_mb = mem.available_memory / 1_048_576,
@@ -57,7 +57,7 @@ impl SystemMonitor {
             "Memory usage"
         );
 
-        debug!(
+        trace!(
             global_cpu_usage = cpu.global_usage,
             cpu_count = cpu.cpu_count,
             "CPU usage"

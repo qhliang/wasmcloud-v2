@@ -65,7 +65,7 @@ impl CliCommand for DevCommand {
 
         // Enable wasi config
         host_builder =
-            host_builder.with_plugin(Arc::new(plugin::wasi_config::DynamicConfig::default()))?;
+            host_builder.with_plugin(Arc::new(plugin::wasi_config::DynamicConfig::new(true)))?;
 
         // Enable wasmcloud:messaging
         host_builder = host_builder.with_plugin(Arc::new(
@@ -81,6 +81,10 @@ impl CliCommand for DevCommand {
                 path = %blobstore_path.display(),
                 "WASI Blobstore plugin registered with filesystem backend"
             );
+        } else if let Some(_) = &dev_config.wasi_blobstore_cloudflare {
+            host_builder =
+                host_builder.with_plugin(Arc::new(custom_plugin_cf_r2::CloudflareR2::new()))?;
+            debug!("WASI Blobstore plugin registered with Cloudflare backend");
         } else {
             host_builder = host_builder.with_plugin(Arc::new(
                 plugin::wasi_blobstore::InMemoryBlobstore::default(),
@@ -162,11 +166,24 @@ impl CliCommand for DevCommand {
                 path = %keyvalue_path.display(),
                 "WASI KeyValue plugin registered with filesystem backend"
             );
+        } else if let Some(_) = &dev_config.wasi_keyvalue_cloudflare {
+            host_builder = host_builder
+                .with_plugin(Arc::new(custom_plugin_cf_kv::CloudflareKeyValue::new()))?;
+            debug!("WASI KeyValue plugin registered with Cloudflare backend");
         } else {
             host_builder = host_builder
                 .with_plugin(Arc::new(plugin::wasi_keyvalue::InMemoryKeyValue::default()))?;
             debug!("WASI KeyValue plugin registered with in-memory backend");
         }
+        // Enable Cloudflare D1 plugin (always loaded by default)
+        host_builder =
+            host_builder.with_plugin(Arc::new(custom_plugin_cf_d1::CloudflareD1::new()))?;
+        debug!("Cloudflare D1 plugin enabled");
+
+        // Enable LLM gateway plugin
+        host_builder =
+            host_builder.with_plugin(Arc::new(custom_plugin_llm_gateway::LlmGateway::new()))?;
+        debug!("LLM gateway plugin enabled");
 
         // Add postgres plugin if configured
         if let Some(postgres_url) = &dev_config.postgres_url {
@@ -379,11 +396,17 @@ async fn create_workload(host: &Host, config: &Config, bytes: Bytes) -> anyhow::
             digest: None,
             local_resources: LocalResources {
                 volume_mounts: volume_mounts.clone(),
+                environment: dev_component.config.clone(),
                 ..Default::default()
             },
             pool_size: -1,
             max_invocations: -1,
         });
+
+        debug!(
+            "new component config added, component id: {}, config: {:?}",
+            dev_component.name, dev_component.config
+        );
     }
 
     debug!("workload host interfaces: {:?}", host_interfaces);

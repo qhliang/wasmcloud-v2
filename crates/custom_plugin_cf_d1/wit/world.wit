@@ -1,0 +1,6 @@
+package my:d1;
+
+
+world d1 {
+    import custom:cf-d1/query@0.1.0;
+}

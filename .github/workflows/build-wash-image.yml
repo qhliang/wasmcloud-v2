@@ -1,0 +1,21 @@
+name: build-wash-image
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-push:
+    permissions:
+      contents: write
+      packages: write
+    uses: ./.github/workflows/docker-build-push.yml
+    secrets: inherit
+    with:
+      push: true
+      image: ghcr.io/qhliang/wash
+      working-directory: .
+      file: ./Dockerfile
+      tags: |
+        type=raw,value=custom-v1-alpha

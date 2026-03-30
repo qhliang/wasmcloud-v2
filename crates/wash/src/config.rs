@@ -129,6 +129,9 @@ pub struct DevComponent {
     pub name: String,
     /// Path to the component file
     pub file: PathBuf,
+    /// Configuration values for the component
+    #[serde(default)]
+    pub config: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -187,9 +190,17 @@ pub struct DevConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wasi_keyvalue_nats_url: Option<String>,
 
+    /// Optional Cloudflare for the WASI keyvalue plugin.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wasi_keyvalue_cloudflare: Option<String>,
+
     /// Optional path for WASI blobstore filesystem storage. If not set, an in-memory store is used.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wasi_blobstore_path: Option<PathBuf>,
+
+    /// Optional Cloudflare for the WASI blobstore plugin.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wasi_blobstore_cloudflare: Option<String>,
 
     /// Optional PostgreSQL connection URL for the wasmcloud:postgres plugin.
     /// Example: postgres://user:pass@bouncer:6432?sslmode=require&pool_size=10

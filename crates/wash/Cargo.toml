@@ -56,6 +56,10 @@ wasm-pkg-client = { workspace = true }
 wasm-pkg-core = { workspace = true }
 wash-runtime = { workspace = true, features = ["washlet", "oci", "wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "wasmcloud-postgres", "wasi-otel"] }
 wit-component = { workspace = true }
+custom_plugin_cf_kv = { path = "../custom_plugin_cf_kv" }
+custom_plugin_cf_r2 = { path = "../custom_plugin_cf_r2" }
+custom_plugin_cf_d1 = { path = "../custom_plugin_cf_d1" }
+custom_plugin_llm_gateway = { path = "../custom_plugin_llm_gateway" }
 
 # Enable WebGPU support on non-Windows platforms
 # WebGPU is disabled on Windows due to dependency version conflicts with the windows crate

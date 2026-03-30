@@ -2,6 +2,10 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Context as _;
 use clap::Args;
+use custom_plugin_cf_d1::CloudflareD1;
+use custom_plugin_cf_kv::CloudflareKeyValue;
+use custom_plugin_cf_r2::CloudflareR2;
+use custom_plugin_llm_gateway::LlmGateway;
 use tracing::info;
 use wash_runtime::{
     engine::Engine,
@@ -10,6 +14,20 @@ use wash_runtime::{
 };
 
 use crate::cli::{CliCommand, CliContext, CommandOutput};
+
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
+pub enum KeyValueBackendType {
+    #[default]
+    Nats,
+    Cloudflare,
+}
+
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
+pub enum BlobstoreBackendType {
+    #[default]
+    Nats,
+    Cloudflare,
+}
 
 #[derive(Debug, Clone, Args)]
 pub struct HostCommand {
@@ -90,6 +108,14 @@ pub struct HostCommand {
     /// Enable WASI OpenTelemetry plugin
     #[arg(long = "wasi-otel", default_value_t = false)]
     pub wasi_otel: bool,
+
+    /// The keyvalue backend to use
+    #[clap(long = "keyvalue-backend", env = "KEYVALUE_BACKEND")]
+    pub keyvalue_backend: KeyValueBackendType,
+
+    /// The blobstore backend to use
+    #[clap(long = "blobstore-backend", env = "BLOBSTORE_BACKEND")]
+    pub blobstore_backend: BlobstoreBackendType,
 }
 
 impl CliCommand for HostCommand {
@@ -143,16 +169,48 @@ impl CliCommand for HostCommand {
             .with_host_group(self.host_group.clone())
             .with_plugin(Arc::new(plugin::wasi_config::DynamicConfig::new(true)))?
             .with_plugin(Arc::new(plugin::wasi_logging::TracingLogger::default()))?
-            .with_plugin(Arc::new(plugin::wasi_blobstore::NatsBlobstore::new(
-                &data_nats_client,
-            )))?
             .with_plugin(Arc::new(plugin::wasmcloud_messaging::NatsMessaging::new(
                 data_nats_client.clone(),
             )))?
-            .with_plugin(Arc::new(plugin::wasi_keyvalue::NatsKeyValue::new(
-                &data_nats_client,
-            )))?
             .with_meters(Meters::new(ctx.enable_meters()));
+
+        // Enable keyvalue plugin
+        match self.keyvalue_backend {
+            KeyValueBackendType::Nats => {
+                cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(
+                    plugin::wasi_keyvalue::NatsKeyValue::new(&data_nats_client),
+                ))?;
+                tracing::info!("Nats keyvalue plugin enabled");
+            }
+            KeyValueBackendType::Cloudflare => {
+                cluster_host_builder =
+                    cluster_host_builder.with_plugin(Arc::new(CloudflareKeyValue::new()))?;
+                tracing::info!("Cloudflare keyvalue plugin enabled");
+            }
+        }
+
+        // Enable blobstore plugin
+        match self.blobstore_backend {
+            BlobstoreBackendType::Nats => {
+                cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(
+                    plugin::wasi_blobstore::NatsBlobstore::new(&data_nats_client),
+                ))?;
+                tracing::info!("Nats blobstore plugin enabled");
+            }
+            BlobstoreBackendType::Cloudflare => {
+                cluster_host_builder =
+                    cluster_host_builder.with_plugin(Arc::new(CloudflareR2::new()))?;
+                tracing::info!("Cloudflare R2 blobstore plugin enabled");
+            }
+        }
+
+        // Enable Cloudflare D1 plugin (always loaded by default)
+        cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(CloudflareD1::new()))?;
+        tracing::info!("Cloudflare D1 plugin enabled");
+
+        // Enable LLM gateway plugin
+        cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(LlmGateway::new()))?;
+        tracing::info!("LLM gateway plugin enabled");
 
         if let Some(postgres_url) = &self.postgres_url {
             cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(

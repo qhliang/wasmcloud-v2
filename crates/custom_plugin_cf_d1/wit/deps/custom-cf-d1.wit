@@ -1,0 +1,82 @@
+package custom:cf-d1@0.1.0;
+
+/// Types used by components and providers of the Cloudflare D1 interface
+interface types {
+    /// Errors that can occur when executing SQL queries
+    variant query-error {
+        /// Invalid query syntax
+        invalid-query(string),
+        /// Invalid parameters
+        invalid-params(string),
+        /// Database error
+        database-error(string),
+        /// Connection or authentication error
+        connection-error(string),
+        /// Unexpected error
+        unexpected(string),
+    }
+
+    /// A column value from a query result
+    variant column-value {
+        null,
+        integer(s64),
+        real(f64),
+        text(string),
+        blob(list<u8>),
+    }
+
+    /// A single row from a query result
+    record result-row {
+        /// Column values in order
+        values: list<column-value>,
+    }
+
+    /// Metadata about a column in the result
+    record column-meta {
+        /// Column name
+        name: string,
+        /// Column type (SQLite type name)
+        column-type: option<string>,
+    }
+
+    /// Result of multiple query execution
+    record query-result {
+        /// Column metadata
+        columns: list<column-meta>,
+        /// Result rows
+        rows: list<result-row>,
+        /// Number of rows affected (for INSERT, UPDATE, DELETE)
+        rows-affected: u64,
+        /// Last inserted row ID (for INSERT)
+        last-insert-rowid: option<s64>,
+    }
+}
+
+/// Interface for executing SQL queries against Cloudflare D1
+interface query {
+    use types.{query-error, query-result, column-value, result-row};
+
+    /// Execute a SQL query with parameters
+    ///
+    /// Parameters use SQLite syntax: ?, ?1, ?2, etc.
+    ///
+    /// Example:
+    /// ```sql
+    /// SELECT * FROM users WHERE id = ? AND status = ?
+    /// ```
+    query: func(sql: string, params: list<column-value>) -> result<query-result, query-error>;
+
+    /// Execute a batch of SQL statements (no parameters allowed)
+    ///
+    /// Useful for migrations or multiple statements.
+    /// Each statement is executed in sequence.
+    query-batch: func(sql: string) -> result<list<query-result>, query-error>;
+
+    /// Execute a SQL query and return only the first row
+    query-one: func(sql: string, params: list<column-value>) -> result<option<result-row>, query-error>;
+}
+
+/// World defining the D1 database interface
+world d1 {
+    import query;
+}

@@ -1,0 +1,78 @@
+package custom:llm-gateway@0.1.0;
+
+/// Types used by components and providers of the LLM Gateway interface
+interface types {
+    /// Errors that can occur when calling LLM providers
+    variant llm-error {
+        /// Invalid request (bad parameters, empty messages, etc.)
+        invalid-request(string),
+        /// Authentication error (invalid API key, etc.)
+        authentication-error(string),
+        /// Provider-side error (upstream API failure)
+        provider-error(string),
+        /// Rate limit exceeded
+        rate-limit-error(string),
+        /// Model not found or not available
+        model-not-found(string),
+        /// Unexpected error
+        unexpected(string),
+    }
+
+    /// A single message in a chat conversation
+    record chat-message {
+        /// Role: "system", "user", or "assistant"
+        role: string,
+        /// Message content text
+        content: string,
+    }
+
+    /// Token usage statistics
+    record token-usage {
+        /// Number of tokens in the prompt
+        prompt-tokens: u64,
+        /// Number of tokens in the completion
+        completion-tokens: u64,
+        /// Total tokens used
+        total-tokens: u64,
+    }
+
+    /// Response from a chat completion
+    record chat-response {
+        /// The generated text content
+        content: string,
+        /// The model that was used (may differ from requested model)
+        model: string,
+        /// Token usage statistics, if available
+        usage: option<token-usage>,
+        /// Reason the generation finished (e.g., "stop", "length")
+        finish-reason: option<string>,
+    }
+
+    /// Options for chat completion
+    record chat-options {
+        /// Sampling temperature (0.0 - 2.0)
+        temperature: option<f32>,
+        /// Maximum tokens to generate
+        max-tokens: option<u32>,
+        /// Top-p sampling parameter
+        top-p: option<f32>,
+    }
+}
+
+/// Interface for LLM chat completions
+interface chat {
+    use types.{llm-error, chat-message, chat-response, chat-options};
+
+    /// Execute a chat completion request.
+    ///
+    /// Sends a list of messages to the specified model and returns the
+    /// assistant's response. The model name determines which provider is
+    /// used (e.g., "gpt-4o-mini" for OpenAI, "claude-3-haiku" for Anthropic,
+    /// "gemini-2.0-flash" for Gemini, "deepseek-chat" for DeepSeek).
+    chat: func(model: string, messages: list<chat-message>, options: option<chat-options>) -> result<chat-response, llm-error>;
+}
+
+/// World defining the LLM Gateway interface
+world llm-gateway {
+    import chat;
+}

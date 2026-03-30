@@ -4,6 +4,10 @@ default-members = ["crates/wash"]
 members = [
     "crates/wash-runtime",
     "crates/wash",
+    "crates/custom_plugin_cf_kv",
+    "crates/custom_plugin_cf_r2",
+    "crates/custom_plugin_cf_d1",
+    "crates/custom_plugin_llm_gateway"
 ]
 
 [workspace.package]
@@ -119,6 +123,7 @@ wasmtime-wasi-http = { version = "42", default-features = false }
 wit-component = { version = "0.244.0", default-features = false }
 wash-runtime = { path = "crates/wash-runtime", default-features = false }
 wat = { version = "1.244.0", default-features = false }
+indexmap = { version = "2.13.0", default-features = false, features = ["std", "serde", "rayon", "sval", "arbitrary"] }
 
 # postgres deps
 bigdecimal = { version = "0.4", default-features = false }
@@ -153,3 +158,9 @@ ignored = [
 [patch.crates-io]
 # Pinned for async component support (fixes #187). Remove after https://github.com/bytecodealliance/rust-oci-wasm/issues/28
 oci-wasm = { git = "https://github.com/bytecodealliance/rust-oci-wasm", rev = "5ee16fa1" }
+
+[profile.release]
+# Optimize for small code size
+lto = true
+opt-level = "s"
+strip = true

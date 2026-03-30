@@ -1,0 +1,28 @@
+[package]
+name = "custom_plugin_llm_gateway"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+description = "Custom host plugin for LLM Gateway using genai multi-provider library"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+wasmtime = { workspace = true }
+opentelemetry = { workspace = true, features = ["trace", "metrics"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+wash-runtime = { path = "../wash-runtime" }
+
+# Multi-provider LLM library
+genai = "0.6.0-beta.11"
