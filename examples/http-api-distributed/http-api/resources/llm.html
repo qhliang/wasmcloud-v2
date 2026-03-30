@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LLM Gateway</title>
+    <style>
+{BASE_CSS}
+        .chat-container {
+            background: #fafafa;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            padding: 16px;
+            margin-top: 12px;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .chat-msg {
+            margin-bottom: 12px;
+            padding: 10px 14px;
+            border-radius: 8px;
+            max-width: 85%;
+            word-break: break-word;
+            white-space: pre-wrap;
+        }
+        .chat-msg.user {
+            background: #0066cc;
+            color: white;
+            margin-left: auto;
+            text-align: right;
+        }
+        .chat-msg.assistant {
+            background: #e8e8e8;
+            color: #333;
+        }
+        .chat-meta {
+            font-size: 11px;
+            color: #888;
+            margin-top: 4px;
+        }
+        .options-row {
+            display: flex;
+            gap: 12px;
+        }
+        .options-row > div { flex: 1; }
+        .options-row label { font-size: 12px; }
+        .options-row input { font-size: 13px; padding: 8px; }
+    </style>
+</head>
+<body>
+    <h1>LLM Gateway</h1>
+    {NAV}
+
+    <div class="section">
+        <h2>Chat</h2>
+        <label for="model">Model</label>
+        <input type="text" id="model" value="deepseek-chat" placeholder="e.g. gpt-4o-mini, claude-3-haiku, gemini-2.0-flash, deepseek-chat">
+
+        <label for="systemPrompt">System Prompt (optional)</label>
+        <textarea id="systemPrompt" rows="2" placeholder="You are a helpful assistant..."></textarea>
+
+        <label for="userMessage">Message</label>
+        <textarea id="userMessage" rows="3" placeholder="Type your message here..."></textarea>
+
+        <div class="options-row">
+            <div>
+                <label for="temperature">Temperature</label>
+                <input type="number" id="temperature" value="0.7" min="0" max="2" step="0.1">
+            </div>
+            <div>
+                <label for="maxTokens">Max Tokens</label>
+                <input type="number" id="maxTokens" value="4096" min="1" step="1">
+            </div>
+            <div>
+                <label for="topP">Top P</label>
+                <input type="number" id="topP" value="1.0" min="0" max="1" step="0.05">
+            </div>
+        </div>
+
+        <button onclick="sendMessage()" id="sendBtn">Send</button>
+        <button onclick="clearChat()" style="background:#666;">Clear Chat</button>
+
+        <div id="chatContainer" class="chat-container"></div>
+        <div id="chatResult" class="result"></div>
+    </div>
+
+    <script>
+{BASE_JS}
+        const chatHistory = [];
+
+        async function sendMessage() {
+            const model = document.getElementById('model').value.trim();
+            const systemPrompt = document.getElementById('systemPrompt').value.trim();
+            const userMsg = document.getElementById('userMessage').value.trim();
+            const temperature = parseFloat(document.getElementById('temperature').value);
+            const maxTokens = parseInt(document.getElementById('maxTokens').value);
+            const topP = parseFloat(document.getElementById('topP').value);
+
+            if (!model) { showResult('chatResult', 'Model is required', true); return; }
+            if (!userMsg) { showResult('chatResult', 'Message is required', true); return; }
+
+            const messages = [];
+            if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
+            chatHistory.forEach(m => messages.push(m));
+            messages.push({ role: 'user', content: userMsg });
+
+            appendChatMessage('user', userMsg);
+            chatHistory.push({ role: 'user', content: userMsg });
+
+            const sendBtn = document.getElementById('sendBtn');
+            sendBtn.disabled = true;
+            sendBtn.textContent = 'Thinking...';
+
+            try {
+                const resp = await fetch('/llm/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ model, messages, options: { temperature, max_tokens: maxTokens, top_p: topP } })
+                });
+                const data = await resp.json();
+                if (!resp.ok) {
+                    showResult('chatResult', 'Error: ' + (data.error || JSON.stringify(data, null, 2)), true);
+                    chatHistory.pop();
+                    return;
+                }
+                appendChatMessage('assistant', data.content, { model: data.model, usage: data.usage, finish_reason: data.finish_reason });
+                chatHistory.push({ role: 'assistant', content: data.content });
+                document.getElementById('chatResult').style.display = 'none';
+            } catch (e) {
+                showResult('chatResult', 'Error: ' + e.message, true);
+                chatHistory.pop();
+            } finally {
+                sendBtn.disabled = false;
+                sendBtn.textContent = 'Send';
+            }
+        }
+
+        function appendChatMessage(role, content, meta) {
+            const container = document.getElementById('chatContainer');
+            const div = document.createElement('div');
+            div.className = 'chat-msg ' + role;
+            div.textContent = content;
+            if (meta) {
+                const metaDiv = document.createElement('div');
+                metaDiv.className = 'chat-meta';
+                let text = 'Model: ' + (meta.model || 'unknown');
+                if (meta.usage) text += ' | Tokens: ' + (meta.usage.total_tokens || '?');
+                if (meta.finish_reason) text += ' | Finish: ' + meta.finish_reason;
+                metaDiv.textContent = text;
+                div.appendChild(metaDiv);
+            }
+            container.appendChild(div);
+            container.scrollTop = container.scrollHeight;
+        }
+
+        function clearChat() {
+            chatHistory.length = 0;
+            document.getElementById('chatContainer').innerHTML = '';
+            document.getElementById('chatResult').style.display = 'none';
+        }
+
+        document.getElementById('userMessage').addEventListener('keydown', function(e) {
+            if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); sendMessage(); }
+        });
+    </script>
+</body>
+</html>
