@@ -2,7 +2,7 @@
 resolver = "3"
 package.edition = "2024"
 package.authors = ["The wasmCloud Team"]
-members = ["http-api", "task-kv", "task-leet", "cf-kv", "cf-r2"]
+members = ["http-api"]
 
 [workspace.dependencies]
 wit-bindgen = "0.46.0"

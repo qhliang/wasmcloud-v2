@@ -1,140 +1,172 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>KeyValue Store</title>
-    <style>
-{BASE_CSS}
-        .keys-list { margin-top: 10px; }
-        .key-item {
-            display: flex;
-            align-items: center;
-            padding: 8px;
-            background: #f9f9f9;
-            margin-bottom: 4px;
-            border-radius: 4px;
-        }
-        .key-item span { flex: 1; }
-        .key-item button {
-            padding: 4px 8px;
-            font-size: 12px;
-            margin: 0 2px;
-        }
-    </style>
-</head>
-<body>
-    <h1>KeyValue Store</h1>
-    {NAV}
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>KeyValue Store</title>
+        <style>
+            {BASE_CSS}
+                    .keys-list { margin-top: 10px; }
+                    .key-item {
+                        display: flex;
+                        align-items: center;
+                        padding: 8px;
+                        background: #f9f9f9;
+                        margin-bottom: 4px;
+                        border-radius: 4px;
+                    }
+                    .key-item span { flex: 1; }
+                    .key-item button {
+                        padding: 4px 8px;
+                        font-size: 12px;
+                        margin: 0 2px;
+                    }
+        </style>
+    </head>
+    <body>
+        <h1>KeyValue Store</h1>
+        {NAV}
 
-    <div class="section">
-        <h2>Set Value</h2>
-        <label for="setKey">Key</label>
-        <input type="text" id="setKey" placeholder="Enter key">
-        <label for="setValue">Value</label>
-        <input type="text" id="setValue" placeholder="Enter value">
-        <button onclick="setValue()">Set</button>
-        <div id="setResult" class="result"></div>
-    </div>
+        <div class="section">
+            <h2>Set Value</h2>
+            <label for="setKey">Key</label>
+            <input type="text" id="setKey" placeholder="Enter key" />
+            <label for="setValue">Value</label>
+            <input type="text" id="setValue" placeholder="Enter value" />
+            <button onclick="setValue()">Set</button>
+            <div id="setResult" class="result"></div>
+        </div>
 
-    <div class="section">
-        <h2>Get Value</h2>
-        <label for="getKey">Key</label>
-        <input type="text" id="getKey" placeholder="Enter key">
-        <button onclick="getValue()">Get</button>
-        <div id="getResult" class="result"></div>
-    </div>
+        <div class="section">
+            <h2>Get Value</h2>
+            <label for="getKey">Key</label>
+            <input type="text" id="getKey" placeholder="Enter key" />
+            <button onclick="getValue()">Get</button>
+            <div id="getResult" class="result"></div>
+        </div>
 
-    <div class="section">
-        <h2>Delete Key</h2>
-        <label for="delKey">Key</label>
-        <input type="text" id="delKey" placeholder="Enter key">
-        <button class="danger" onclick="deleteKey()">Delete</button>
-        <div id="delResult" class="result"></div>
-    </div>
+        <div class="section">
+            <h2>Delete Key</h2>
+            <label for="delKey">Key</label>
+            <input type="text" id="delKey" placeholder="Enter key" />
+            <button class="danger" onclick="deleteKey()">Delete</button>
+            <div id="delResult" class="result"></div>
+        </div>
 
-    <div class="section">
-        <h2>All Keys</h2>
-        <button onclick="listKeys()">Refresh Keys</button>
-        <div id="keysList" class="keys-list"></div>
-    </div>
+        <div class="section">
+            <h2>All Keys</h2>
+            <button onclick="listKeys()">Refresh Keys</button>
+            <div id="keysList" class="keys-list"></div>
+        </div>
 
-    <script>
-{BASE_JS}
-        async function setValue() {
-            const key = document.getElementById('setKey').value.trim();
-            const value = document.getElementById('setValue').value;
-            if (!key) { showResult('setResult', 'Key is required', true); return; }
-            try {
-                const resp = await fetch('/kv/set', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ key, value })
-                });
-                const text = await resp.text();
-                showResult('setResult', text, !resp.ok);
-            } catch (e) {
-                showResult('setResult', 'Error: ' + e.message, true);
+        <script>
+            {
+                BASE_JS;
             }
-        }
-
-        async function getValue() {
-            const key = document.getElementById('getKey').value.trim();
-            if (!key) { showResult('getResult', 'Key is required', true); return; }
-            try {
-                const resp = await fetch('/kv/get?key=' + encodeURIComponent(key));
-                const text = await resp.text();
-                showResult('getResult', text, !resp.ok);
-            } catch (e) {
-                showResult('getResult', 'Error: ' + e.message, true);
-            }
-        }
-
-        async function deleteKey() {
-            const key = document.getElementById('delKey').value.trim();
-            if (!key) { showResult('delResult', 'Key is required', true); return; }
-            try {
-                const resp = await fetch('/kv/delete?key=' + encodeURIComponent(key), { method: 'DELETE' });
-                const text = await resp.text();
-                showResult('delResult', text, !resp.ok);
-                listKeys();
-            } catch (e) {
-                showResult('delResult', 'Error: ' + e.message, true);
-            }
-        }
-
-        async function listKeys() {
-            try {
-                const resp = await fetch('/kv/keys');
-                const keys = await resp.json();
-                const container = document.getElementById('keysList');
-                if (keys.length === 0) {
-                    container.innerHTML = '<p style="color:#666;">No keys found</p>';
+            async function setValue() {
+                const key = document.getElementById("setKey").value.trim();
+                const value = document.getElementById("setValue").value;
+                if (!key) {
+                    showResult("setResult", "Key is required", true);
                     return;
                 }
-                container.innerHTML = keys.map(k => '<div class="key-item"><span>' + escapeHtml(k) + '</span><button onclick="quickGet(\'' + escapeHtml(k) + '\')">Get</button><button class="danger" onclick="quickDelete(\'' + escapeHtml(k) + '\')">Del</button></div>').join('');
-            } catch (e) {
-                document.getElementById('keysList').innerHTML = '<p style="color:red;">Error: ' + e.message + '</p>';
+                try {
+                    const resp = await fetch("/kv/set", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ key, value }),
+                    });
+                    const text = await resp.text();
+                    showResult("setResult", text, !resp.ok);
+                } catch (e) {
+                    showResult("setResult", "Error: " + e.message, true);
+                }
             }
-        }
 
-        async function quickGet(key) {
-            document.getElementById('getKey').value = key;
-            await getValue();
-        }
-
-        async function quickDelete(key) {
-            if (!confirm('Delete key "' + key + '"?')) return;
-            try {
-                const resp = await fetch('/kv/delete?key=' + encodeURIComponent(key), { method: 'DELETE' });
-                await resp.text();
-                listKeys();
-            } catch (e) {
-                alert('Error: ' + e.message);
+            async function getValue() {
+                const key = document.getElementById("getKey").value.trim();
+                if (!key) {
+                    showResult("getResult", "Key is required", true);
+                    return;
+                }
+                try {
+                    const resp = await fetch(
+                        "/kv/get?key=" + encodeURIComponent(key),
+                    );
+                    const text = await resp.text();
+                    showResult("getResult", text, !resp.ok);
+                } catch (e) {
+                    showResult("getResult", "Error: " + e.message, true);
+                }
             }
-        }
 
-        listKeys();
-    </script>
-</body>
+            async function deleteKey() {
+                const key = document.getElementById("delKey").value.trim();
+                if (!key) {
+                    showResult("delResult", "Key is required", true);
+                    return;
+                }
+                try {
+                    const resp = await fetch(
+                        "/kv/delete?key=" + encodeURIComponent(key),
+                        { method: "DELETE" },
+                    );
+                    const text = await resp.text();
+                    showResult("delResult", text, !resp.ok);
+                    listKeys();
+                } catch (e) {
+                    showResult("delResult", "Error: " + e.message, true);
+                }
+            }
+
+            async function listKeys() {
+                try {
+                    const resp = await fetch("/kv/keys");
+                    const keys = await resp.json();
+                    const container = document.getElementById("keysList");
+                    if (keys.length === 0) {
+                        container.innerHTML =
+                            '<p style="color:#666;">No keys found</p>';
+                        return;
+                    }
+                    container.innerHTML = keys
+                        .map(
+                            (k) =>
+                                '<div class="key-item"><span>' +
+                                escapeHtml(k) +
+                                "</span><button onclick=\"quickGet('" +
+                                escapeHtml(k) +
+                                '\')">Get</button><button class="danger" onclick="quickDelete(\'' +
+                                escapeHtml(k) +
+                                "')\">Del</button></div>",
+                        )
+                        .join("");
+                } catch (e) {
+                    document.getElementById("keysList").innerHTML =
+                        '<p style="color:red;">Error: ' + e.message + "</p>";
+                }
+            }
+
+            async function quickGet(key) {
+                document.getElementById("getKey").value = key;
+                await getValue();
+            }
+
+            async function quickDelete(key) {
+                if (!confirm('Delete key "' + key + '"?')) return;
+                try {
+                    const resp = await fetch(
+                        "/kv/delete?key=" + encodeURIComponent(key),
+                        { method: "DELETE" },
+                    );
+                    await resp.text();
+                    listKeys();
+                } catch (e) {
+                    alert("Error: " + e.message);
+                }
+            }
+
+            listKeys();
+        </script>
+    </body>
 </html>

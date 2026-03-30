@@ -1,216 +1,333 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>R2 Blob Store</title>
-    <style>
-{BASE_CSS}
-        .objects-list { margin-top: 10px; }
-        .object-item {
-            display: flex;
-            align-items: center;
-            padding: 8px;
-            background: #f9f9f9;
-            margin-bottom: 4px;
-            border-radius: 4px;
-        }
-        .object-item span { flex: 1; font-family: monospace; }
-        .object-item button {
-            padding: 4px 8px;
-            font-size: 12px;
-            margin: 0 2px;
-        }
-        .containers-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-            gap: 10px;
-            margin-top: 10px;
-        }
-        .container-card {
-            background: #f9f9f9;
-            padding: 15px;
-            border-radius: 8px;
-            text-align: center;
-        }
-        .container-card h3 { margin: 0 0 10px 0; font-size: 16px; }
-        .container-card button { margin: 2px; padding: 6px 12px; }
-    </style>
-</head>
-<body>
-    <h1>R2 Blob Store</h1>
-    {NAV}
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>R2 Blob Store</title>
+        <style>
+            {BASE_CSS}
+                    .objects-list { margin-top: 10px; }
+                    .object-item {
+                        display: flex;
+                        align-items: center;
+                        padding: 8px;
+                        background: #f9f9f9;
+                        margin-bottom: 4px;
+                        border-radius: 4px;
+                    }
+                    .object-item span { flex: 1; font-family: monospace; }
+                    .object-item button {
+                        padding: 4px 8px;
+                        font-size: 12px;
+                        margin: 0 2px;
+                    }
+                    .containers-grid {
+                        display: grid;
+                        grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+                        gap: 10px;
+                        margin-top: 10px;
+                    }
+                    .container-card {
+                        background: #f9f9f9;
+                        padding: 15px;
+                        border-radius: 8px;
+                        text-align: center;
+                    }
+                    .container-card h3 { margin: 0 0 10px 0; font-size: 16px; }
+                    .container-card button { margin: 2px; padding: 6px 12px; }
+        </style>
+    </head>
+    <body>
+        <h1>R2 Blob Store</h1>
+        {NAV}
 
-    <div class="section">
-        <h2>Containers</h2>
-        <label for="newContainer">New Container Name</label>
-        <input type="text" id="newContainer" placeholder="Enter container name">
-        <button onclick="createContainer()">Create Container</button>
-        <button onclick="listContainers()">Refresh Containers</button>
-        <div id="containersList" class="containers-grid"></div>
-    </div>
+        <div class="section">
+            <h2>Containers</h2>
+            <label for="newContainer">New Container Name</label>
+            <input
+                type="text"
+                id="newContainer"
+                placeholder="Enter container name"
+            />
+            <button onclick="createContainer()">Create Container</button>
+            <button onclick="listContainers()">Refresh Containers</button>
+            <div id="containersList" class="containers-grid"></div>
+        </div>
 
-    <div class="section">
-        <h2>Upload Object</h2>
-        <label for="uploadContainer">Container</label>
-        <select id="uploadContainer">
-            <option value="wasmcloud-v2">wasmcloud-v2</option>
-        </select>
-        <label for="objectName">Object Name (Key)</label>
-        <input type="text" id="objectName" placeholder="Enter object name">
-        <label for="objectData">Data</label>
-        <textarea id="objectData" placeholder="Enter data to store..."></textarea>
-        <button onclick="putObject()">Upload Object</button>
-        <div id="putResult" class="result"></div>
-    </div>
+        <div class="section">
+            <h2>Upload Object</h2>
+            <label for="uploadContainer">Container</label>
+            <select id="uploadContainer">
+                <option value="wasmcloud-v2">wasmcloud-v2</option>
+            </select>
+            <label for="objectName">Object Name (Key)</label>
+            <input
+                type="text"
+                id="objectName"
+                placeholder="Enter object name"
+            />
+            <label for="objectData">Data</label>
+            <textarea
+                id="objectData"
+                placeholder="Enter data to store..."
+            ></textarea>
+            <button onclick="putObject()">Upload Object</button>
+            <div id="putResult" class="result"></div>
+        </div>
 
-    <div class="section">
-        <h2>Get Object</h2>
-        <label for="getContainer">Container</label>
-        <select id="getContainer">
-            <option value="wasmcloud-v2">wasmcloud-v2</option>
-        </select>
-        <label for="getObjectName">Object Name</label>
-        <input type="text" id="getObjectName" placeholder="Enter object name">
-        <button onclick="getObject()">Get Object</button>
-        <div id="getResult" class="result"></div>
-    </div>
+        <div class="section">
+            <h2>Get Object</h2>
+            <label for="getContainer">Container</label>
+            <select id="getContainer">
+                <option value="wasmcloud-v2">wasmcloud-v2</option>
+            </select>
+            <label for="getObjectName">Object Name</label>
+            <input
+                type="text"
+                id="getObjectName"
+                placeholder="Enter object name"
+            />
+            <button onclick="getObject()">Get Object</button>
+            <div id="getResult" class="result"></div>
+        </div>
 
-    <div class="section">
-        <h2>List Objects</h2>
-        <label for="listContainer">Container</label>
-        <select id="listContainer">
-            <option value="wasmcloud-v2">wasmcloud-v2</option>
-        </select>
-        <button onclick="listObjects()">List Objects</button>
-        <div id="objectsList" class="objects-list"></div>
-    </div>
+        <div class="section">
+            <h2>List Objects</h2>
+            <label for="listContainer">Container</label>
+            <select id="listContainer">
+                <option value="wasmcloud-v2">wasmcloud-v2</option>
+            </select>
+            <button onclick="listObjects()">List Objects</button>
+            <div id="objectsList" class="objects-list"></div>
+        </div>
 
-    <script>
-{BASE_JS}
-        async function createContainer() {
-            const name = document.getElementById('newContainer').value.trim();
-            if (!name) { alert('Container name is required'); return; }
-            try {
-                const resp = await fetch('/r2/container/create?name=' + encodeURIComponent(name), { method: 'POST' });
-                const text = await resp.text();
-                alert(resp.ok ? 'Container created: ' + name : 'Error: ' + text);
-                if (resp.ok) { document.getElementById('newContainer').value = ''; listContainers(); }
-            } catch (e) { alert('Error: ' + e.message); }
-        }
-
-        async function listContainers() {
-            try {
-                const resp = await fetch('/r2/containers');
-                const containers = await resp.json();
-                const grid = document.getElementById('containersList');
-                if (containers.length === 0) {
-                    grid.innerHTML = '<p style="color:#666; grid-column: 1/-1;">No containers found</p>';
+        <script>
+            {
+                BASE_JS;
+            }
+            async function createContainer() {
+                const name = document
+                    .getElementById("newContainer")
+                    .value.trim();
+                if (!name) {
+                    alert("Container name is required");
                     return;
                 }
-                grid.innerHTML = containers.map(c =>
-                    '<div class="container-card"><h3>' + escapeHtml(c) + '</h3>' +
-                    '<button onclick="selectContainer(\'' + escapeHtml(c) + '\')">Select</button>' +
-                    '<button class="danger" onclick="deleteContainer(\'' + escapeHtml(c) + '\')">Delete</button></div>'
-                ).join('');
-                updateContainerSelects(containers);
-            } catch (e) {
-                document.getElementById('containersList').innerHTML = '<p style="color:red;">Error: ' + e.message + '</p>';
+                try {
+                    const resp = await fetch(
+                        "/r2/container/create?name=" + encodeURIComponent(name),
+                        { method: "POST" },
+                    );
+                    const text = await resp.text();
+                    alert(
+                        resp.ok
+                            ? "Container created: " + name
+                            : "Error: " + text,
+                    );
+                    if (resp.ok) {
+                        document.getElementById("newContainer").value = "";
+                        listContainers();
+                    }
+                } catch (e) {
+                    alert("Error: " + e.message);
+                }
             }
-        }
 
-        function updateContainerSelects(containers) {
-            ['uploadContainer', 'getContainer', 'listContainer'].forEach(id => {
-                const select = document.getElementById(id);
-                const current = select.value;
-                select.innerHTML = containers.map(c =>
-                    '<option value="' + escapeHtml(c) + '"' + (c === current ? ' selected' : '') + '>' + escapeHtml(c) + '</option>'
-                ).join('');
-            });
-        }
+            async function listContainers() {
+                try {
+                    const resp = await fetch("/r2/containers");
+                    const containers = await resp.json();
+                    const grid = document.getElementById("containersList");
+                    if (containers.length === 0) {
+                        grid.innerHTML =
+                            '<p style="color:#666; grid-column: 1/-1;">No containers found</p>';
+                        return;
+                    }
+                    grid.innerHTML = containers
+                        .map(
+                            (c) =>
+                                '<div class="container-card"><h3>' +
+                                escapeHtml(c) +
+                                "</h3>" +
+                                "<button onclick=\"selectContainer('" +
+                                escapeHtml(c) +
+                                "')\">Select</button>" +
+                                '<button class="danger" onclick="deleteContainer(\'' +
+                                escapeHtml(c) +
+                                "')\">Delete</button></div>",
+                        )
+                        .join("");
+                    updateContainerSelects(containers);
+                } catch (e) {
+                    document.getElementById("containersList").innerHTML =
+                        '<p style="color:red;">Error: ' + e.message + "</p>";
+                }
+            }
 
-        function selectContainer(name) {
-            document.getElementById('uploadContainer').value = name;
-            document.getElementById('getContainer').value = name;
-            document.getElementById('listContainer').value = name;
-            listObjects();
-        }
+            function updateContainerSelects(containers) {
+                ["uploadContainer", "getContainer", "listContainer"].forEach(
+                    (id) => {
+                        const select = document.getElementById(id);
+                        const current = select.value;
+                        select.innerHTML = containers
+                            .map(
+                                (c) =>
+                                    '<option value="' +
+                                    escapeHtml(c) +
+                                    '"' +
+                                    (c === current ? " selected" : "") +
+                                    ">" +
+                                    escapeHtml(c) +
+                                    "</option>",
+                            )
+                            .join("");
+                    },
+                );
+            }
 
-        async function deleteContainer(name) {
-            if (!confirm('Delete container "' + name + '" and all its objects?')) return;
-            try {
-                const resp = await fetch('/r2/container/delete?name=' + encodeURIComponent(name), { method: 'DELETE' });
-                const text = await resp.text();
-                alert(resp.ok ? 'Container deleted' : 'Error: ' + text);
-                listContainers();
-            } catch (e) { alert('Error: ' + e.message); }
-        }
-
-        async function putObject() {
-            const container = document.getElementById('uploadContainer').value;
-            const name = document.getElementById('objectName').value.trim();
-            const data = document.getElementById('objectData').value;
-            if (!name) { showResult('putResult', 'Object name is required', true); return; }
-            try {
-                const resp = await fetch('/r2/object/put', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ container, name, data })
-                });
-                const text = await resp.text();
-                showResult('putResult', resp.ok ? 'Object uploaded: ' + name : 'Error: ' + text, !resp.ok);
-                if (resp.ok) { document.getElementById('objectName').value = ''; document.getElementById('objectData').value = ''; }
-            } catch (e) { showResult('putResult', 'Error: ' + e.message, true); }
-        }
-
-        async function getObject() {
-            const container = document.getElementById('getContainer').value;
-            const name = document.getElementById('getObjectName').value.trim();
-            if (!name) { showResult('getResult', 'Object name is required', true); return; }
-            try {
-                const resp = await fetch('/r2/object/get?container=' + encodeURIComponent(container) + '&name=' + encodeURIComponent(name));
-                const text = await resp.text();
-                showResult('getResult', text, !resp.ok);
-            } catch (e) { showResult('getResult', 'Error: ' + e.message, true); }
-        }
-
-        async function deleteObject(container, name) {
-            if (!confirm('Delete object "' + name + '"?')) return;
-            try {
-                const resp = await fetch('/r2/object/delete?container=' + encodeURIComponent(container) + '&name=' + encodeURIComponent(name), { method: 'DELETE' });
-                await resp.text();
+            function selectContainer(name) {
+                document.getElementById("uploadContainer").value = name;
+                document.getElementById("getContainer").value = name;
+                document.getElementById("listContainer").value = name;
                 listObjects();
-            } catch (e) { alert('Error: ' + e.message); }
-        }
+            }
 
-        async function listObjects() {
-            const container = document.getElementById('listContainer').value;
-            try {
-                const resp = await fetch('/r2/objects?container=' + encodeURIComponent(container));
-                const objects = await resp.json();
-                const div = document.getElementById('objectsList');
-                if (objects.length === 0) {
-                    div.innerHTML = '<p style="color:#666;">No objects in container</p>';
+            async function deleteContainer(name) {
+                if (
+                    !confirm(
+                        'Delete container "' + name + '" and all its objects?',
+                    )
+                )
+                    return;
+                try {
+                    const resp = await fetch(
+                        "/r2/container/delete?name=" + encodeURIComponent(name),
+                        { method: "DELETE" },
+                    );
+                    const text = await resp.text();
+                    alert(resp.ok ? "Container deleted" : "Error: " + text);
+                    listContainers();
+                } catch (e) {
+                    alert("Error: " + e.message);
+                }
+            }
+
+            async function putObject() {
+                const container =
+                    document.getElementById("uploadContainer").value;
+                const name = document.getElementById("objectName").value.trim();
+                const data = document.getElementById("objectData").value;
+                if (!name) {
+                    showResult("putResult", "Object name is required", true);
                     return;
                 }
-                div.innerHTML = objects.map(o =>
-                    '<div class="object-item"><span>' + escapeHtml(o) + '</span>' +
-                    '<button onclick="quickGet(\'' + escapeHtml(o) + '\')">Get</button>' +
-                    '<button class="danger" onclick="deleteObject(\'' + escapeHtml(container) + '\', \'' + escapeHtml(o) + '\')">Del</button></div>'
-                ).join('');
-            } catch (e) {
-                document.getElementById('objectsList').innerHTML = '<p style="color:red;">Error: ' + e.message + '</p>';
+                try {
+                    const resp = await fetch("/r2/object/put", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ container, name, data }),
+                    });
+                    const text = await resp.text();
+                    showResult(
+                        "putResult",
+                        resp.ok ? "Object uploaded: " + name : "Error: " + text,
+                        !resp.ok,
+                    );
+                    if (resp.ok) {
+                        document.getElementById("objectName").value = "";
+                        document.getElementById("objectData").value = "";
+                    }
+                } catch (e) {
+                    showResult("putResult", "Error: " + e.message, true);
+                }
             }
-        }
 
-        function quickGet(name) {
-            document.getElementById('getContainer').value = document.getElementById('listContainer').value;
-            document.getElementById('getObjectName').value = name;
-            getObject();
-        }
+            async function getObject() {
+                const container = document.getElementById("getContainer").value;
+                const name = document
+                    .getElementById("getObjectName")
+                    .value.trim();
+                if (!name) {
+                    showResult("getResult", "Object name is required", true);
+                    return;
+                }
+                try {
+                    const resp = await fetch(
+                        "/r2/object/get?container=" +
+                            encodeURIComponent(container) +
+                            "&name=" +
+                            encodeURIComponent(name),
+                    );
+                    const text = await resp.text();
+                    showResult("getResult", text, !resp.ok);
+                } catch (e) {
+                    showResult("getResult", "Error: " + e.message, true);
+                }
+            }
 
-        listContainers();
-        listObjects();
-    </script>
-</body>
+            async function deleteObject(container, name) {
+                if (!confirm('Delete object "' + name + '"?')) return;
+                try {
+                    const resp = await fetch(
+                        "/r2/object/delete?container=" +
+                            encodeURIComponent(container) +
+                            "&name=" +
+                            encodeURIComponent(name),
+                        { method: "DELETE" },
+                    );
+                    await resp.text();
+                    listObjects();
+                } catch (e) {
+                    alert("Error: " + e.message);
+                }
+            }
+
+            async function listObjects() {
+                const container =
+                    document.getElementById("listContainer").value;
+                try {
+                    const resp = await fetch(
+                        "/r2/objects?container=" +
+                            encodeURIComponent(container),
+                    );
+                    const objects = await resp.json();
+                    const div = document.getElementById("objectsList");
+                    if (objects.length === 0) {
+                        div.innerHTML =
+                            '<p style="color:#666;">No objects in container</p>';
+                        return;
+                    }
+                    div.innerHTML = objects
+                        .map(
+                            (o) =>
+                                '<div class="object-item"><span>' +
+                                escapeHtml(o) +
+                                "</span>" +
+                                "<button onclick=\"quickGet('" +
+                                escapeHtml(o) +
+                                "')\">Get</button>" +
+                                '<button class="danger" onclick="deleteObject(\'' +
+                                escapeHtml(container) +
+                                "', '" +
+                                escapeHtml(o) +
+                                "')\">Del</button></div>",
+                        )
+                        .join("");
+                } catch (e) {
+                    document.getElementById("objectsList").innerHTML =
+                        '<p style="color:red;">Error: ' + e.message + "</p>";
+                }
+            }
+
+            function quickGet(name) {
+                document.getElementById("getContainer").value =
+                    document.getElementById("listContainer").value;
+                document.getElementById("getObjectName").value = name;
+                getObject();
+            }
+
+            listContainers();
+            listObjects();
+        </script>
+    </body>
 </html>

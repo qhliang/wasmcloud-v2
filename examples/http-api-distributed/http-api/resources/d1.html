@@ -1,195 +1,332 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>D1 SQL Database</title>
-    <style>
-{BASE_CSS}
-        .quick-actions {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 8px;
-            margin-top: 10px;
-        }
-        .quick-actions button {
-            font-size: 12px;
-            padding: 6px 12px;
-        }
-    </style>
-</head>
-<body>
-    <h1>D1 SQL Database</h1>
-    {NAV}
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>D1 SQL Database</title>
+        <style>
+            {BASE_CSS}
+                    .quick-actions {
+                        display: flex;
+                        flex-wrap: wrap;
+                        gap: 8px;
+                        margin-top: 10px;
+                    }
+                    .quick-actions button {
+                        font-size: 12px;
+                        padding: 6px 12px;
+                    }
+        </style>
+    </head>
+    <body>
+        <h1>D1 SQL Database</h1>
+        {NAV}
 
-    <div class="section">
-        <h2>Execute Query</h2>
-        <label for="sqlQuery">SQL Query</label>
-        <textarea id="sqlQuery">SELECT name FROM sqlite_master WHERE type='table'</textarea>
-        <div class="quick-actions">
-            <button onclick="setQuery('SELECT * FROM sqlite_master WHERE type=\\'table\\'')">Show Tables</button>
-            <button onclick="setQuery('SELECT name, sql FROM sqlite_master WHERE type=\\'table\\'')">Schema</button>
-            <button onclick="setQuery('SELECT 1 as test')">Test Query</button>
+        <div class="section">
+            <h2>Execute Query</h2>
+            <label for="sqlQuery">SQL Query</label>
+            <textarea id="sqlQuery">
+SELECT name FROM sqlite_master WHERE type='table'</textarea
+            >
+            <div class="quick-actions">
+                <button
+                    onclick="setQuery('SELECT * FROM sqlite_master WHERE type=\\'table\\'')"
+                >
+                    Show Tables
+                </button>
+                <button
+                    onclick="setQuery('SELECT name, sql FROM sqlite_master WHERE type=\\'table\\'')"
+                >
+                    Schema
+                </button>
+                <button onclick="setQuery('SELECT 1 as test')">
+                    Test Query
+                </button>
+            </div>
+            <div style="margin-top: 12px">
+                <button onclick="executeQuery()">Execute Query</button>
+                <button class="success" onclick="executeBatch()">
+                    Execute Batch
+                </button>
+            </div>
+            <div id="queryResult" class="result"></div>
         </div>
-        <div style="margin-top: 12px;">
-            <button onclick="executeQuery()">Execute Query</button>
-            <button class="success" onclick="executeBatch()">Execute Batch</button>
-        </div>
-        <div id="queryResult" class="result"></div>
-    </div>
 
-    <div class="section">
-        <h2>Quick Create Table</h2>
-        <label for="tableName">Table Name</label>
-        <input type="text" id="tableName" value="test_users" placeholder="users">
-        <label for="columns">Columns (SQL syntax)</label>
-        <textarea id="columns">id INTEGER PRIMARY KEY AUTOINCREMENT,
+        <div class="section">
+            <h2>Quick Create Table</h2>
+            <label for="tableName">Table Name</label>
+            <input
+                type="text"
+                id="tableName"
+                value="test_users"
+                placeholder="users"
+            />
+            <label for="columns">Columns (SQL syntax)</label>
+            <textarea id="columns">
+id INTEGER PRIMARY KEY AUTOINCREMENT,
 name TEXT NOT NULL,
 email TEXT UNIQUE,
-created_at DATETIME DEFAULT CURRENT_TIMESTAMP</textarea>
-        <button onclick="createTable()">Create Table</button>
-        <div id="createResult" class="result"></div>
-    </div>
+created_at DATETIME DEFAULT CURRENT_TIMESTAMP</textarea
+            >
+            <button onclick="createTable()">Create Table</button>
+            <div id="createResult" class="result"></div>
+        </div>
 
-    <div class="section">
-        <h2>Quick Insert</h2>
-        <label for="insertTable">Table Name</label>
-        <input type="text" id="insertTable" value="test_users" placeholder="users">
-        <label for="insertColumns">Column Names (comma separated)</label>
-        <input type="text" id="insertColumns" value="name, email" placeholder="name, email">
-        <label for="insertValues">Values (comma separated, strings in quotes)</label>
-        <input type="text" id="insertValues" value="'Test User', 'test@example.com'" placeholder="'John Doe', 'john@example.com'">
-        <button onclick="insertRow()">Insert Row</button>
-        <div id="insertResult" class="result"></div>
-    </div>
+        <div class="section">
+            <h2>Quick Insert</h2>
+            <label for="insertTable">Table Name</label>
+            <input
+                type="text"
+                id="insertTable"
+                value="test_users"
+                placeholder="users"
+            />
+            <label for="insertColumns">Column Names (comma separated)</label>
+            <input
+                type="text"
+                id="insertColumns"
+                value="name, email"
+                placeholder="name, email"
+            />
+            <label for="insertValues"
+                >Values (comma separated, strings in quotes)</label
+            >
+            <input
+                type="text"
+                id="insertValues"
+                value="'Test User', 'test@example.com'"
+                placeholder="'John Doe', 'john@example.com'"
+            />
+            <button onclick="insertRow()">Insert Row</button>
+            <div id="insertResult" class="result"></div>
+        </div>
 
-    <script>
-{BASE_JS}
-        async function executeQuery() {
-            const sql = document.getElementById('sqlQuery').value.trim();
-            if (!sql) { showResult('queryResult', 'Please enter a SQL query', true); return; }
-            try {
-                const resp = await fetch('/d1/query', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ sql, params: [] })
-                });
-                const data = await resp.json();
-                if (!resp.ok) {
-                    showResult('queryResult', 'Error: ' + (data.error || JSON.stringify(data, null, 2)), true);
-                } else {
-                    displayQueryResult('queryResult', data);
+        <script>
+            {
+                BASE_JS;
+            }
+            async function executeQuery() {
+                const sql = document.getElementById("sqlQuery").value.trim();
+                if (!sql) {
+                    showResult("queryResult", "Please enter a SQL query", true);
+                    return;
                 }
-            } catch (e) { showResult('queryResult', 'Error: ' + e.message, true); }
-        }
-
-        async function executeBatch() {
-            const sql = document.getElementById('sqlQuery').value.trim();
-            if (!sql) { showResult('queryResult', 'Please enter SQL statements', true); return; }
-            try {
-                const resp = await fetch('/d1/batch', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ sql })
-                });
-                const data = await resp.json();
-                if (!resp.ok) {
-                    showResult('queryResult', 'Error: ' + (data.error || JSON.stringify(data, null, 2)), true);
-                } else {
-                    let html = '<div class="meta">Batch executed: ' + data.length + ' statement(s)</div>';
-                    data.forEach((result, i) => {
-                        html += '<h3>Statement ' + (i + 1) + '</h3>';
-                        html += formatResultTable(result);
+                try {
+                    const resp = await fetch("/d1/query", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ sql, params: [] }),
                     });
-                    document.getElementById('queryResult').innerHTML = html;
-                    document.getElementById('queryResult').className = 'result success';
-                    document.getElementById('queryResult').style.display = 'block';
+                    const data = await resp.json();
+                    if (!resp.ok) {
+                        showResult(
+                            "queryResult",
+                            "Error: " +
+                                (data.error || JSON.stringify(data, null, 2)),
+                            true,
+                        );
+                    } else {
+                        displayQueryResult("queryResult", data);
+                    }
+                } catch (e) {
+                    showResult("queryResult", "Error: " + e.message, true);
                 }
-            } catch (e) { showResult('queryResult', 'Error: ' + e.message, true); }
-        }
-
-        function displayQueryResult(elementId, data) {
-            let html = formatResultTable(data);
-            html += '<div class="meta">Rows affected: ' + (data.rows_affected || 0);
-            if (data.last_insert_rowid !== null && data.last_insert_rowid !== undefined) {
-                html += ' | Last insert ID: ' + data.last_insert_rowid;
             }
-            html += '</div>';
-            document.getElementById(elementId).innerHTML = html;
-            document.getElementById(elementId).className = 'result success';
-            document.getElementById(elementId).style.display = 'block';
-        }
 
-        function formatResultTable(data) {
-            if (!data.rows || data.rows.length === 0) return '<p style="color:#666;">No results</p>';
-            const columns = data.columns || [];
-            let html = '<table><thead><tr>';
-            columns.forEach(col => { html += '<th>' + escapeHtml(col.name) + '</th>'; });
-            html += '</tr></thead><tbody>';
-            data.rows.forEach(row => {
-                html += '<tr>';
-                row.values.forEach(val => { html += '<td>' + formatValue(val) + '</td>'; });
-                html += '</tr>';
-            });
-            html += '</tbody></table>';
-            return html;
-        }
-
-        function formatValue(val) {
-            if (val === null || val === undefined) return '<i style="color:#999">NULL</i>';
-            if (typeof val === 'object') {
-                if (val.integer !== undefined) return val.integer;
-                if (val.real !== undefined) return val.real;
-                if (val.text !== undefined) return escapeHtml(val.text);
-                if (val.blob !== undefined) return '&lt;blob: ' + val.blob.length + ' bytes&gt;';
-                if (val.null !== undefined) return '<i style="color:#999">NULL</i>';
-                return escapeHtml(JSON.stringify(val));
+            async function executeBatch() {
+                const sql = document.getElementById("sqlQuery").value.trim();
+                if (!sql) {
+                    showResult(
+                        "queryResult",
+                        "Please enter SQL statements",
+                        true,
+                    );
+                    return;
+                }
+                try {
+                    const resp = await fetch("/d1/batch", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ sql }),
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok) {
+                        showResult(
+                            "queryResult",
+                            "Error: " +
+                                (data.error || JSON.stringify(data, null, 2)),
+                            true,
+                        );
+                    } else {
+                        let html =
+                            '<div class="meta">Batch executed: ' +
+                            data.length +
+                            " statement(s)</div>";
+                        data.forEach((result, i) => {
+                            html += "<h3>Statement " + (i + 1) + "</h3>";
+                            html += formatResultTable(result);
+                        });
+                        document.getElementById("queryResult").innerHTML = html;
+                        document.getElementById("queryResult").className =
+                            "result success";
+                        document.getElementById("queryResult").style.display =
+                            "block";
+                    }
+                } catch (e) {
+                    showResult("queryResult", "Error: " + e.message, true);
+                }
             }
-            return escapeHtml(String(val));
-        }
 
-        async function createTable() {
-            const tableName = document.getElementById('tableName').value.trim();
-            const columns = document.getElementById('columns').value.trim();
-            if (!tableName || !columns) { showResult('createResult', 'Please enter table name and columns', true); return; }
-            const sql = 'CREATE TABLE IF NOT EXISTS ' + tableName + ' (' + columns + ')';
-            try {
-                const resp = await fetch('/d1/batch', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ sql })
-                });
-                const data = await resp.json();
-                if (!resp.ok) {
-                    showResult('createResult', 'Error: ' + (data.error || JSON.stringify(data, null, 2)), true);
-                } else {
-                    showResult('createResult', 'Table "' + tableName + '" created successfully', false);
+            function displayQueryResult(elementId, data) {
+                let html = formatResultTable(data);
+                html +=
+                    '<div class="meta">Rows affected: ' +
+                    (data.rows_affected || 0);
+                if (
+                    data.last_insert_rowid !== null &&
+                    data.last_insert_rowid !== undefined
+                ) {
+                    html += " | Last insert ID: " + data.last_insert_rowid;
                 }
-            } catch (e) { showResult('createResult', 'Error: ' + e.message, true); }
-        }
+                html += "</div>";
+                document.getElementById(elementId).innerHTML = html;
+                document.getElementById(elementId).className = "result success";
+                document.getElementById(elementId).style.display = "block";
+            }
 
-        async function insertRow() {
-            const table = document.getElementById('insertTable').value.trim();
-            const columns = document.getElementById('insertColumns').value.trim();
-            const values = document.getElementById('insertValues').value.trim();
-            if (!table || !columns || !values) { showResult('insertResult', 'Please fill all fields', true); return; }
-            const sql = 'INSERT INTO ' + table + ' (' + columns + ') VALUES (' + values + ')';
-            try {
-                const resp = await fetch('/d1/query', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ sql, params: [] })
+            function formatResultTable(data) {
+                if (!data.rows || data.rows.length === 0)
+                    return '<p style="color:#666;">No results</p>';
+                const columns = data.columns || [];
+                let html = "<table><thead><tr>";
+                columns.forEach((col) => {
+                    html += "<th>" + escapeHtml(col.name) + "</th>";
                 });
-                const data = await resp.json();
-                if (!resp.ok) {
-                    showResult('insertResult', 'Error: ' + (data.error || JSON.stringify(data, null, 2)), true);
-                } else {
-                    showResult('insertResult', 'Row inserted successfully. Last ID: ' + (data.last_insert_rowid || 'N/A'), false);
-                }
-            } catch (e) { showResult('insertResult', 'Error: ' + e.message, true); }
-        }
+                html += "</tr></thead><tbody>";
+                data.rows.forEach((row) => {
+                    html += "<tr>";
+                    row.values.forEach((val) => {
+                        html += "<td>" + formatValue(val) + "</td>";
+                    });
+                    html += "</tr>";
+                });
+                html += "</tbody></table>";
+                return html;
+            }
 
-        function setQuery(sql) { document.getElementById('sqlQuery').value = sql; }
-    </script>
-</body>
+            function formatValue(val) {
+                if (val === null || val === undefined)
+                    return '<i style="color:#999">NULL</i>';
+                if (typeof val === "object") {
+                    if (val.integer !== undefined) return val.integer;
+                    if (val.real !== undefined) return val.real;
+                    if (val.text !== undefined) return escapeHtml(val.text);
+                    if (val.blob !== undefined)
+                        return "&lt;blob: " + val.blob.length + " bytes&gt;";
+                    if (val.null !== undefined)
+                        return '<i style="color:#999">NULL</i>';
+                    return escapeHtml(JSON.stringify(val));
+                }
+                return escapeHtml(String(val));
+            }
+
+            async function createTable() {
+                const tableName = document
+                    .getElementById("tableName")
+                    .value.trim();
+                const columns = document.getElementById("columns").value.trim();
+                if (!tableName || !columns) {
+                    showResult(
+                        "createResult",
+                        "Please enter table name and columns",
+                        true,
+                    );
+                    return;
+                }
+                const sql =
+                    "CREATE TABLE IF NOT EXISTS " +
+                    tableName +
+                    " (" +
+                    columns +
+                    ")";
+                try {
+                    const resp = await fetch("/d1/batch", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ sql }),
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok) {
+                        showResult(
+                            "createResult",
+                            "Error: " +
+                                (data.error || JSON.stringify(data, null, 2)),
+                            true,
+                        );
+                    } else {
+                        showResult(
+                            "createResult",
+                            'Table "' + tableName + '" created successfully',
+                            false,
+                        );
+                    }
+                } catch (e) {
+                    showResult("createResult", "Error: " + e.message, true);
+                }
+            }
+
+            async function insertRow() {
+                const table = document
+                    .getElementById("insertTable")
+                    .value.trim();
+                const columns = document
+                    .getElementById("insertColumns")
+                    .value.trim();
+                const values = document
+                    .getElementById("insertValues")
+                    .value.trim();
+                if (!table || !columns || !values) {
+                    showResult("insertResult", "Please fill all fields", true);
+                    return;
+                }
+                const sql =
+                    "INSERT INTO " +
+                    table +
+                    " (" +
+                    columns +
+                    ") VALUES (" +
+                    values +
+                    ")";
+                try {
+                    const resp = await fetch("/d1/query", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ sql, params: [] }),
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok) {
+                        showResult(
+                            "insertResult",
+                            "Error: " +
+                                (data.error || JSON.stringify(data, null, 2)),
+                            true,
+                        );
+                    } else {
+                        showResult(
+                            "insertResult",
+                            "Row inserted successfully. Last ID: " +
+                                (data.last_insert_rowid || "N/A"),
+                            false,
+                        );
+                    }
+                } catch (e) {
+                    showResult("insertResult", "Error: " + e.message, true);
+                }
+            }
+
+            function setQuery(sql) {
+                document.getElementById("sqlQuery").value = sql;
+            }
+        </script>
+    </body>
 </html>
