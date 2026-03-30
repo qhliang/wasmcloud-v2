@@ -40,6 +40,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::{FutureExt, StreamExt};
 use genai::adapter::AdapterKind;
 use genai::chat::{ChatMessage as GenaiChatMessage, ChatOptions, ChatRequest};
 use genai::resolver::{AuthData, AuthResolver, Endpoint, ServiceTargetResolver};
@@ -47,6 +48,7 @@ use genai::{Client, ModelIden, ServiceTarget};
 use opentelemetry::metrics::Counter;
 use tokio::sync::RwLock;
 use tracing::debug;
+use wasmtime::component::Resource;
 
 use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use wash_runtime::engine::workload::WorkloadItem;
@@ -59,14 +61,29 @@ mod bindings {
         imports: {
             default: async | trappable | tracing,
         },
+        with: {
+            "custom:llm-gateway/chat-streaming.chat-stream": super::ChatStreamHandle,
+        },
     });
 }
 
 use bindings::custom::llm_gateway::types::{
-    ChatMessage, ChatOptions as WitChatOptions, ChatResponse, LlmError, TokenUsage,
+    ChatChunk, ChatMessage, ChatOptions as WitChatOptions, ChatResponse, ChatStreamEvent,
+    LlmError, StreamEnd as WitStreamEnd, TokenUsage,
 };
 
 const PLUGIN_ID: &str = "llm-gateway";
+
+/// Host-side state for an active streaming chat response.
+/// Stored in the wasmtime ResourceTable and polled by `next()`.
+pub struct ChatStreamHandle {
+    /// The genai ChatStream (implements futures::Stream)
+    stream: futures::stream::BoxStream<'static, genai::Result<genai::chat::ChatStreamEvent>>,
+    /// The model identifier returned by the provider
+    model_iden: Option<ModelIden>,
+    /// Whether the stream has ended
+    ended: bool,
+}
 
 /// Default system prompt role
 const DEFAULT_SYSTEM_PROMPT_ROLE: &str = "system";
@@ -536,6 +553,196 @@ impl<'a> bindings::custom::llm_gateway::chat::Host for ActiveCtx<'a> {
 }
 
 // ============================================================================
+// Streaming Chat Interface Implementation
+// ============================================================================
+
+impl<'a> bindings::custom::llm_gateway::chat_streaming::Host for ActiveCtx<'a> {
+    async fn chat_streaming(
+        &mut self,
+        model: String,
+        messages: Vec<ChatMessage>,
+        options: Option<WitChatOptions>,
+    ) -> wasmtime::Result<Result<Resource<ChatStreamHandle>, LlmError>> {
+        let Some(plugin) = self.get_plugin::<LlmGateway>(PLUGIN_ID) else {
+            return Ok(Err(LlmError::Unexpected(
+                "LLM Gateway plugin not available".to_string(),
+            )));
+        };
+
+        // Validate input
+        if messages.is_empty() {
+            return Ok(Err(LlmError::InvalidRequest(
+                "Messages list cannot be empty".to_string(),
+            )));
+        }
+
+        let workload_id = self.workload_id.as_ref().to_string();
+
+        // Get config for this workload
+        let config = {
+            let configs = plugin.configs.read().await;
+            match configs.get(&workload_id).cloned() {
+                Some(c) => c,
+                None => {
+                    return Ok(Err(LlmError::Unexpected(format!(
+                        "No LLM Gateway config found for workload '{}'",
+                        workload_id
+                    ))));
+                }
+            }
+        };
+
+        // Use configured model name if the request model is empty
+        let model = if model.is_empty() {
+            config.model_name.clone()
+        } else {
+            model
+        };
+
+        plugin.record_chat_request(&model);
+
+        // Get or create genai client
+        let client = match plugin.get_or_create_client(&workload_id).await {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(Err(LlmError::Unexpected(format!(
+                    "Failed to create LLM client: {e}"
+                ))));
+            }
+        };
+
+        debug!(
+            workload_id = %workload_id,
+            model = %model,
+            message_count = messages.len(),
+            "Executing LLM streaming chat request"
+        );
+
+        // Build chat request: prepend preset prompts, then user messages
+        let mut all_messages = Vec::new();
+        for prompt in &config.system_prompts {
+            match to_genai_role(&prompt.role) {
+                genai::chat::ChatRole::System => {
+                    all_messages.push(GenaiChatMessage::system(&prompt.content));
+                }
+                genai::chat::ChatRole::Assistant => {
+                    all_messages.push(GenaiChatMessage::assistant(&prompt.content));
+                }
+                _ => {
+                    all_messages.push(GenaiChatMessage::user(&prompt.content));
+                }
+            }
+        }
+        all_messages.extend(to_genai_messages(messages));
+        let chat_req = ChatRequest::new(all_messages);
+
+        let chat_options = build_chat_options(&config, options);
+
+        // Execute streaming chat
+        let chat_stream_res = match client
+            .exec_chat_stream(&model, chat_req, Some(&chat_options))
+            .await
+        {
+            Ok(res) => res,
+            Err(e) => {
+                debug!(error = %e, "LLM streaming chat request failed");
+                return Ok(Err(to_llm_error(e)));
+            }
+        };
+
+        let model_iden = Some(chat_stream_res.model_iden);
+        let boxed_stream = chat_stream_res.stream.boxed();
+
+        let handle = ChatStreamHandle {
+            stream: boxed_stream,
+            model_iden,
+            ended: false,
+        };
+
+        let resource = self.table.push(handle)?;
+        Ok(Ok(resource))
+    }
+}
+
+impl<'a> bindings::custom::llm_gateway::chat_streaming::HostChatStream for ActiveCtx<'a> {
+    async fn next(
+        &mut self,
+        stream_resource: Resource<ChatStreamHandle>,
+    ) -> wasmtime::Result<Result<(Vec<ChatStreamEvent>, bool), LlmError>> {
+        let handle = self.table.get_mut(&stream_resource)?;
+
+        if handle.ended {
+            return Ok(Ok((vec![], true)));
+        }
+
+        let mut events: Vec<ChatStreamEvent> = Vec::new();
+        let mut ended = false;
+
+        // Drain currently available events from the stream
+        while let Some(result) = handle.stream.next().now_or_never() {
+            match result {
+                Some(Ok(event)) => match event {
+                    genai::chat::ChatStreamEvent::Start => { /* no-op */ }
+                    genai::chat::ChatStreamEvent::Chunk(chunk) => {
+                        events.push(ChatStreamEvent::Chunk(ChatChunk {
+                            content_delta: chunk.content,
+                        }));
+                    }
+                    genai::chat::ChatStreamEvent::End(stream_end) => {
+                        let model = handle
+                            .model_iden
+                            .as_ref()
+                            .map(|m| m.model_name.to_string())
+                            .unwrap_or_default();
+
+                        let usage = stream_end.captured_usage.map(|u| TokenUsage {
+                            prompt_tokens: u.prompt_tokens.unwrap_or(0) as u64,
+                            completion_tokens: u.completion_tokens.unwrap_or(0) as u64,
+                            total_tokens: u.total_tokens.unwrap_or(0) as u64,
+                        });
+
+                        let finish_reason = stream_end
+                            .captured_stop_reason
+                            .map(|r| format!("{r:?}"));
+
+                        events.push(ChatStreamEvent::End(WitStreamEnd {
+                            model,
+                            usage,
+                            finish_reason,
+                        }));
+                        ended = true;
+                        handle.ended = true;
+                        break;
+                    }
+                    // Skip reasoning/tool-call chunks for now
+                    _ => {}
+                },
+                Some(Err(e)) => {
+                    events.push(ChatStreamEvent::Error(e.to_string()));
+                    ended = true;
+                    handle.ended = true;
+                    break;
+                }
+                None => {
+                    // No more events available right now
+                    break;
+                }
+            }
+        }
+
+        Ok(Ok((events, ended)))
+    }
+
+    async fn drop(
+        &mut self,
+        rep: Resource<ChatStreamHandle>,
+    ) -> wasmtime::Result<()> {
+        self.table.delete(rep)?;
+        Ok(())
+    }
+}
+
+// ============================================================================
 // HostPlugin Implementation
 // ============================================================================
 
@@ -547,7 +754,10 @@ impl HostPlugin for LlmGateway {
 
     fn world(&self) -> WitWorld {
         WitWorld {
-            imports: HashSet::from([WitInterface::from("custom:llm-gateway/chat@0.1.0")]),
+            imports: HashSet::from([
+                WitInterface::from("custom:llm-gateway/chat@0.1.0"),
+                WitInterface::from("custom:llm-gateway/chat-streaming@0.1.0"),
+            ]),
             ..Default::default()
         }
     }
@@ -608,6 +818,10 @@ impl HostPlugin for LlmGateway {
 
         let linker = component_handle.linker();
         bindings::custom::llm_gateway::chat::add_to_linker::<_, SharedCtx>(
+            linker,
+            extract_active_ctx,
+        )?;
+        bindings::custom::llm_gateway::chat_streaming::add_to_linker::<_, SharedCtx>(
             linker,
             extract_active_ctx,
         )?;

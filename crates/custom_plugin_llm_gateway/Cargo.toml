@@ -21,6 +21,7 @@ wasmtime = { workspace = true }
 opentelemetry = { workspace = true, features = ["trace", "metrics"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+futures = { workspace = true }
 
 wash-runtime = { path = "../wash-runtime" }
 
