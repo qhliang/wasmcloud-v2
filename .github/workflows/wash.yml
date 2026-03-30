@@ -132,7 +132,7 @@ jobs:
     secrets: inherit
     with:
       push: true
-      image: ghcr.io/wasmcloud/wash
+      image: ghcr.io/qhliang/wash
       tags: |
         type=raw,value=canary-v2
 
@@ -145,7 +145,7 @@ jobs:
     secrets: inherit
     with:
       push: true
-      image: ghcr.io/wasmcloud/wash
+      image: ghcr.io/qhliang/wash
       tags: |
         type=semver,pattern={{version}},value=${{ github.ref_name }}
 
