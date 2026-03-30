@@ -561,13 +561,7 @@ impl<'a> bindings::custom::cf_d1::query::Host for ActiveCtx<'a> {
         // Execute normal query and return first row
         let result = self.query(sql, params).await?;
         match result {
-            Ok(query_result) => {
-                if query_result.rows.is_empty() {
-                    Ok(Ok(None))
-                } else {
-                    Ok(Ok(Some(query_result.rows.into_iter().next().unwrap())))
-                }
-            }
+            Ok(query_result) => Ok(Ok(query_result.rows.into_iter().next())),
             Err(e) => Ok(Err(e)),
         }
     }
@@ -702,7 +696,7 @@ mod tests {
             world
                 .imports
                 .iter()
-                .any(|i| i.namespace == "cf" && i.package == "d1")
+                .any(|i| i.namespace == "custom" && i.package == "cf-d1")
         );
     }
     #[test]
