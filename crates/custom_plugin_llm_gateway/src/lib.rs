@@ -68,8 +68,8 @@ mod bindings {
 }
 
 use bindings::custom::llm_gateway::types::{
-    ChatChunk, ChatMessage, ChatOptions as WitChatOptions, ChatResponse, ChatStreamEvent,
-    LlmError, StreamEnd as WitStreamEnd, TokenUsage,
+    ChatChunk, ChatMessage, ChatOptions as WitChatOptions, ChatResponse, ChatStreamEvent, LlmError,
+    StreamEnd as WitStreamEnd, TokenUsage,
 };
 
 const PLUGIN_ID: &str = "llm-gateway";
@@ -701,9 +701,8 @@ impl<'a> bindings::custom::llm_gateway::chat_streaming::HostChatStream for Activ
                             total_tokens: u.total_tokens.unwrap_or(0) as u64,
                         });
 
-                        let finish_reason = stream_end
-                            .captured_stop_reason
-                            .map(|r| format!("{r:?}"));
+                        let finish_reason =
+                            stream_end.captured_stop_reason.map(|r| format!("{r:?}"));
 
                         events.push(ChatStreamEvent::End(WitStreamEnd {
                             model,
@@ -733,10 +732,7 @@ impl<'a> bindings::custom::llm_gateway::chat_streaming::HostChatStream for Activ
         Ok(Ok((events, ended)))
     }
 
-    async fn drop(
-        &mut self,
-        rep: Resource<ChatStreamHandle>,
-    ) -> wasmtime::Result<()> {
+    async fn drop(&mut self, rep: Resource<ChatStreamHandle>) -> wasmtime::Result<()> {
         self.table.delete(rep)?;
         Ok(())
     }
