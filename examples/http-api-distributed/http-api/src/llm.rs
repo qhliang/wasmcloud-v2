@@ -56,7 +56,7 @@ pub async fn chat(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
         })
         .collect();
 
-    let options = chat_req.options.map(|o| ChatOptions {
+    let _options = chat_req.options.map(|o| ChatOptions {
         temperature: o.temperature,
         max_tokens: o.max_tokens,
         top_p: o.top_p,

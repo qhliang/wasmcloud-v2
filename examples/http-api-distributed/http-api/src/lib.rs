@@ -4,22 +4,42 @@ mod bindings {
         world: "http-api",
         generate_all,
     });
+
+    use super::CrontabHandler;
+
+    export!(CrontabHandler);
 }
 
-mod helpers;
-mod templates;
-mod task;
-mod kv;
-mod r2;
+mod crontab;
 mod d1;
+mod helpers;
+mod kv;
 mod llm;
+mod r2;
+mod task;
+mod templates;
 
+use bindings::exports::custom::crontab::handler::Guest;
 use bindings::wasi::logging::logging::{Level, log};
 use wstd::http::{Body, Request, Response, StatusCode};
 
 const LOG_CTX: &str = "http-api";
 
 static HOME_HTML: &str = include_str!("../resources/home.html");
+
+struct CrontabHandler;
+
+impl Guest for CrontabHandler {
+    fn handle_tick(name: String) -> Result<(), String> {
+        let message = format!(
+            "CRONTAB TICK: schedule '{}' fired via handle-tick export",
+            name
+        );
+        log(Level::Info, LOG_CTX, &message);
+        crontab::push_callback(message);
+        Ok(())
+    }
+}
 
 #[wstd::http_server]
 async fn main(req: Request<Body>) -> anyhow::Result<Response<Body>> {
@@ -51,6 +71,13 @@ async fn main(req: Request<Body>) -> anyhow::Result<Response<Body>> {
         "/r2/object/delete" => r2::object_delete(req).await,
         "/llm" | "/llm/" => llm::home(req).await,
         "/llm/chat" => llm::chat(req).await,
+        "/crontab" | "/crontab/" => crontab::home(req).await,
+        "/crontab/schedule" => crontab::schedule(req).await,
+        "/crontab/schedule-delay" => crontab::schedule_delay(req).await,
+        "/crontab/remove" => crontab::remove(req).await,
+        "/crontab/list" => crontab::list(req).await,
+        "/crontab/callback" => crontab::callback(req).await,
+        "/crontab/callbacks" => crontab::callbacks(req).await,
         _ => {
             log(Level::Debug, LOG_CTX, &format!("Not found: {}", path));
             helpers::text_response(StatusCode::NOT_FOUND, "Not found\n")

@@ -57,6 +57,7 @@ dev:
       package: llm-gateway
       interfaces:
         - chat
+        # - chat-streaming
       config:
         provider: openai-compat
         base_url: https://openrouter.ai/api/v1/

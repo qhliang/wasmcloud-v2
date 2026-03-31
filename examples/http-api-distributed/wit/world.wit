@@ -11,4 +11,12 @@ world http-api {
   import wasi:logging/logging@0.1.0-draft;
   import custom:cf-d1/query@0.1.0;
   import custom:llm-gateway/chat@0.1.0;
+  import custom:crontab/scheduler@0.1.0;
+  export custom:crontab/handler@0.1.0;
+}
+
+world task {
+  import wasmcloud:messaging/consumer@0.2.0;
+  import wasi:logging/logging@0.1.0-draft;
+  export wasmcloud:messaging/handler@0.2.0;
 }

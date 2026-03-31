@@ -750,10 +750,9 @@ impl HostPlugin for LlmGateway {
 
     fn world(&self) -> WitWorld {
         WitWorld {
-            imports: HashSet::from([
-                WitInterface::from("custom:llm-gateway/chat@0.1.0"),
-                WitInterface::from("custom:llm-gateway/chat-streaming@0.1.0"),
-            ]),
+            exports: HashSet::from([WitInterface::from(
+                "custom:llm-gateway/chat,chat-streaming@0.1.0",
+            )]),
             ..Default::default()
         }
     }

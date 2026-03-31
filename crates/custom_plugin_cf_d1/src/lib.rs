@@ -573,7 +573,7 @@ impl HostPlugin for CloudflareD1 {
     }
     fn world(&self) -> WitWorld {
         WitWorld {
-            imports: HashSet::from([WitInterface::from("custom:cf-d1/query@0.1.0")]),
+            exports: HashSet::from([WitInterface::from("custom:cf-d1/query@0.1.0")]),
             ..Default::default()
         }
     }

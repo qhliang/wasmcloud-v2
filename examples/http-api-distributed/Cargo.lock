@@ -424,6 +424,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "task-leet"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen 0.46.0",
+ "wstd",
+]
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"

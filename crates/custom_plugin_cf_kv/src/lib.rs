@@ -48,7 +48,7 @@ use wash_runtime::engine::workload::WorkloadItem;
 use wash_runtime::plugin::HostPlugin;
 use wash_runtime::wit::{WitInterface, WitWorld};
 
-const PLUGIN_KEYVALUE_ID: &str = "wasi-keyvalue-cf";
+const PLUGIN_KEYVALUE_ID: &str = "wasi-keyvalue-cf-kv";
 
 // Generate bindings for the keyvalue world with trappable error handling
 mod bindings {
@@ -613,7 +613,7 @@ impl HostPlugin for CloudflareKeyValue {
 
     fn world(&self) -> WitWorld {
         WitWorld {
-            imports: HashSet::from([WitInterface::from(
+            exports: HashSet::from([WitInterface::from(
                 "wasi:keyvalue/store,atomics,batch@0.2.0-draft",
             )]),
             ..Default::default()

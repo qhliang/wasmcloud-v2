@@ -70,11 +70,16 @@ enum ScheduleKind {
 
 /// Per-component data tracked by the plugin
 struct ComponentData {
+    /// Token that cancels ALL tasks for this component
     cancel_token: tokio_util::sync::CancellationToken,
     /// Active schedule names (for listing / dedup)
     names: HashSet<String>,
     /// Parsed schedules (stored during bind, used during resolve)
     schedules: Vec<(String, ScheduleKind)>,
+    /// Resolved workload — set during on_workload_resolved, used to spawn runtime tasks
+    workload: Option<ResolvedWorkload>,
+    /// Per-schedule cancel tokens (child of cancel_token) for individual removal
+    task_tokens: HashMap<String, tokio_util::sync::CancellationToken>,
 }
 
 /// The crontab host plugin
@@ -114,7 +119,7 @@ impl<'a> bindings::custom::crontab::scheduler::Host for ActiveCtx<'a> {
         name: String,
         cron_expression: String,
     ) -> wasmtime::Result<Result<(), ScheduleError>> {
-        let _schedule = match Schedule::from_str(&cron_expression) {
+        let schedule = match Schedule::from_str(&format!("0 {cron_expression} *")) {
             Ok(s) => s,
             Err(e) => {
                 return Ok(Err(ScheduleError::InvalidExpression(format!(
@@ -131,35 +136,45 @@ impl<'a> bindings::custom::crontab::scheduler::Host for ActiveCtx<'a> {
 
         let component_id = self.component_id.as_ref().to_string();
 
-        // Check for duplicate name
+        // Check for duplicate name, then record it + spawn the task
         {
-            let lock = plugin.tracker.read().await;
-            if let Some(data) = lock.get_component_data(&component_id)
-                && data.names.contains(&name)
-            {
+            let mut lock = plugin.tracker.write().await;
+            let data = match lock.get_component_data_mut(&component_id) {
+                Some(d) => d,
+                None => {
+                    return Ok(Err(ScheduleError::Internal(
+                        "component not tracked — ensure handler is exported".to_string(),
+                    )));
+                }
+            };
+
+            if data.names.contains(&name) {
                 return Ok(Err(ScheduleError::AlreadyExists(format!(
                     "schedule '{name}' already exists"
                 ))));
             }
-        }
 
-        // Record the name
-        {
-            let mut lock = plugin.tracker.write().await;
-            if let Some(data) = lock.get_component_data_mut(&component_id) {
-                data.names.insert(name.clone());
-            } else {
-                return Ok(Err(ScheduleError::Internal(
-                    "component not tracked — ensure handler is exported".to_string(),
-                )));
-            }
-        }
+            let workload = match &data.workload {
+                Some(w) => w.clone(),
+                None => {
+                    return Ok(Err(ScheduleError::Internal(
+                        "workload not resolved yet".to_string(),
+                    )));
+                }
+            };
 
-        debug!(
-            component_id = %component_id,
-            name = %name,
-            "Runtime cron schedule added"
-        );
+            let task_token = data.cancel_token.child_token();
+            data.names.insert(name.clone());
+            data.task_tokens.insert(name.clone(), task_token.clone());
+
+            debug!(
+                component_id = %component_id,
+                name = %name,
+                "Runtime cron schedule added, spawning task"
+            );
+
+            spawn_cron_task(workload, component_id.clone(), name, schedule, task_token);
+        }
 
         Ok(Ok(()))
     }
@@ -178,36 +193,46 @@ impl<'a> bindings::custom::crontab::scheduler::Host for ActiveCtx<'a> {
 
         let component_id = self.component_id.as_ref().to_string();
 
-        // Check for duplicate name
+        // Check for duplicate name, then record it + spawn the task
         {
-            let lock = plugin.tracker.read().await;
-            if let Some(data) = lock.get_component_data(&component_id)
-                && data.names.contains(&name)
-            {
+            let mut lock = plugin.tracker.write().await;
+            let data = match lock.get_component_data_mut(&component_id) {
+                Some(d) => d,
+                None => {
+                    return Ok(Err(ScheduleError::Internal(
+                        "component not tracked — ensure handler is exported".to_string(),
+                    )));
+                }
+            };
+
+            if data.names.contains(&name) {
                 return Ok(Err(ScheduleError::AlreadyExists(format!(
                     "schedule '{name}' already exists"
                 ))));
             }
-        }
 
-        // Record the name
-        {
-            let mut lock = plugin.tracker.write().await;
-            if let Some(data) = lock.get_component_data_mut(&component_id) {
-                data.names.insert(name.clone());
-            } else {
-                return Ok(Err(ScheduleError::Internal(
-                    "component not tracked — ensure handler is exported".to_string(),
-                )));
-            }
-        }
+            let workload = match &data.workload {
+                Some(w) => w.clone(),
+                None => {
+                    return Ok(Err(ScheduleError::Internal(
+                        "workload not resolved yet".to_string(),
+                    )));
+                }
+            };
 
-        debug!(
-            component_id = %component_id,
-            name = %name,
-            delay_ms,
-            "Runtime delay schedule added"
-        );
+            let task_token = data.cancel_token.child_token();
+            data.names.insert(name.clone());
+            data.task_tokens.insert(name.clone(), task_token.clone());
+
+            debug!(
+                component_id = %component_id,
+                name = %name,
+                delay_ms,
+                "Runtime delay schedule added, spawning task"
+            );
+
+            spawn_delay_task(workload, component_id.clone(), name, delay_ms, task_token);
+        }
 
         Ok(Ok(()))
     }
@@ -225,7 +250,11 @@ impl<'a> bindings::custom::crontab::scheduler::Host for ActiveCtx<'a> {
         let mut lock = plugin.tracker.write().await;
         if let Some(data) = lock.get_component_data_mut(&component_id) {
             if data.names.remove(&name) {
-                debug!(component_id = %component_id, name = %name, "Schedule removed");
+                // Cancel the per-schedule task token if present
+                if let Some(task_token) = data.task_tokens.remove(&name) {
+                    task_token.cancel();
+                }
+                debug!(component_id = %component_id, name = %name, "Schedule removed and task cancelled");
                 Ok(Ok(()))
             } else {
                 Ok(Err(ScheduleError::NotFound(format!(
@@ -596,6 +625,8 @@ impl HostPlugin for Crontab {
                     cancel_token: tokio_util::sync::CancellationToken::new(),
                     names: schedule_names,
                     schedules,
+                    workload: None,
+                    task_tokens: HashMap::new(),
                 },
             );
         }
@@ -610,9 +641,12 @@ impl HostPlugin for Crontab {
     ) -> anyhow::Result<()> {
         // Get cancel token and stored schedules from tracker
         let (cancel_token, schedules) = {
-            let lock = self.tracker.read().await;
-            match lock.get_component_data(component_id) {
-                Some(data) => (data.cancel_token.clone(), data.schedules.clone()),
+            let mut lock = self.tracker.write().await;
+            match lock.get_component_data_mut(component_id) {
+                Some(data) => {
+                    data.workload = Some(workload.clone());
+                    (data.cancel_token.clone(), data.schedules.clone())
+                }
                 None => return Ok(()),
             }
         };
@@ -631,6 +665,15 @@ impl HostPlugin for Crontab {
         let component_id_owned = component_id.to_string();
 
         for (name, kind) in schedules {
+            // Create a child cancel token per schedule so it can be removed individually
+            let task_token = cancel_token.child_token();
+            {
+                let mut lock = self.tracker.write().await;
+                if let Some(data) = lock.get_component_data_mut(&component_id_owned) {
+                    data.task_tokens.insert(name.clone(), task_token.clone());
+                }
+            }
+
             match kind {
                 ScheduleKind::Cron(schedule) => {
                     debug!(
@@ -643,7 +686,7 @@ impl HostPlugin for Crontab {
                         component_id_owned.clone(),
                         name,
                         *schedule,
-                        cancel_token.clone(),
+                        task_token,
                     );
                 }
                 ScheduleKind::Delay(delay_ms) => {
@@ -658,7 +701,7 @@ impl HostPlugin for Crontab {
                         component_id_owned.clone(),
                         name,
                         delay_ms,
-                        cancel_token.clone(),
+                        task_token,
                     );
                 }
             }

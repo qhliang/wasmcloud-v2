@@ -195,7 +195,7 @@ impl HostPlugin for CloudflareR2 {
 
     fn world(&self) -> WitWorld {
         WitWorld {
-            imports: HashSet::from([WitInterface::from(
+            exports: HashSet::from([WitInterface::from(
                 "wasi:blobstore/blobstore,container,types@0.2.0-draft",
             )]),
             ..Default::default()
