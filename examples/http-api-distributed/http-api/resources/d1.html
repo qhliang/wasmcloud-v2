@@ -30,12 +30,20 @@ SELECT name FROM sqlite_master WHERE type='table'</textarea
             >
             <div class="quick-actions">
                 <button
-                    onclick="setQuery('SELECT * FROM sqlite_master WHERE type=\\'table\\'')"
+                    onclick="
+                        setQuery(
+                            'SELECT * FROM sqlite_master WHERE type=\'table\'',
+                        )
+                    "
                 >
                     Show Tables
                 </button>
                 <button
-                    onclick="setQuery('SELECT name, sql FROM sqlite_master WHERE type=\\'table\\'')"
+                    onclick="
+                        setQuery(
+                            'SELECT name, sql FROM sqlite_master WHERE type=\'table\'',
+                        )
+                    "
                 >
                     Schema
                 </button>
