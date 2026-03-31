@@ -231,7 +231,14 @@ impl<'a> bindings::custom::crontab::scheduler::Host for ActiveCtx<'a> {
                 "Runtime delay schedule added, spawning task"
             );
 
-            spawn_delay_task(workload, component_id.clone(), name, delay_ms, task_token);
+            spawn_delay_task(
+                workload,
+                component_id.clone(),
+                name,
+                delay_ms,
+                task_token,
+                plugin.tracker.clone(),
+            );
         }
 
         Ok(Ok(()))
@@ -472,6 +479,7 @@ fn spawn_delay_task(
     name: String,
     delay_ms: u64,
     cancel_token: tokio_util::sync::CancellationToken,
+    tracker: Arc<RwLock<WorkloadTracker<(), ComponentData>>>,
 ) {
     tokio::spawn(async move {
         tokio::select! {
@@ -532,6 +540,20 @@ fn spawn_delay_task(
                             component_id = %component_id,
                             name = %name,
                             "Delay tick handled successfully"
+                        );
+
+                        // Auto-remove one-shot delay from the schedule list
+                        {
+                            let mut lock = tracker.write().await;
+                            if let Some(data) = lock.get_component_data_mut(&component_id) {
+                                data.names.remove(&name);
+                                data.task_tokens.remove(&name);
+                            }
+                        }
+                        debug!(
+                            component_id = %component_id,
+                            name = %name,
+                            "Delay schedule auto-removed"
                         );
                     }
                     Ok(Err(e)) => {
@@ -702,6 +724,7 @@ impl HostPlugin for Crontab {
                         name,
                         delay_ms,
                         task_token,
+                        self.tracker.clone(),
                     );
                 }
             }
