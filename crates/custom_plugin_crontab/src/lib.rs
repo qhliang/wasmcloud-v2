@@ -63,7 +63,7 @@ const PLUGIN_ID: &str = "crontab";
 #[derive(Clone, Debug)]
 enum ScheduleKind {
     /// Periodic cron: 5-field expression like `*/30 * * * *`
-    Cron(Schedule),
+    Cron(Box<Schedule>),
     /// One-shot delay in milliseconds
     Delay(u64),
 }
@@ -134,12 +134,12 @@ impl<'a> bindings::custom::crontab::scheduler::Host for ActiveCtx<'a> {
         // Check for duplicate name
         {
             let lock = plugin.tracker.read().await;
-            if let Some(data) = lock.get_component_data(&component_id) {
-                if data.names.contains(&name) {
-                    return Ok(Err(ScheduleError::AlreadyExists(format!(
-                        "schedule '{name}' already exists"
-                    ))));
-                }
+            if let Some(data) = lock.get_component_data(&component_id)
+                && data.names.contains(&name)
+            {
+                return Ok(Err(ScheduleError::AlreadyExists(format!(
+                    "schedule '{name}' already exists"
+                ))));
             }
         }
 
@@ -181,12 +181,12 @@ impl<'a> bindings::custom::crontab::scheduler::Host for ActiveCtx<'a> {
         // Check for duplicate name
         {
             let lock = plugin.tracker.read().await;
-            if let Some(data) = lock.get_component_data(&component_id) {
-                if data.names.contains(&name) {
-                    return Ok(Err(ScheduleError::AlreadyExists(format!(
-                        "schedule '{name}' already exists"
-                    ))));
-                }
+            if let Some(data) = lock.get_component_data(&component_id)
+                && data.names.contains(&name)
+            {
+                return Ok(Err(ScheduleError::AlreadyExists(format!(
+                    "schedule '{name}' already exists"
+                ))));
             }
         }
 
@@ -289,7 +289,7 @@ fn parse_schedule_config(value: &str) -> Option<(String, ScheduleKind)> {
             _ => expr,
         };
         let schedule = Schedule::from_str(&normalized).ok()?;
-        Some((name, ScheduleKind::Cron(schedule)))
+        Some((name, ScheduleKind::Cron(Box::new(schedule))))
     } else if let Some(ms) = delay_ms {
         let ms: u64 = ms.parse().ok()?;
         Some((name, ScheduleKind::Delay(ms)))
@@ -642,7 +642,7 @@ impl HostPlugin for Crontab {
                         workload.clone(),
                         component_id_owned.clone(),
                         name,
-                        schedule,
+                        *schedule,
                         cancel_token.clone(),
                     );
                 }

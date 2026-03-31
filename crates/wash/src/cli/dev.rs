@@ -81,7 +81,7 @@ impl CliCommand for DevCommand {
                 path = %blobstore_path.display(),
                 "WASI Blobstore plugin registered with filesystem backend"
             );
-        } else if let Some(_) = &dev_config.wasi_blobstore_cloudflare {
+        } else if dev_config.wasi_blobstore_cloudflare.is_some() {
             host_builder =
                 host_builder.with_plugin(Arc::new(custom_plugin_cf_r2::CloudflareR2::new()))?;
             debug!("WASI Blobstore plugin registered with Cloudflare backend");
@@ -166,7 +166,7 @@ impl CliCommand for DevCommand {
                 path = %keyvalue_path.display(),
                 "WASI KeyValue plugin registered with filesystem backend"
             );
-        } else if let Some(_) = &dev_config.wasi_keyvalue_cloudflare {
+        } else if dev_config.wasi_keyvalue_cloudflare.is_some() {
             host_builder = host_builder
                 .with_plugin(Arc::new(custom_plugin_cf_kv::CloudflareKeyValue::new()))?;
             debug!("WASI KeyValue plugin registered with Cloudflare backend");
