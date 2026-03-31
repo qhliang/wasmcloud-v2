@@ -7576,6 +7576,7 @@ dependencies = [
  "custom_plugin_cf_d1",
  "custom_plugin_cf_kv",
  "custom_plugin_cf_r2",
+ "custom_plugin_crontab",
  "custom_plugin_llm_gateway",
  "dialoguer",
  "etcetera 0.10.0",

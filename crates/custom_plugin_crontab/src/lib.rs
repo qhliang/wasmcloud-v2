@@ -79,17 +79,17 @@ struct ComponentData {
 
 /// The crontab host plugin
 #[derive(Clone)]
-pub struct CrontabPlugin {
+pub struct Crontab {
     tracker: Arc<RwLock<WorkloadTracker<(), ComponentData>>>,
 }
 
-impl Default for CrontabPlugin {
+impl Default for Crontab {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl CrontabPlugin {
+impl Crontab {
     pub fn new() -> Self {
         Self {
             tracker: Arc::new(RwLock::new(WorkloadTracker::default())),
@@ -123,7 +123,7 @@ impl<'a> bindings::custom::crontab::scheduler::Host for ActiveCtx<'a> {
             }
         };
 
-        let Some(plugin) = self.get_plugin::<CrontabPlugin>(PLUGIN_ID) else {
+        let Some(plugin) = self.get_plugin::<Crontab>(PLUGIN_ID) else {
             return Ok(Err(ScheduleError::Internal(
                 "crontab plugin not available".to_string(),
             )));
@@ -170,7 +170,7 @@ impl<'a> bindings::custom::crontab::scheduler::Host for ActiveCtx<'a> {
         name: String,
         delay_ms: u64,
     ) -> wasmtime::Result<Result<(), ScheduleError>> {
-        let Some(plugin) = self.get_plugin::<CrontabPlugin>(PLUGIN_ID) else {
+        let Some(plugin) = self.get_plugin::<Crontab>(PLUGIN_ID) else {
             return Ok(Err(ScheduleError::Internal(
                 "crontab plugin not available".to_string(),
             )));
@@ -214,7 +214,7 @@ impl<'a> bindings::custom::crontab::scheduler::Host for ActiveCtx<'a> {
 
     #[instrument(skip_all, fields(name = %name))]
     async fn remove(&mut self, name: String) -> wasmtime::Result<Result<(), ScheduleError>> {
-        let Some(plugin) = self.get_plugin::<CrontabPlugin>(PLUGIN_ID) else {
+        let Some(plugin) = self.get_plugin::<Crontab>(PLUGIN_ID) else {
             return Ok(Err(ScheduleError::Internal(
                 "crontab plugin not available".to_string(),
             )));
@@ -240,7 +240,7 @@ impl<'a> bindings::custom::crontab::scheduler::Host for ActiveCtx<'a> {
     }
 
     async fn list_schedules(&mut self) -> wasmtime::Result<Result<Vec<String>, ScheduleError>> {
-        let Some(plugin) = self.get_plugin::<CrontabPlugin>(PLUGIN_ID) else {
+        let Some(plugin) = self.get_plugin::<Crontab>(PLUGIN_ID) else {
             return Ok(Err(ScheduleError::Internal(
                 "crontab plugin not available".to_string(),
             )));
@@ -532,7 +532,7 @@ fn spawn_delay_task(
 // ---------------------------------------------------------------------------
 
 #[async_trait::async_trait]
-impl HostPlugin for CrontabPlugin {
+impl HostPlugin for Crontab {
     fn id(&self) -> &'static str {
         PLUGIN_ID
     }
@@ -697,13 +697,13 @@ mod tests {
 
     #[test]
     fn test_plugin_id() {
-        let plugin = CrontabPlugin::new();
+        let plugin = Crontab::new();
         assert_eq!(plugin.id(), PLUGIN_ID);
     }
 
     #[test]
     fn test_world_imports() {
-        let plugin = CrontabPlugin::new();
+        let plugin = Crontab::new();
         let world = plugin.world();
         assert!(
             world
@@ -715,7 +715,7 @@ mod tests {
 
     #[test]
     fn test_world_exports() {
-        let plugin = CrontabPlugin::new();
+        let plugin = Crontab::new();
         let world = plugin.world();
         assert!(
             world

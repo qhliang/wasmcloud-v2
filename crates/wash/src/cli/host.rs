@@ -212,6 +212,11 @@ impl CliCommand for HostCommand {
         cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(LlmGateway::new()))?;
         tracing::info!("LLM gateway plugin enabled");
 
+        // Enable crontab plugin
+        cluster_host_builder =
+            cluster_host_builder.with_plugin(Arc::new(custom_plugin_crontab::Crontab::new()))?;
+        tracing::info!("Crontab plugin enabled");
+
         if let Some(postgres_url) = &self.postgres_url {
             cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(
                 plugin::wasmcloud_postgres::WasmcloudPostgres::new(postgres_url)
