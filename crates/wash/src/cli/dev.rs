@@ -189,6 +189,15 @@ impl CliCommand for DevCommand {
         host_builder = host_builder.with_plugin(Arc::new(custom_plugin_crontab::Crontab::new()))?;
         debug!("Crontab plugin enabled");
 
+        // Enable dingtalk stream plugin
+        host_builder =
+            host_builder.with_plugin(Arc::new(custom_plugin_dingtalk_stream::DingTalk::new()))?;
+        debug!("Dingtalk stream plugin enabled");
+
+        // Enable feishu plugin
+        host_builder = host_builder.with_plugin(Arc::new(custom_plugin_feishu::Feishu::new()))?;
+        debug!("Feishu plugin enabled");
+
         // Add postgres plugin if configured
         if let Some(postgres_url) = &dev_config.postgres_url {
             host_builder = host_builder.with_plugin(Arc::new(

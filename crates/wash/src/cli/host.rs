@@ -217,6 +217,16 @@ impl CliCommand for HostCommand {
             cluster_host_builder.with_plugin(Arc::new(custom_plugin_crontab::Crontab::new()))?;
         tracing::info!("Crontab plugin enabled");
 
+        // Enable dingtalk stream plugin
+        cluster_host_builder = cluster_host_builder
+            .with_plugin(Arc::new(custom_plugin_dingtalk_stream::DingTalk::new()))?;
+        tracing::info!("Dingtalk stream plugin enabled");
+
+        // Enable feishu plugin
+        cluster_host_builder =
+            cluster_host_builder.with_plugin(Arc::new(custom_plugin_feishu::Feishu::new()))?;
+        tracing::info!("Feishu plugin enabled");
+
         if let Some(postgres_url) = &self.postgres_url {
             cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(
                 plugin::wasmcloud_postgres::WasmcloudPostgres::new(postgres_url)

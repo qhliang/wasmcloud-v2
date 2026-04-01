@@ -1,0 +1,27 @@
+[package]
+name = "custom_plugin_dingtalk_stream"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+description = "Custom host plugin for DingTalk Stream Mode messaging"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+wasmtime = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+wash-runtime = { path = "../wash-runtime" }
+
+dingtalk-stream = "0.1"

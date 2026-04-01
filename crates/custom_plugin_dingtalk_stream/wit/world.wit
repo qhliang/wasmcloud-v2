@@ -1,0 +1,6 @@
+package my:dingtalk-stream;
+
+world dingtalk-stream {
+    import custom:dingtalk-stream/sender@0.1.0;
+    export custom:dingtalk-stream/handler@0.1.0;
+}

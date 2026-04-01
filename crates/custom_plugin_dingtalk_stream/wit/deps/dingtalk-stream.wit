@@ -1,0 +1,53 @@
+package custom:dingtalk-stream@0.1.0;
+
+interface types {
+    variant dingtalk-error {
+        internal(string),
+        auth-failed(string),
+        send-failed(string),
+    }
+
+    record chatbot-message {
+        conversation-type: string,
+        conversation-id: string,
+        sender-id: string,
+        sender-nick: string,
+        message-id: string,
+        text-content: option<string>,
+        is-admin: bool,
+        is-at: bool,
+        raw-json: string,
+    }
+}
+
+/// Host-provided API for guest to send messages via DingTalk.
+interface sender {
+    use types.{dingtalk-error};
+
+    /// Reply text message to a conversation.
+    /// Uses conversation-id and sender-id to route the reply.
+    send-text: func(conversation-id: string, sender-id: string, content: string) -> result<_, dingtalk-error>;
+
+    /// Reply markdown message to a conversation.
+    send-markdown: func(conversation-id: string, sender-id: string, title: string, content: string) -> result<_, dingtalk-error>;
+
+    /// Send a proactive text message to a user (one-to-one single chat).
+    send-oto-text: func(user-id: string, content: string) -> result<_, dingtalk-error>;
+
+    /// Get the current DingTalk access token.
+    get-access-token: func() -> result<string, dingtalk-error>;
+}
+
+/// Interface that the guest component must export.
+/// The host calls `on-message` when a DingTalk chatbot message arrives.
+interface handler {
+    use types.{chatbot-message};
+
+    /// Called by the host when a DingTalk chatbot message is received.
+    on-message: func(msg: chatbot-message) -> result<_, string>;
+}
+
+world dingtalk-stream {
+    import sender;
+    export handler;
+}
