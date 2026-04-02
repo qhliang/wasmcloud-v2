@@ -1,0 +1,525 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Feishu</title>
+        <style>
+            {BASE_CSS}
+                    .tabs {
+                        display: flex;
+                        flex-wrap: wrap;
+                        gap: 0;
+                        border-bottom: 2px solid #ddd;
+                        margin-bottom: 16px;
+                    }
+                    .tab-btn {
+                        padding: 8px 14px;
+                        background: #eee;
+                        border: none;
+                        cursor: pointer;
+                        font-size: 13px;
+                        color: #333;
+                        border-radius: 4px 4px 0 0;
+                        margin-right: 2px;
+                    }
+                    .tab-btn:hover { background: #ddd; }
+                    .tab-btn.active { background: #0066cc; color: white; }
+                    .tab-content { display: none; }
+                    .tab-content.active { display: block; }
+                    .result-json {
+                        max-height: 300px;
+                        overflow: auto;
+                        font-family: monospace;
+                        font-size: 12px;
+                        white-space: pre-wrap;
+                        word-break: break-all;
+                    }
+        </style>
+    </head>
+    <body>
+        <h1>Feishu</h1>
+        {NAV}
+
+        <div class="section">
+            <div class="tabs">
+                <button class="tab-btn active" onclick="switchTab('im')">IM</button>
+                <button class="tab-btn" onclick="switchTab('contact')">Contact</button>
+                <button class="tab-btn" onclick="switchTab('group')">Group</button>
+                <button class="tab-btn" onclick="switchTab('ai')">AI</button>
+                <button class="tab-btn" onclick="switchTab('calendar')">Calendar</button>
+                <button class="tab-btn" onclick="switchTab('cardkit')">CardKit</button>
+                <button class="tab-btn" onclick="switchTab('mail')">Mail</button>
+                <button class="tab-btn" onclick="switchTab('task')">Task</button>
+                <button class="tab-btn" onclick="switchTab('bot')">Bot</button>
+                <button class="tab-btn" onclick="switchTab('docs')">Docs</button>
+            </div>
+
+            <!-- IM -->
+            <div id="tab-im" class="tab-content active">
+                <h2>IM — Messaging</h2>
+
+                <h3>Send Text</h3>
+                <label>Chat ID</label>
+                <input type="text" id="im-chat-id" placeholder="oc_xxx" />
+                <label>Content</label>
+                <textarea id="im-send-text-content" rows="2" placeholder="Hello from Feishu!"></textarea>
+                <button onclick="feishuCall('im/send-text',{chat_id:gv('im-chat-id'),content:gv('im-send-text-content')},'im-st-res')">Send</button>
+                <div id="im-st-res" class="result"></div>
+
+                <h3>Send Text To User</h3>
+                <label>Receive ID</label>
+                <input type="text" id="im-recv-id" placeholder="ou_xxx or email" />
+                <label>Receive ID Type</label>
+                <input type="text" id="im-recv-id-type" value="open_id" placeholder="open_id / user_id / email" />
+                <label>Content</label>
+                <textarea id="im-send-user-content" rows="2" placeholder="Hello!"></textarea>
+                <button onclick="feishuCall('im/send-text-to-user',{receive_id:gv('im-recv-id'),receive_id_type:gv('im-recv-id-type'),content:gv('im-send-user-content')},'im-stu-res')">Send</button>
+                <div id="im-stu-res" class="result"></div>
+
+                <h3>Reply Message</h3>
+                <label>Message ID</label>
+                <input type="text" id="im-msg-id" placeholder="om_xxx" />
+                <label>Content</label>
+                <textarea id="im-reply-content" rows="2" placeholder="Reply text"></textarea>
+                <button onclick="feishuCall('im/reply-message',{message_id:gv('im-msg-id'),content:gv('im-reply-content')},'im-reply-res')">Reply</button>
+                <div id="im-reply-res" class="result"></div>
+
+                <h3>Get Access Token</h3>
+                <button onclick="feishuCall('im/get-access-token',{},'im-token-res')">Get Token</button>
+                <div id="im-token-res" class="result"></div>
+            </div>
+
+            <!-- Contact -->
+            <div id="tab-contact" class="tab-content">
+                <h2>Contact</h2>
+
+                <h3>Get User</h3>
+                <label>User ID</label>
+                <input type="text" id="ct-user-id" placeholder="ou_xxx" />
+                <label>User ID Type</label>
+                <input type="text" id="ct-user-id-type" value="open_id" />
+                <button onclick="feishuCall('contact/get-user',{user_id:gv('ct-user-id'),user_id_type:gv('ct-user-id-type')},'ct-gu-res')">Get User</button>
+                <div id="ct-gu-res" class="result"></div>
+
+                <h3>Batch Get Users</h3>
+                <label>Request JSON</label>
+                <textarea id="ct-batch-json" rows="4">{
+  "user_id_type": "open_id",
+  "user_ids": ["ou_xxx"]
+}</textarea>
+                <button onclick="feishuJsonCall('contact/batch-get-users',gv('ct-batch-json'),'ct-bg-res')">Batch Get</button>
+                <div id="ct-bg-res" class="result"></div>
+
+                <h3>Search Users</h3>
+                <label>Request JSON</label>
+                <textarea id="ct-search-json" rows="4">{
+  "query": "test",
+  "page_size": 20
+}</textarea>
+                <button onclick="feishuJsonCall('contact/search-users',gv('ct-search-json'),'ct-su-res')">Search</button>
+                <div id="ct-su-res" class="result"></div>
+
+                <h3>List Department Users</h3>
+                <label>Request JSON</label>
+                <textarea id="ct-dept-users-json" rows="4">{
+  "department_id": "0",
+  "department_id_type": "open_department_id",
+  "page_size": 20
+}</textarea>
+                <button onclick="feishuJsonCall('contact/list-department-users',gv('ct-dept-users-json'),'ct-du-res')">List</button>
+                <div id="ct-du-res" class="result"></div>
+
+                <h3>Get Department</h3>
+                <label>Department ID</label>
+                <input type="text" id="ct-dept-id" placeholder="0" value="0" />
+                <label>Department ID Type</label>
+                <input type="text" id="ct-dept-id-type" value="open_department_id" />
+                <button onclick="feishuCall('contact/get-department',{department_id:gv('ct-dept-id'),department_id_type:gv('ct-dept-id-type')},'ct-gd-res')">Get Department</button>
+                <div id="ct-gd-res" class="result"></div>
+
+                <h3>List Sub Departments</h3>
+                <label>Request JSON</label>
+                <textarea id="ct-sub-dept-json" rows="4">{
+  "department_id": "0",
+  "department_id_type": "open_department_id",
+  "page_size": 20
+}</textarea>
+                <button onclick="feishuJsonCall('contact/list-sub-departments',gv('ct-sub-dept-json'),'ct-sd-res')">List</button>
+                <div id="ct-sd-res" class="result"></div>
+            </div>
+
+            <!-- Group -->
+            <div id="tab-group" class="tab-content">
+                <h2>Group</h2>
+
+                <h3>Create Group</h3>
+                <label>Request JSON</label>
+                <textarea id="grp-create-json" rows="4">{
+  "name": "Test Group",
+  "description": "Created via API"
+}</textarea>
+                <button onclick="feishuJsonCall('group/create-group',gv('grp-create-json'),'grp-cg-res')">Create</button>
+                <div id="grp-cg-res" class="result"></div>
+
+                <h3>Get Group</h3>
+                <label>Chat ID</label>
+                <input type="text" id="grp-chat-id" placeholder="oc_xxx" />
+                <button onclick="feishuCall('group/get-group',{chat_id:gv('grp-chat-id')},'grp-gg-res')">Get</button>
+                <div id="grp-gg-res" class="result"></div>
+
+                <h3>Update Group</h3>
+                <label>Chat ID</label>
+                <input type="text" id="grp-upd-chat-id" placeholder="oc_xxx" />
+                <label>Request JSON</label>
+                <textarea id="grp-upd-json" rows="3">{
+  "name": "Updated Name"
+}</textarea>
+                <button onclick="feishuCall('group/update-group',{chat_id:gv('grp-upd-chat-id'),request_json:gv('grp-upd-json')},'grp-ug-res')">Update</button>
+                <div id="grp-ug-res" class="result"></div>
+
+                <h3>Add Group Members</h3>
+                <label>Chat ID</label>
+                <input type="text" id="grp-add-chat-id" placeholder="oc_xxx" />
+                <label>Request JSON</label>
+                <textarea id="grp-add-json" rows="3">{
+  "id_list": ["ou_xxx"]
+}</textarea>
+                <button onclick="feishuCall('group/add-group-members',{chat_id:gv('grp-add-chat-id'),request_json:gv('grp-add-json')},'grp-am-res')">Add</button>
+                <div id="grp-am-res" class="result"></div>
+
+                <h3>Remove Group Members</h3>
+                <label>Chat ID</label>
+                <input type="text" id="grp-rm-chat-id" placeholder="oc_xxx" />
+                <label>Request JSON</label>
+                <textarea id="grp-rm-json" rows="3">{
+  "id_list": ["ou_xxx"]
+}</textarea>
+                <button onclick="feishuCall('group/remove-group-members',{chat_id:gv('grp-rm-chat-id'),request_json:gv('grp-rm-json')},'grp-rm-res')">Remove</button>
+                <div id="grp-rm-res" class="result"></div>
+
+                <h3>List Group Members</h3>
+                <label>Chat ID</label>
+                <input type="text" id="grp-ls-chat-id" placeholder="oc_xxx" />
+                <label>Request JSON (pagination)</label>
+                <textarea id="grp-ls-json" rows="3">{
+  "page_size": "20"
+}</textarea>
+                <button onclick="feishuCall('group/list-group-members',{chat_id:gv('grp-ls-chat-id'),request_json:gv('grp-ls-json')},'grp-lm-res')">List</button>
+                <div id="grp-lm-res" class="result"></div>
+            </div>
+
+            <!-- AI -->
+            <div id="tab-ai" class="tab-content">
+                <h2>AI — OCR &amp; Translation</h2>
+
+                <h3>Recognize Text (OCR)</h3>
+                <label>Request JSON</label>
+                <textarea id="ai-ocr-json" rows="6">{
+  "image": "<base64-encoded-image>",
+  "language": "zh"
+}</textarea>
+                <button onclick="feishuJsonCall('ai/recognize-text',gv('ai-ocr-json'),'ai-ocr-res')">Recognize</button>
+                <div id="ai-ocr-res" class="result"></div>
+
+                <h3>Translate</h3>
+                <label>Request JSON</label>
+                <textarea id="ai-translate-json" rows="6">{
+  "source_language": "zh",
+  "target_language": "en",
+  "text": "Hello World"
+}</textarea>
+                <button onclick="feishuJsonCall('ai/translate',gv('ai-translate-json'),'ai-tr-res')">Translate</button>
+                <div id="ai-tr-res" class="result"></div>
+            </div>
+
+            <!-- Calendar -->
+            <div id="tab-calendar" class="tab-content">
+                <h2>Calendar</h2>
+
+                <h3>List Calendars</h3>
+                <label>Request JSON (pagination)</label>
+                <textarea id="cal-list-json" rows="3">{
+  "page_size": "20"
+}</textarea>
+                <button onclick="feishuJsonCall('calendar/list-calendars',gv('cal-list-json'),'cal-lc-res')">List</button>
+                <div id="cal-lc-res" class="result"></div>
+
+                <h3>Create Calendar Event</h3>
+                <label>Calendar ID</label>
+                <input type="text" id="cal-id" placeholder="cal_xxx" />
+                <label>Request JSON</label>
+                <textarea id="cal-create-json" rows="8">{
+  "summary": "Test Event",
+  "start_time": "2026-04-01 10:00:00",
+  "end_time": "2026-04-01 11:00:00"
+}</textarea>
+                <button onclick="feishuCall('calendar/create-calendar-event',{calendar_id:gv('cal-id'),request_json:gv('cal-create-json')},'cal-ce-res')">Create</button>
+                <div id="cal-ce-res" class="result"></div>
+
+                <h3>List Calendar Events</h3>
+                <label>Calendar ID</label>
+                <input type="text" id="cal-ev-cal-id" placeholder="cal_xxx" />
+                <label>Request JSON</label>
+                <textarea id="cal-ev-list-json" rows="3">{
+  "page_size": "20"
+}</textarea>
+                <button onclick="feishuCall('calendar/list-calendar-events',{calendar_id:gv('cal-ev-cal-id'),request_json:gv('cal-ev-list-json')},'cal-le-res')">List</button>
+                <div id="cal-le-res" class="result"></div>
+
+                <h3>Get Calendar Event</h3>
+                <label>Calendar ID</label>
+                <input type="text" id="cal-get-cal-id" placeholder="cal_xxx" />
+                <label>Event ID</label>
+                <input type="text" id="cal-get-ev-id" placeholder="evt_xxx" />
+                <button onclick="feishuCall('calendar/get-calendar-event',{calendar_id:gv('cal-get-cal-id'),event_id:gv('cal-get-ev-id')},'cal-ge-res')">Get</button>
+                <div id="cal-ge-res" class="result"></div>
+
+                <h3>Delete Calendar Event</h3>
+                <label>Calendar ID</label>
+                <input type="text" id="cal-del-cal-id" placeholder="cal_xxx" />
+                <label>Event ID</label>
+                <input type="text" id="cal-del-ev-id" placeholder="evt_xxx" />
+                <button class="danger" onclick="feishuCall('calendar/delete-calendar-event',{calendar_id:gv('cal-del-cal-id'),event_id:gv('cal-del-ev-id')},'cal-de-res')">Delete</button>
+                <div id="cal-de-res" class="result"></div>
+            </div>
+
+            <!-- CardKit -->
+            <div id="tab-cardkit" class="tab-content">
+                <h2>CardKit — Interactive Cards</h2>
+
+                <h3>Create Card</h3>
+                <label>Request JSON</label>
+                <textarea id="ck-create-json" rows="8">{
+  "elements": [{
+    "type": "markdown",
+    "content": "**Hello** from CardKit"
+  }]
+}</textarea>
+                <button onclick="feishuJsonCall('cardkit/create-card',gv('ck-create-json'),'ck-cc-res')">Create</button>
+                <div id="ck-cc-res" class="result"></div>
+
+                <h3>Update Card</h3>
+                <label>Card ID</label>
+                <input type="text" id="ck-card-id" placeholder="card_xxx" />
+                <label>Request JSON</label>
+                <textarea id="ck-update-json" rows="8">{
+  "elements": [{
+    "type": "markdown",
+    "content": "**Updated** card content"
+  }]
+}</textarea>
+                <button onclick="feishuCall('cardkit/update-card',{card_id:gv('ck-card-id'),request_json:gv('ck-update-json')},'ck-uc-res')">Update</button>
+                <div id="ck-uc-res" class="result"></div>
+            </div>
+
+            <!-- Mail -->
+            <div id="tab-mail" class="tab-content">
+                <h2>Mail</h2>
+
+                <h3>Send Mail</h3>
+                <label>User Mailbox ID</label>
+                <input type="text" id="mail-mb-id" placeholder="mailbox-id" />
+                <label>Request JSON</label>
+                <textarea id="mail-send-json" rows="8">{
+  "subject": "Test Subject",
+  "to": ["test@example.com"],
+  "content": "Hello from Feishu Mail API"
+}</textarea>
+                <button onclick="feishuCall('mail/send-mail',{user_mailbox_id:gv('mail-mb-id'),request_json:gv('mail-send-json')},'mail-sm-res')">Send</button>
+                <div id="mail-sm-res" class="result"></div>
+
+                <h3>List Mails</h3>
+                <label>User Mailbox ID</label>
+                <input type="text" id="mail-ls-mb-id" placeholder="mailbox-id" />
+                <label>Request JSON</label>
+                <textarea id="mail-list-json" rows="3">{
+  "page_size": "20"
+}</textarea>
+                <button onclick="feishuCall('mail/list-mails',{user_mailbox_id:gv('mail-ls-mb-id'),request_json:gv('mail-list-json')},'mail-lm-res')">List</button>
+                <div id="mail-lm-res" class="result"></div>
+
+                <h3>Get Mail</h3>
+                <label>User Mailbox ID</label>
+                <input type="text" id="mail-get-mb-id" placeholder="mailbox-id" />
+                <label>Message ID</label>
+                <input type="text" id="mail-msg-id" placeholder="msg_xxx" />
+                <button onclick="feishuCall('mail/get-mail',{user_mailbox_id:gv('mail-get-mb-id'),message_id:gv('mail-msg-id')},'mail-gm-res')">Get</button>
+                <div id="mail-gm-res" class="result"></div>
+            </div>
+
+            <!-- Task -->
+            <div id="tab-task" class="tab-content">
+                <h2>Task</h2>
+
+                <h3>Create Task</h3>
+                <label>Request JSON</label>
+                <textarea id="task-create-json" rows="4">{
+  "summary": "Test Task",
+  "description": "Task description"
+}</textarea>
+                <button onclick="feishuJsonCall('task/create-task',gv('task-create-json'),'task-ct-res')">Create</button>
+                <div id="task-ct-res" class="result"></div>
+
+                <h3>Get Task</h3>
+                <label>Task GUID</label>
+                <input type="text" id="task-guid" placeholder="task-guid" />
+                <button onclick="feishuCall('task/get-task',{task_guid:gv('task-guid')},'task-gt-res')">Get</button>
+                <div id="task-gt-res" class="result"></div>
+
+                <h3>Update Task</h3>
+                <label>Task GUID</label>
+                <input type="text" id="task-upd-guid" placeholder="task-guid" />
+                <label>Request JSON</label>
+                <textarea id="task-upd-json" rows="3">{
+  "summary": "Updated Task"
+}</textarea>
+                <button onclick="feishuCall('task/update-task',{task_guid:gv('task-upd-guid'),request_json:gv('task-upd-json')},'task-ut-res')">Update</button>
+                <div id="task-ut-res" class="result"></div>
+
+                <h3>Delete Task</h3>
+                <label>Task GUID</label>
+                <input type="text" id="task-del-guid" placeholder="task-guid" />
+                <button class="danger" onclick="feishuCall('task/delete-task',{task_guid:gv('task-del-guid')},'task-dt-res')">Delete</button>
+                <div id="task-dt-res" class="result"></div>
+
+                <h3>List Tasks</h3>
+                <label>Request JSON</label>
+                <textarea id="task-list-json" rows="4">{
+  "page_size": 20
+}</textarea>
+                <button onclick="feishuJsonCall('task/list-tasks',gv('task-list-json'),'task-lt-res')">List</button>
+                <div id="task-lt-res" class="result"></div>
+
+                <h3>Create Tasklist</h3>
+                <label>Request JSON</label>
+                <textarea id="task-ctl-json" rows="3">{
+  "name": "My Tasklist"
+}</textarea>
+                <button onclick="feishuJsonCall('task/create-tasklist',gv('task-ctl-json'),'task-ctl-res')">Create</button>
+                <div id="task-ctl-res" class="result"></div>
+
+                <h3>List Tasklists</h3>
+                <label>Request JSON</label>
+                <textarea id="task-ltl-json" rows="3">{
+  "page_size": 20
+}</textarea>
+                <button onclick="feishuJsonCall('task/list-tasklists',gv('task-ltl-json'),'task-ltl-res')">List</button>
+                <div id="task-ltl-res" class="result"></div>
+            </div>
+
+            <!-- Bot -->
+            <div id="tab-bot" class="tab-content">
+                <h2>Bot</h2>
+
+                <h3>Get Bot Info</h3>
+                <button onclick="feishuCall('bot/get-bot-info',{},'bot-gbi-res')">Get Bot Info</button>
+                <div id="bot-gbi-res" class="result"></div>
+            </div>
+
+            <!-- Docs -->
+            <div id="tab-docs" class="tab-content">
+                <h2>Docs — Cloud Documents</h2>
+
+                <h3>Create Document</h3>
+                <label>Request JSON</label>
+                <textarea id="docs-cd-json" rows="4">{
+  "title": "Test Document",
+  "folder_token": ""
+}</textarea>
+                <button onclick="feishuJsonCall('docs/create-document',gv('docs-cd-json'),'docs-cd-res')">Create</button>
+                <div id="docs-cd-res" class="result"></div>
+
+                <h3>Get Document</h3>
+                <label>Document ID</label>
+                <input type="text" id="docs-doc-id" placeholder="doxcnxxx" />
+                <button onclick="feishuCall('docs/get-document',{document_id:gv('docs-doc-id')},'docs-gd-res')">Get</button>
+                <div id="docs-gd-res" class="result"></div>
+
+                <h3>Create Spreadsheet</h3>
+                <label>Request JSON</label>
+                <textarea id="docs-cs-json" rows="4">{
+  "title": "Test Spreadsheet",
+  "folder_token": ""
+}</textarea>
+                <button onclick="feishuJsonCall('docs/create-spreadsheet',gv('docs-cs-json'),'docs-cs-res')">Create</button>
+                <div id="docs-cs-res" class="result"></div>
+
+                <h3>Get Spreadsheet</h3>
+                <label>Spreadsheet Token</label>
+                <input type="text" id="docs-ss-token" placeholder="shtcnxxx" />
+                <button onclick="feishuCall('docs/get-spreadsheet',{spreadsheet_token:gv('docs-ss-token')},'docs-gs-res')">Get</button>
+                <div id="docs-gs-res" class="result"></div>
+
+                <h3>Create Bitable</h3>
+                <label>Request JSON</label>
+                <textarea id="docs-cb-json" rows="4">{
+  "name": "Test Bitable",
+  "folder_token": ""
+}</textarea>
+                <button onclick="feishuJsonCall('docs/create-bitable',gv('docs-cb-json'),'docs-cb-res')">Create</button>
+                <div id="docs-cb-res" class="result"></div>
+
+                <h3>List Bitable Tables</h3>
+                <label>App Token</label>
+                <input type="text" id="docs-bt-app-token" placeholder="bascnxxx" />
+                <button onclick="feishuCall('docs/list-bitable-tables',{app_token:gv('docs-bt-app-token')},'docs-lbt-res')">List</button>
+                <div id="docs-lbt-res" class="result"></div>
+
+                <h3>List Bitable Records</h3>
+                <label>App Token</label>
+                <input type="text" id="docs-br-app-token" placeholder="bascnxxx" />
+                <label>Table ID</label>
+                <input type="text" id="docs-br-table-id" placeholder="tblxxx" />
+                <label>Request JSON</label>
+                <textarea id="docs-br-json" rows="4">{
+  "page_size": 20
+}</textarea>
+                <button onclick="feishuCall('docs/list-bitable-records',{app_token:gv('docs-br-app-token'),table_id:gv('docs-br-table-id'),request_json:gv('docs-br-json')},'docs-lbr-res')">List</button>
+                <div id="docs-lbr-res" class="result"></div>
+            </div>
+        </div>
+
+        <script>
+            {
+                BASE_JS;
+            }
+
+            function gv(id) {
+                return document.getElementById(id).value.trim();
+            }
+
+            function switchTab(name) {
+                document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+                document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+                document.getElementById('tab-' + name).classList.add('active');
+                event.target.classList.add('active');
+            }
+
+            async function feishuCall(endpoint, body, resultId) {
+                try {
+                    const resp = await fetch('/feishu/' + endpoint, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body),
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok) {
+                        showResult(resultId, 'Error: ' + (data.error || JSON.stringify(data, null, 2)), true);
+                    } else {
+                        const el = document.getElementById(resultId);
+                        el.innerHTML = '<div class="result-json">' + escapeHtml(JSON.stringify(data, null, 2)) + '</div>';
+                        el.className = 'result success';
+                        el.style.display = 'block';
+                    }
+                } catch (e) {
+                    showResult(resultId, 'Error: ' + e.message, true);
+                }
+            }
+
+            async function feishuJsonCall(endpoint, requestJson, resultId) {
+                return feishuCall(endpoint, { request_json: requestJson }, resultId);
+            }
+        </script>
+    </body>
+</html>

@@ -339,19 +339,10 @@ impl HostPlugin for Feishu {
 
     fn world(&self) -> WitWorld {
         WitWorld {
-            imports: HashSet::from([
-                WitInterface::from("custom:feishu/sender,types@0.1.0"),
-                WitInterface::from("custom:feishu/contact-sender@0.1.0"),
-                WitInterface::from("custom:feishu/group-sender@0.1.0"),
-                WitInterface::from("custom:feishu/ai-sender@0.1.0"),
-                WitInterface::from("custom:feishu/calendar-sender@0.1.0"),
-                WitInterface::from("custom:feishu/cardkit-sender@0.1.0"),
-                WitInterface::from("custom:feishu/mail-sender@0.1.0"),
-                WitInterface::from("custom:feishu/task-sender@0.1.0"),
-                WitInterface::from("custom:feishu/bot-sender@0.1.0"),
-                WitInterface::from("custom:feishu/docs-sender@0.1.0"),
-            ]),
-            exports: HashSet::from([WitInterface::from("custom:feishu/handler@0.1.0")]),
+            imports: HashSet::from([WitInterface::from(
+                "custom:feishu/sender,types,contact-sender,group-sender,ai-sender,calendar-sender,cardkit-sender,mail-sender,task-sender,bot-sender,docs-sender@0.1.0",
+            )]),
+            ..Default::default()
         }
     }
 
@@ -381,28 +372,28 @@ impl HostPlugin for Feishu {
             return Ok(());
         };
 
-        let has_handler = component_handle
-            .world()
-            .exports
-            .iter()
-            .any(|i| i.namespace == "custom" && i.package == "feishu");
+        // let has_handler = component_handle
+        //     .world()
+        //     .exports
+        //     .iter()
+        //     .any(|i| i.namespace == "custom" && i.package == "feishu");
 
-        if has_handler {
-            debug!(
-                component_id = component_handle.id(),
-                "Tracking component for Feishu IM callbacks"
-            );
+        // if has_handler {
+        debug!(
+            component_id = component_handle.id(),
+            "Tracking component for Feishu IM callbacks"
+        );
 
-            self.tracker.write().await.add_component(
-                component_handle,
-                ComponentData {
-                    cancel_token: tokio_util::sync::CancellationToken::new(),
-                    workload: None,
-                    client: None,
-                    config,
-                },
-            );
-        }
+        self.tracker.write().await.add_component(
+            component_handle,
+            ComponentData {
+                cancel_token: tokio_util::sync::CancellationToken::new(),
+                workload: None,
+                client: None,
+                config,
+            },
+        );
+        // }
 
         Ok(())
     }

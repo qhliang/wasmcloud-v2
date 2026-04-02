@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>DingTalk Stream</title>
+        <style>
+            {BASE_CSS}
+        </style>
+    </head>
+    <body>
+        <h1>DingTalk Stream</h1>
+        {NAV}
+
+        <div class="section">
+            <h2>Send Text</h2>
+            <label for="stConvId">Conversation ID</label>
+            <input type="text" id="stConvId" placeholder="conversation-id" />
+            <label for="stSenderId">Sender ID</label>
+            <input type="text" id="stSenderId" placeholder="sender-id" />
+            <label for="stContent">Content</label>
+            <textarea id="stContent" rows="3" placeholder="Hello from DingTalk!"></textarea>
+            <button onclick="sendText()">Send Text</button>
+            <div id="stResult" class="result"></div>
+        </div>
+
+        <div class="section">
+            <h2>Send Markdown</h2>
+            <label for="smConvId">Conversation ID</label>
+            <input type="text" id="smConvId" placeholder="conversation-id" />
+            <label for="smSenderId">Sender ID</label>
+            <input type="text" id="smSenderId" placeholder="sender-id" />
+            <label for="smTitle">Title</label>
+            <input type="text" id="smTitle" placeholder="Message Title" />
+            <label for="smContent">Content (Markdown)</label>
+            <textarea id="smContent" rows="4" placeholder="# Hello\nThis is **markdown** content"></textarea>
+            <button onclick="sendMarkdown()">Send Markdown</button>
+            <div id="smResult" class="result"></div>
+        </div>
+
+        <div class="section">
+            <h2>Send OTO Text (One-to-One)</h2>
+            <label for="otoUserId">User ID</label>
+            <input type="text" id="otoUserId" placeholder="user-id" />
+            <label for="otoContent">Content</label>
+            <textarea id="otoContent" rows="3" placeholder="Hello! This is a proactive message."></textarea>
+            <button onclick="sendOtoText()">Send</button>
+            <div id="otoResult" class="result"></div>
+        </div>
+
+        <div class="section">
+            <h2>Get Access Token</h2>
+            <button onclick="getAccessToken()">Get Access Token</button>
+            <div id="tokenResult" class="result"></div>
+        </div>
+
+        <script>
+            {
+                BASE_JS;
+            }
+
+            async function sendText() {
+                const conversation_id = document.getElementById("stConvId").value.trim();
+                const sender_id = document.getElementById("stSenderId").value.trim();
+                const content = document.getElementById("stContent").value.trim();
+                if (!conversation_id || !sender_id || !content) {
+                    showResult("stResult", "All fields are required", true);
+                    return;
+                }
+                try {
+                    const resp = await fetch("/dingtalk/send-text", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ conversation_id, sender_id, content }),
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok) {
+                        showResult("stResult", "Error: " + (data.error || JSON.stringify(data, null, 2)), true);
+                    } else {
+                        showResult("stResult", "Sent successfully", false);
+                    }
+                } catch (e) {
+                    showResult("stResult", "Error: " + e.message, true);
+                }
+            }
+
+            async function sendMarkdown() {
+                const conversation_id = document.getElementById("smConvId").value.trim();
+                const sender_id = document.getElementById("smSenderId").value.trim();
+                const title = document.getElementById("smTitle").value.trim();
+                const content = document.getElementById("smContent").value.trim();
+                if (!conversation_id || !sender_id || !title || !content) {
+                    showResult("smResult", "All fields are required", true);
+                    return;
+                }
+                try {
+                    const resp = await fetch("/dingtalk/send-markdown", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ conversation_id, sender_id, title, content }),
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok) {
+                        showResult("smResult", "Error: " + (data.error || JSON.stringify(data, null, 2)), true);
+                    } else {
+                        showResult("smResult", "Sent successfully", false);
+                    }
+                } catch (e) {
+                    showResult("smResult", "Error: " + e.message, true);
+                }
+            }
+
+            async function sendOtoText() {
+                const user_id = document.getElementById("otoUserId").value.trim();
+                const content = document.getElementById("otoContent").value.trim();
+                if (!user_id || !content) {
+                    showResult("otoResult", "All fields are required", true);
+                    return;
+                }
+                try {
+                    const resp = await fetch("/dingtalk/send-oto-text", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ user_id, content }),
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok) {
+                        showResult("otoResult", "Error: " + (data.error || JSON.stringify(data, null, 2)), true);
+                    } else {
+                        showResult("otoResult", "Sent successfully", false);
+                    }
+                } catch (e) {
+                    showResult("otoResult", "Error: " + e.message, true);
+                }
+            }
+
+            async function getAccessToken() {
+                try {
+                    const resp = await fetch("/dingtalk/get-access-token", {
+                        method: "POST",
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok) {
+                        showResult("tokenResult", "Error: " + (data.error || JSON.stringify(data, null, 2)), true);
+                    } else {
+                        showResult("tokenResult", "Token: " + data.token, false);
+                    }
+                } catch (e) {
+                    showResult("tokenResult", "Error: " + e.message, true);
+                }
+            }
+        </script>
+    </body>
+</html>

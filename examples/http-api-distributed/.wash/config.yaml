@@ -64,6 +64,20 @@ dev:
         # base_url: https://openrouter.ai/api/v1/chat/completions
         model_name: z-ai/glm-4.5-air:free
         api_key: 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
+    - namespace: custom
+      package: dingtalk-stream
+      interfaces:
+        - sender
+      config:
+        client-id: dingyoneajfa6v5iimh5
+        client-secret: z22GV9SayKtdhUVEN6i1qkZr3983ciMvzdvlM8MWKvHHP2nscbDOawCaHCSx7Ob0
+    - namespace: custom
+      package: feishu
+      interfaces:
+        - sender
+      config:
+        app-id: cli_a946044d55f99bde
+        app-secret: oFk1iE8PibychCsyYhX9qcLQqS70lTqd
 
 new:
   command: cargo fetch
