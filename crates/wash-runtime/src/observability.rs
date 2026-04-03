@@ -22,6 +22,14 @@ pub fn initialize_observability(
     // STDERR logging layer
     let mut fmt_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level.as_str()));
+    // wasmtime internal crates produce verbose debug logs that are never useful for end users
+    fmt_filter = fmt_filter
+        .add_directive(directive("cranelift_codegen=info")?)
+        .add_directive(directive("wasmtime_internal_cranelift=info")?)
+        .add_directive(directive("wasmtime=info")?)
+        .add_directive(directive("h2=info")?)
+        .add_directive(directive("rustl=info")?);
+
     if !verbose {
         // async_nats prints out on connect
         fmt_filter = fmt_filter
