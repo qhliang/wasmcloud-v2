@@ -227,6 +227,11 @@ impl CliCommand for HostCommand {
             cluster_host_builder.with_plugin(Arc::new(custom_plugin_feishu::Feishu::new()))?;
         tracing::info!("Feishu plugin enabled");
 
+        // Enable mail plugin
+        cluster_host_builder =
+            cluster_host_builder.with_plugin(Arc::new(custom_plugin_mail::Mail::new()))?;
+        tracing::info!("Mail plugin enabled");
+
         if let Some(postgres_url) = &self.postgres_url {
             cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(
                 plugin::wasmcloud_postgres::WasmcloudPostgres::new(postgres_url)

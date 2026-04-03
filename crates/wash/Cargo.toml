@@ -60,6 +60,7 @@ custom_plugin_cf_kv = { path = "../custom_plugin_cf_kv" }
 custom_plugin_cf_r2 = { path = "../custom_plugin_cf_r2" }
 custom_plugin_cf_d1 = { path = "../custom_plugin_cf_d1" }
 custom_plugin_llm_gateway = { path = "../custom_plugin_llm_gateway" }
+custom_plugin_mail = { path = "../custom_plugin_mail" }
 custom_plugin_crontab = { path = "../custom_plugin_crontab" }
 custom_plugin_dingtalk_stream = { path = "../custom_plugin_dingtalk_stream" }
 custom_plugin_feishu = { path = "../custom_plugin_feishu" }

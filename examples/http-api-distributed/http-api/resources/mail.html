@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Mail</title>
+        <style>
+            {BASE_CSS}
+        </style>
+    </head>
+    <body>
+        <h1>Mail</h1>
+        {NAV}
+
+        <div class="section">
+            <h2>Send Mail</h2>
+            <label for="mailTo">To *</label>
+            <input type="text" id="mailTo" placeholder="recipient@example.com" />
+            <label for="mailSubject">Subject *</label>
+            <input type="text" id="mailSubject" placeholder="Hello from wasmCloud" />
+            <label for="mailBodyText">Body (Text)</label>
+            <textarea id="mailBodyText" rows="4" placeholder="Plain text body..."></textarea>
+            <label for="mailBodyHtml">Body (HTML)</label>
+            <textarea id="mailBodyHtml" rows="4" placeholder="<h1>HTML body</h1>"></textarea>
+            <label for="mailCc">CC</label>
+            <input type="text" id="mailCc" placeholder="cc@example.com" />
+            <label for="mailBcc">BCC</label>
+            <input type="text" id="mailBcc" placeholder="bcc@example.com" />
+            <button onclick="sendMail()">Send Mail</button>
+            <div id="sendResult" class="result"></div>
+        </div>
+
+        <div class="section">
+            <h2>List Mails</h2>
+            <label for="listMailbox">Mailbox</label>
+            <input type="text" id="listMailbox" placeholder="INBOX" />
+            <label for="listCriteria">Search Criteria (IMAP)</label>
+            <input type="text" id="listCriteria" placeholder="ALL" />
+            <label for="listLimit">Limit</label>
+            <input type="number" id="listLimit" placeholder="20" min="1" max="100" />
+            <button onclick="listMails()">List Mails</button>
+            <div id="listResult" class="result"></div>
+        </div>
+
+        <div class="section">
+            <h2>Get Mail</h2>
+            <label for="getMessageId">Message UID *</label>
+            <input type="text" id="getMessageId" placeholder="123" />
+            <label for="getMailbox">Mailbox</label>
+            <input type="text" id="getMailbox" placeholder="INBOX" />
+            <button onclick="getMail()">Get Mail</button>
+            <div id="getResult" class="result"></div>
+        </div>
+
+        <script>
+            {
+                BASE_JS;
+            }
+
+            async function sendMail() {
+                const to = document.getElementById("mailTo").value.trim();
+                const subject = document.getElementById("mailSubject").value.trim();
+                const body_text = document.getElementById("mailBodyText").value.trim();
+                const body_html = document.getElementById("mailBodyHtml").value.trim();
+                const cc = document.getElementById("mailCc").value.trim();
+                const bcc = document.getElementById("mailBcc").value.trim();
+
+                if (!to || !subject) {
+                    showResult("sendResult", "To and Subject are required", true);
+                    return;
+                }
+
+                const payload = { to, subject };
+                if (body_text) payload.body_text = body_text;
+                if (body_html) payload.body_html = body_html;
+                if (cc) payload.cc = cc;
+                if (bcc) payload.bcc = bcc;
+
+                try {
+                    const resp = await fetch("/mail/send", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(payload),
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok) {
+                        showResult("sendResult", "Error: " + (data.error || JSON.stringify(data, null, 2)), true);
+                    } else {
+                        showResult("sendResult", "Mail sent successfully", false);
+                    }
+                } catch (e) {
+                    showResult("sendResult", "Error: " + e.message, true);
+                }
+            }
+
+            async function listMails() {
+                const mailbox = document.getElementById("listMailbox").value.trim();
+                const search_criteria = document.getElementById("listCriteria").value.trim();
+                const limitVal = document.getElementById("listLimit").value.trim();
+
+                const payload = {};
+                if (mailbox) payload.mailbox = mailbox;
+                if (search_criteria) payload.search_criteria = search_criteria;
+                if (limitVal) payload.limit = parseInt(limitVal);
+
+                try {
+                    const resp = await fetch("/mail/list", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(payload),
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok) {
+                        showResult("listResult", "Error: " + (data.error || JSON.stringify(data, null, 2)), true);
+                    } else {
+                        const mails = typeof data === "string" ? JSON.parse(data) : data;
+                        if (Array.isArray(mails) && mails.length === 0) {
+                            showResult("listResult", "No messages found", false);
+                        } else {
+                            let html = "<table><tr><th>UID</th><th>From</th><th>Subject</th><th>Date</th><th>Flags</th></tr>";
+                            for (const m of mails) {
+                                html += "<tr>";
+                                html += '<td><a href="#" onclick="loadGetMail(\'' + m.uid + '\'); return false;">' + m.uid + "</a></td>";
+                                html += "<td>" + escapeHtml(m.from || "") + "</td>";
+                                html += "<td>" + escapeHtml(m.subject || "") + "</td>";
+                                html += "<td>" + escapeHtml(m.date || "") + "</td>";
+                                html += "<td>" + (m.flags || []).join(", ") + "</td>";
+                                html += "</tr>";
+                            }
+                            html += "</table>";
+                            document.getElementById("listResult").innerHTML = html;
+                        }
+                    }
+                } catch (e) {
+                    showResult("listResult", "Error: " + e.message, true);
+                }
+            }
+
+            function loadGetMail(uid) {
+                document.getElementById("getMessageId").value = uid;
+                getMail();
+            }
+
+            async function getMail() {
+                const message_id = document.getElementById("getMessageId").value.trim();
+                const mailbox = document.getElementById("getMailbox").value.trim();
+
+                if (!message_id) {
+                    showResult("getResult", "Message UID is required", true);
+                    return;
+                }
+
+                const payload = { message_id };
+                if (mailbox) payload.mailbox = mailbox;
+
+                try {
+                    const resp = await fetch("/mail/get", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(payload),
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok) {
+                        showResult("getResult", "Error: " + (data.error || JSON.stringify(data, null, 2)), true);
+                    } else {
+                        const mail = typeof data === "string" ? JSON.parse(data) : data;
+                        let html = "<p><b>UID:</b> " + escapeHtml(mail.uid || "") + "</p>";
+                        html += "<p><b>From:</b> " + escapeHtml(mail.from || "") + "</p>";
+                        html += "<p><b>To:</b> " + escapeHtml(mail.to || "") + "</p>";
+                        html += "<p><b>Subject:</b> " + escapeHtml(mail.subject || "") + "</p>";
+                        html += "<p><b>Date:</b> " + escapeHtml(mail.date || "") + "</p>";
+                        html += "<p><b>Content-Type:</b> " + escapeHtml(mail.content_type || "") + "</p>";
+                        if (mail.body_text) {
+                            html += "<h3>Text Body</h3><pre>" + escapeHtml(mail.body_text) + "</pre>";
+                        }
+                        if (mail.body_html) {
+                            html += "<h3>HTML Body</h3><div>" + mail.body_html + "</div>";
+                        }
+                        document.getElementById("getResult").innerHTML = html;
+                    }
+                } catch (e) {
+                    showResult("getResult", "Error: " + e.message, true);
+                }
+            }
+        </script>
+    </body>
+</html>

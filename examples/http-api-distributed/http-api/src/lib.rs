@@ -19,6 +19,7 @@ mod kv;
 mod llm;
 mod r2;
 mod task;
+mod mail;
 mod templates;
 
 use bindings::wasi::logging::logging::{Level, log};
@@ -158,6 +159,10 @@ async fn main(req: Request<Body>) -> anyhow::Result<Response<Body>> {
         "/feishu/docs/create-bitable" => feishu::docs_create_bitable(req).await,
         "/feishu/docs/list-bitable-tables" => feishu::docs_list_bitable_tables(req).await,
         "/feishu/docs/list-bitable-records" => feishu::docs_list_bitable_records(req).await,
+        "/mail" | "/mail/" => mail::home(req).await,
+        "/mail/send" => mail::send_mail(req).await,
+        "/mail/list" => mail::list_mails(req).await,
+        "/mail/get" => mail::get_mail(req).await,
         _ => {
             log(Level::Debug, LOG_CTX, &format!("Not found: {}", path));
             helpers::text_response(StatusCode::NOT_FOUND, "Not found\n")

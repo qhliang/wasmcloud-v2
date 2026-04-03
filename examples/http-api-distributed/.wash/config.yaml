@@ -78,6 +78,16 @@ dev:
       config:
         app-id: cli_a946044d55f99bde
         app-secret: oFk1iE8PibychCsyYhX9qcLQqS70lTqd
+    - namespace: custom
+      package: mail
+      interfaces:
+        - sender
+      config:
+        smtp-host: x
+        smtp-port: "80"
+        username: y
+        password: z
+        default-from: a
 
 new:
   command: cargo fetch

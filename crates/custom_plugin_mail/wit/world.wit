@@ -1,0 +1,5 @@
+package my:mail;
+
+world mail {
+    import custom:mail/sender@0.1.0;
+}
