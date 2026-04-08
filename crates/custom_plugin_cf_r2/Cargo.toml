@@ -4,11 +4,11 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-description = "Custom host plugin for Cloudflare R2 blobstore"
+description = "Multi-backend blobstore host plugin (S3, WebDAV, FTP, filesystem)"
 license = "Apache-2.0"
 repository = "https://github.com/wasmcloud/wasmCloud"
 readme = "README.md"
-keywords = ["webassembly", "wasm", "cloudflare", "r2"]
+keywords = ["webassembly", "wasm", "blobstore", "opendal"]
 categories = ["wasm"]
 
 [lints]
@@ -30,7 +30,12 @@ serde_json = { workspace = true }
 base64 = { workspace = true }
 tempfile = { workspace = true }
 wash-runtime = { path = "../wash-runtime" }
-s3 = { version = "0.1.22", default-features = false, features = ["async", "rustls", "providers"] }
+opendal = { version = "0.53", default-features = false, features = [
+    "services-s3",
+    "services-webdav",
+    "services-ftp",
+    "services-fs",
+] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

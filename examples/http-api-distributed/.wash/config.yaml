@@ -40,11 +40,37 @@ dev:
         - container
         - blobstore
       config:
-        account_id: 4e4a9cbc00e5e3a6c07597fb44cf7be4
-        api_token: cfut_Ntwhi2Yt7ZfvFEGMROM2ieE6ioPbALZ84ZLhoIrh2329e0d4
-        bucket_name: wasmcloud-v2
-        access_key: a766ff51144201160836e49577d199f1
-        secret_key: df4b71b112492097af3e341160911388f5b1391e7821b7c6c02060ee69b48b72
+        backend: s3
+        root: "/"
+        bucket: wasmcloud-v2
+        region: auto
+        endpoint: https://4e4a9cbc00e5e3a6c07597fb44cf7be4.r2.cloudflarestorage.com
+        access_key_id: a766ff51144201160836e49577d199f1
+        secret_access_key: df4b71b112492097af3e341160911388f5b1391e7821b7c6c02060ee69b48b72
+        # # WebDAV
+        # backend: "webdav"
+        # endpoint: "https://dav.example.com/"
+        # username: "user"
+        # password: "pass"
+
+        # # FTP
+        # backend: "ftp"
+        # endpoint: "ftp://ftp.example.com"
+        # username: "user"
+        # password: "pass"
+
+        # # S3
+        # backend: "s3"
+        # bucket: "my-bucket"
+        # region: "us-east-1"
+        # endpoint: "https://s3.amazonaws.com"
+        # access_key_id: "xxx"
+        # secret_access_key: "xxx"
+
+        # # Filesystem
+        # backend: "fs"
+        # root: "/tmp/blobstore"
+
     - namespace: custom
       package: cf-d1
       interfaces:

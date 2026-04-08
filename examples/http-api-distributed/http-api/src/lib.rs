@@ -17,9 +17,9 @@ mod feishu;
 mod helpers;
 mod kv;
 mod llm;
+mod mail;
 mod r2;
 mod task;
-mod mail;
 mod templates;
 
 use bindings::wasi::logging::logging::{Level, log};
@@ -165,6 +165,7 @@ async fn main(req: Request<Body>) -> anyhow::Result<Response<Body>> {
         "/mail/get" => mail::get_mail(req).await,
         _ => {
             log(Level::Debug, LOG_CTX, &format!("Not found: {}", path));
+
             helpers::text_response(StatusCode::NOT_FOUND, "Not found\n")
         }
     };
