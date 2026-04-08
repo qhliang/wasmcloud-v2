@@ -1645,6 +1645,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "custom_plugin_blobstore"
+version = "2.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "futures",
+ "opendal",
+ "opentelemetry 0.31.0",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "wash-runtime",
+ "wasmtime",
+ "wasmtime-wasi",
+ "wasmtime-wasi-io",
+]
+
+[[package]]
 name = "custom_plugin_cf_d1"
 version = "2.0.1"
 dependencies = [
@@ -1679,28 +1701,6 @@ dependencies = [
  "tracing",
  "wash-runtime",
  "wasmtime",
-]
-
-[[package]]
-name = "custom_plugin_cf_r2"
-version = "2.0.1"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64 0.22.1",
- "bytes",
- "futures",
- "opendal",
- "opentelemetry 0.31.0",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "wash-runtime",
- "wasmtime",
- "wasmtime-wasi",
- "wasmtime-wasi-io",
 ]
 
 [[package]]
@@ -8356,9 +8356,9 @@ dependencies = [
  "clap-markdown",
  "clap_complete",
  "ctrlc",
+ "custom_plugin_blobstore",
  "custom_plugin_cf_d1",
  "custom_plugin_cf_kv",
- "custom_plugin_cf_r2",
  "custom_plugin_crontab",
  "custom_plugin_dingtalk_stream",
  "custom_plugin_feishu",

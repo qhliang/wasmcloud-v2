@@ -1,10 +1,10 @@
 [package]
-name = "custom_plugin_cf_r2"
+name = "custom_plugin_blobstore"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-description = "Multi-backend blobstore host plugin (S3, WebDAV, FTP, filesystem)"
+description = "Multi-backend blobstore host plugin (Memory, S3, WebDAV, FTP, filesystem)"
 license = "Apache-2.0"
 repository = "https://github.com/wasmcloud/wasmCloud"
 readme = "README.md"
@@ -31,6 +31,7 @@ base64 = { workspace = true }
 tempfile = { workspace = true }
 wash-runtime = { path = "../wash-runtime" }
 opendal = { version = "0.53", default-features = false, features = [
+    "services-memory",
     "services-s3",
     "services-webdav",
     "services-ftp",

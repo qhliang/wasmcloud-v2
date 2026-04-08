@@ -40,6 +40,10 @@ dev:
         - container
         - blobstore
       config:
+        # # Memory (default, no config needed)
+        # backend: memory
+
+        # S3 (Cloudflare R2)
         backend: s3
         root: "/"
         bucket: wasmcloud-v2
@@ -47,6 +51,7 @@ dev:
         endpoint: https://4e4a9cbc00e5e3a6c07597fb44cf7be4.r2.cloudflarestorage.com
         access_key_id: a766ff51144201160836e49577d199f1
         secret_access_key: df4b71b112492097af3e341160911388f5b1391e7821b7c6c02060ee69b48b72
+
         # # WebDAV
         # backend: "webdav"
         # endpoint: "https://dav.example.com/"

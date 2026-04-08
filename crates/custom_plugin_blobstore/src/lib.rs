@@ -3,9 +3,10 @@
 //! This module implements a wasmCloud host plugin that provides `wasi:blobstore@0.2.0-draft`
 //! interfaces using OpenDAL as the unified storage access layer.
 //!
-//! Supported backends: S3 (including Cloudflare R2), WebDAV, FTP, Filesystem.
+//! Supported backends: Memory (default), S3 (including Cloudflare R2), WebDAV, FTP, Filesystem.
 //!
-//! Backend is selected via `backend` config key (e.g., "s3", "webdav", "ftp", "fs").
+//! Backend is selected via `backend` config key (e.g., "memory", "s3", "webdav", "ftp", "fs").
+//! If `backend` is not specified, "memory" is used by default.
 //! All other config keys are the YAML interface config are passed directly to OpenDAL.
 
 use std::collections::{HashMap, HashSet};
@@ -13,8 +14,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use opentelemetry::metrics::Counter;
 use opendal::{Operator, Scheme};
+use opentelemetry::metrics::Counter;
 use tokio::sync::RwLock;
 use tracing::debug;
 use wasmtime::component::Resource;
@@ -70,14 +71,10 @@ pub struct OutgoingValueHandle {
 }
 
 /// Extract blobstore config from interface config.
-/// The `backend` key is required (e.g., "s3", "webdav", "ftp", "fs").
+/// The `backend` key defaults to "memory" if not specified.
 /// All other keys are passed directly to OpenDAL as backend-specific config.
 fn extract_config(interface: &WitInterface) -> anyhow::Result<Operator> {
-    let backend = interface
-        .config
-        .get("backend")
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("missing required config: 'backend'"))?;
+    let backend = interface.config.get("backend").cloned().unwrap_or_else(|| "memory".to_string());
 
     let scheme = Scheme::from_str(&backend)
         .map_err(|e| anyhow::anyhow!("unknown backend '{backend}': {e}"))?;
@@ -88,8 +85,9 @@ fn extract_config(interface: &WitInterface) -> anyhow::Result<Operator> {
         .filter(|(k, _)| k.as_str() != "backend")
         .map(|(k, v)| (k.clone(), v.clone()));
 
-    let op = Operator::via_iter(scheme, iter)
-        .map_err(|e| anyhow::anyhow!("failed to create OpenDAL operator for backend '{backend}': {e}"))?;
+    let op = Operator::via_iter(scheme, iter).map_err(|e| {
+        anyhow::anyhow!("failed to create OpenDAL operator for backend '{backend}': {e}")
+    })?;
 
     debug!(backend = backend, "Created OpenDAL operator");
     Ok(op)
@@ -97,7 +95,7 @@ fn extract_config(interface: &WitInterface) -> anyhow::Result<Operator> {
 
 /// Multi-backend blobstore plugin
 #[derive(Clone, Default)]
-pub struct CloudflareR2 {
+pub struct CustomBlobstore {
     /// Per-workload OpenDAL operators
     operators: Arc<RwLock<HashMap<String, Operator>>>,
     metrics: Arc<BlobstoreMetrics>,
@@ -124,7 +122,7 @@ impl BlobstoreMetrics {
     }
 }
 
-impl CloudflareR2 {
+impl CustomBlobstore {
     /// Create a new blobstore plugin.
     /// Backend is configured per-workload via interface config.
     pub fn new() -> Self {
@@ -178,7 +176,7 @@ impl CloudflareR2 {
 }
 
 #[async_trait]
-impl HostPlugin for CloudflareR2 {
+impl HostPlugin for CustomBlobstore {
     fn id(&self) -> &'static str {
         PLUGIN_ID
     }
@@ -212,14 +210,7 @@ impl HostPlugin for CloudflareR2 {
         let workload_id = component_handle.workload_id().to_string();
 
         // Validate config by creating operator
-        let backend = interface.config.get("backend").cloned().unwrap_or_default();
-        if backend.is_empty() {
-            tracing::error!(
-                workload_id = %workload_id,
-                "Missing required config: 'backend' for blobstore plugin. Supported: s3, webdav, ftp, fs"
-            );
-            return Ok(());
-        }
+        let backend = interface.config.get("backend").cloned().unwrap_or_else(|| "memory".to_string());
 
         match self.get_or_create_operator(&workload_id, interface).await {
             Ok(_) => {
@@ -284,7 +275,7 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         &mut self,
         name: ContainerName,
     ) -> wasmtime::Result<Result<Resource<String>, BlobstoreError>> {
-        let Some(plugin) = self.get_plugin::<CloudflareR2>(PLUGIN_ID) else {
+        let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
             return Ok(Err("Blobstore plugin not available".to_string()));
         };
         plugin.record_operation("create_container");
@@ -315,7 +306,7 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         &mut self,
         name: ContainerName,
     ) -> wasmtime::Result<Result<Resource<String>, BlobstoreError>> {
-        let Some(plugin) = self.get_plugin::<CloudflareR2>(PLUGIN_ID) else {
+        let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
             return Ok(Err("Blobstore plugin not available".to_string()));
         };
         plugin.record_operation("get_container");
@@ -328,7 +319,7 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         &mut self,
         name: ContainerName,
     ) -> wasmtime::Result<Result<bool, BlobstoreError>> {
-        let Some(plugin) = self.get_plugin::<CloudflareR2>(PLUGIN_ID) else {
+        let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
             return Ok(Err("Blobstore plugin not available".to_string()));
         };
         plugin.record_operation("container_exists");
@@ -349,7 +340,7 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         &mut self,
         name: ContainerName,
     ) -> wasmtime::Result<Result<(), BlobstoreError>> {
-        let Some(plugin) = self.get_plugin::<CloudflareR2>(PLUGIN_ID) else {
+        let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
             return Ok(Err("Blobstore plugin not available".to_string()));
         };
         plugin.record_operation("delete_container");
@@ -379,7 +370,7 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         src: ObjectId,
         dest: ObjectId,
     ) -> wasmtime::Result<Result<(), BlobstoreError>> {
-        let Some(plugin) = self.get_plugin::<CloudflareR2>(PLUGIN_ID) else {
+        let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
             return Ok(Err("Blobstore plugin not available".to_string()));
         };
         plugin.record_operation("copy_object");
@@ -404,7 +395,7 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         src: ObjectId,
         dest: ObjectId,
     ) -> wasmtime::Result<Result<(), BlobstoreError>> {
-        let Some(plugin) = self.get_plugin::<CloudflareR2>(PLUGIN_ID) else {
+        let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
             return Ok(Err("Blobstore plugin not available".to_string()));
         };
         plugin.record_operation("move_object");
@@ -467,7 +458,7 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
             "Getting object data"
         );
 
-        let Some(plugin) = self.get_plugin::<CloudflareR2>(PLUGIN_ID) else {
+        let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
             return Ok(Err("Blobstore plugin not available".to_string()));
         };
 
@@ -543,7 +534,7 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
     ) -> wasmtime::Result<Result<Resource<StreamObjectNamesHandle>, ContainerError>> {
         let container_name = self.table.get(&container)?;
 
-        let Some(plugin) = self.get_plugin::<CloudflareR2>(PLUGIN_ID) else {
+        let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
             return Ok(Err("Blobstore plugin not available".to_string()));
         };
 
@@ -590,7 +581,7 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
     ) -> wasmtime::Result<Result<(), ContainerError>> {
         let container_name = self.table.get(&container)?;
 
-        let Some(plugin) = self.get_plugin::<CloudflareR2>(PLUGIN_ID) else {
+        let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
             return Ok(Err("Blobstore plugin not available".to_string()));
         };
 
@@ -614,7 +605,7 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
     ) -> wasmtime::Result<Result<(), ContainerError>> {
         let container_name = self.table.get(&container)?;
 
-        let Some(plugin) = self.get_plugin::<CloudflareR2>(PLUGIN_ID) else {
+        let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
             return Ok(Err("Blobstore plugin not available".to_string()));
         };
 
@@ -640,7 +631,7 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
     ) -> wasmtime::Result<Result<bool, ContainerError>> {
         let container_name = self.table.get(&container)?;
 
-        let Some(plugin) = self.get_plugin::<CloudflareR2>(PLUGIN_ID) else {
+        let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
             return Ok(Err("Blobstore plugin not available".to_string()));
         };
 
@@ -663,7 +654,7 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
     ) -> wasmtime::Result<Result<ObjectMetadata, ContainerError>> {
         let container_name = self.table.get(&container)?;
 
-        let Some(plugin) = self.get_plugin::<CloudflareR2>(PLUGIN_ID) else {
+        let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
             return Ok(Err("Blobstore plugin not available".to_string()));
         };
 
@@ -677,7 +668,9 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
             Ok(meta) => Ok(Ok(ObjectMetadata {
                 name: name.clone(),
                 container: container_name.clone(),
-                created_at: meta.last_modified().map_or(0, |ts| ts.timestamp_millis() as u64),
+                created_at: meta
+                    .last_modified()
+                    .map_or(0, |ts| ts.timestamp_millis() as u64),
                 size: meta.content_length(),
             })),
             Err(e) => Ok(Err(format!("object '{name}' not found: {e}"))),
@@ -690,7 +683,7 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
     ) -> wasmtime::Result<Result<(), ContainerError>> {
         let container_name = self.table.get(&container)?;
 
-        let Some(plugin) = self.get_plugin::<CloudflareR2>(PLUGIN_ID) else {
+        let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
             return Ok(Err("Blobstore plugin not available".to_string()));
         };
 
@@ -871,7 +864,7 @@ impl<'a> bindings::wasi::blobstore::types::HostOutgoingValue for ActiveCtx<'a> {
         if let (Some(container_name), Some(object_name)) =
             (&handle.container_name, &handle.object_name)
         {
-            let Some(plugin) = self.get_plugin::<CloudflareR2>(PLUGIN_ID) else {
+            let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
                 return Ok(Err("Blobstore plugin not available".to_string()));
             };
 
@@ -994,18 +987,18 @@ mod tests {
 
     #[test]
     fn test_plugin_id() {
-        let plugin = CloudflareR2::new();
+        let plugin = CustomBlobstore::new();
         assert_eq!(plugin.id(), PLUGIN_ID);
     }
 
     #[test]
     fn test_world() {
-        let plugin = CloudflareR2::new();
+        let plugin = CustomBlobstore::new();
         let world = plugin.world();
 
         assert!(
             world
-                .imports
+                .exports
                 .iter()
                 .any(|i| i.namespace == "wasi" && i.package == "blobstore")
         );
@@ -1013,7 +1006,7 @@ mod tests {
 
     #[test]
     fn test_default() {
-        let plugin = CloudflareR2::default();
+        let plugin = CustomBlobstore::default();
         assert_eq!(plugin.id(), PLUGIN_ID);
     }
 }

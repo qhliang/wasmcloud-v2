@@ -82,8 +82,8 @@ impl CliCommand for DevCommand {
                 "WASI Blobstore plugin registered with filesystem backend"
             );
         } else if dev_config.wasi_blobstore_cloudflare.is_some() {
-            host_builder =
-                host_builder.with_plugin(Arc::new(custom_plugin_cf_r2::CloudflareR2::new()))?;
+            host_builder = host_builder
+                .with_plugin(Arc::new(custom_plugin_blobstore::CustomBlobstore::new()))?;
             debug!("WASI Blobstore plugin registered with Cloudflare backend");
         } else {
             host_builder = host_builder.with_plugin(Arc::new(

@@ -2,9 +2,9 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Context as _;
 use clap::Args;
+use custom_plugin_blobstore::CustomBlobstore;
 use custom_plugin_cf_d1::CloudflareD1;
 use custom_plugin_cf_kv::CloudflareKeyValue;
-use custom_plugin_cf_r2::CloudflareR2;
 use custom_plugin_llm_gateway::LlmGateway;
 use tracing::info;
 use wash_runtime::{
@@ -195,7 +195,7 @@ impl CliCommand for HostCommand {
             }
             BlobstoreBackendType::Cloudflare => {
                 cluster_host_builder =
-                    cluster_host_builder.with_plugin(Arc::new(CloudflareR2::new()))?;
+                    cluster_host_builder.with_plugin(Arc::new(CustomBlobstore::new()))?;
                 tracing::info!("Cloudflare R2 blobstore plugin enabled");
             }
         }
