@@ -119,6 +119,15 @@ dev:
         username: y
         password: z
         default-from: a
+    - namespace: custom
+      package: codex
+      interfaces:
+        - executor
+        - session
+      config:
+        api_token: sk-4Saze9gon2X3ORsGGleSPjdCkCAOq9jHhFYdNPCMg2cYaF09
+        model: glm-5.1
+        codex_binary_path: "/usr/local/bin/codex"
 
 new:
   command: cargo fetch

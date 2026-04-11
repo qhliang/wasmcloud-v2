@@ -10,6 +10,7 @@ mod bindings {
     export!(CustomHandler);
 }
 
+mod codex;
 mod crontab;
 mod d1;
 mod dingtalk;
@@ -163,6 +164,10 @@ async fn main(req: Request<Body>) -> anyhow::Result<Response<Body>> {
         "/mail/send" => mail::send_mail(req).await,
         "/mail/list" => mail::list_mails(req).await,
         "/mail/get" => mail::get_mail(req).await,
+        "/codex" | "/codex/" => codex::home(req).await,
+        "/codex/execute" => codex::execute(req).await,
+        "/codex/usage" => codex::get_usage(req).await,
+        "/codex/resume" => codex::resume(req).await,
         _ => {
             log(Level::Debug, LOG_CTX, &format!("Not found: {}", path));
 

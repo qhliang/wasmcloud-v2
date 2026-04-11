@@ -41,18 +41,11 @@ pub fn text_response(status: StatusCode, text: impl Into<Body>) -> anyhow::Resul
 // ============ Request parsing ============
 
 pub fn query_params(uri: &wstd::http::Uri) -> HashMap<String, String> {
-    uri.query()
-        .map(|q| urlencoded_parse(q))
-        .unwrap_or_default()
+    uri.query().map(|q| urlencoded_parse(q)).unwrap_or_default()
 }
 
-pub async fn parse_json_body<T: DeserializeOwned>(
-    req: &mut Request<Body>,
-) -> anyhow::Result<T> {
-    req.body_mut()
-        .json()
-        .await
-        .context("failed to parse body")
+pub async fn parse_json_body<T: DeserializeOwned>(req: &mut Request<Body>) -> anyhow::Result<T> {
+    req.body_mut().json().await.context("failed to parse body")
 }
 
 // ============ URL encoding ============

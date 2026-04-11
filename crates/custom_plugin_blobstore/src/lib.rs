@@ -74,7 +74,11 @@ pub struct OutgoingValueHandle {
 /// The `backend` key defaults to "memory" if not specified.
 /// All other keys are passed directly to OpenDAL as backend-specific config.
 fn extract_config(interface: &WitInterface) -> anyhow::Result<Operator> {
-    let backend = interface.config.get("backend").cloned().unwrap_or_else(|| "memory".to_string());
+    let backend = interface
+        .config
+        .get("backend")
+        .cloned()
+        .unwrap_or_else(|| "memory".to_string());
 
     let scheme = Scheme::from_str(&backend)
         .map_err(|e| anyhow::anyhow!("unknown backend '{backend}': {e}"))?;
@@ -210,7 +214,11 @@ impl HostPlugin for CustomBlobstore {
         let workload_id = component_handle.workload_id().to_string();
 
         // Validate config by creating operator
-        let backend = interface.config.get("backend").cloned().unwrap_or_else(|| "memory".to_string());
+        let backend = interface
+            .config
+            .get("backend")
+            .cloned()
+            .unwrap_or_else(|| "memory".to_string());
 
         match self.get_or_create_operator(&workload_id, interface).await {
             Ok(_) => {

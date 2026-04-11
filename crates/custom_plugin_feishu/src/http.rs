@@ -65,11 +65,7 @@ pub(crate) async fn feishu_delete(
     Ok(())
 }
 
-pub(crate) async fn feishu_put(
-    token: &str,
-    url: &str,
-    body: String,
-) -> Result<(), FeishuError> {
+pub(crate) async fn feishu_put(token: &str, url: &str, body: String) -> Result<(), FeishuError> {
     reqwest::Client::new()
         .put(url)
         .header("Authorization", format!("Bearer {token}"))

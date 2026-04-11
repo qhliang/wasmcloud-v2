@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Codex</title>
+        <style>
+            {BASE_CSS}
+                    .event-item {
+                        margin-bottom: 8px;
+                        padding: 8px 12px;
+                        border-radius: 4px;
+                        font-size: 13px;
+                        background: #fafafa;
+                        border: 1px solid #eee;
+                        white-space: pre-wrap;
+                        word-break: break-word;
+                    }
+                    .event-item.agent-message {
+                        background: #f5fff5;
+                        border-left: 3px solid #00994d;
+                    }
+                    .event-item.command {
+                        background: #fff8f0;
+                        border-left: 3px solid #cc6600;
+                    }
+                    .event-item.error {
+                        background: #fff5f5;
+                        border-left: 3px solid #cc0000;
+                        color: #cc0000;
+                    }
+                    .event-label {
+                        font-weight: bold;
+                        color: #555;
+                        font-size: 11px;
+                        text-transform: uppercase;
+                    }
+                    .usage-bar {
+                        display: flex;
+                        gap: 16px;
+                        padding: 8px 0;
+                        font-size: 13px;
+                        color: #666;
+                    }
+        </style>
+    </head>
+    <body>
+        <h1>Codex</h1>
+        {NAV}
+
+        <div class="section">
+            <h2>Execute Task</h2>
+            <label for="prompt">Prompt</label>
+            <textarea
+                id="prompt"
+                rows="4"
+                placeholder="Describe the task for Codex to execute..."
+            ></textarea>
+
+            <button onclick="executeTask()" id="execBtn">Execute</button>
+
+            <div id="sessionInfo" class="meta" style="display:none;">
+                Session ID: <code id="sessionId"></code>
+            </div>
+
+            <div class="usage-bar" id="usageBar" style="display:none;">
+                <span>Input: <strong id="inputTokens">0</strong></span>
+                <span>Output: <strong id="outputTokens">0</strong></span>
+            </div>
+
+            <div id="execResult" class="result"></div>
+            <div id="eventsContainer"></div>
+        </div>
+
+        <div class="section">
+            <h2>Resume Session</h2>
+            <label for="resumeSessionId">Session ID</label>
+            <input type="text" id="resumeSessionId" placeholder="Paste session ID here" />
+
+            <label for="resumePrompt">Follow-up Prompt</label>
+            <textarea
+                id="resumePrompt"
+                rows="3"
+                placeholder="Ask a follow-up question..."
+            ></textarea>
+
+            <button onclick="resumeSession()" id="resumeBtn">Resume</button>
+            <div id="resumeResult" class="result"></div>
+        </div>
+
+        <div class="section">
+            <h2>Token Usage</h2>
+            <label for="usageSessionId">Session ID</label>
+            <input type="text" id="usageSessionId" placeholder="Paste session ID here" />
+
+            <button onclick="getUsage()">Get Usage</button>
+            <div id="usageResult" class="result"></div>
+        </div>
+
+        <script>
+            {
+                BASE_JS;
+            }
+
+            async function executeTask() {
+                const prompt = document.getElementById("prompt").value.trim();
+                if (!prompt) {
+                    showResult("execResult", "Prompt is required", true);
+                    return;
+                }
+
+                const execBtn = document.getElementById("execBtn");
+                execBtn.disabled = true;
+                execBtn.textContent = "Executing...";
+                const container = document.getElementById("eventsContainer");
+                container.innerHTML = "";
+
+                try {
+                    const resp = await fetch("/codex/execute", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ prompt }),
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok) {
+                        showResult("execResult", "Error: " + (data.error || JSON.stringify(data, null, 2)), true);
+                        return;
+                    }
+
+                    if (data.session_id) {
+                        document.getElementById("sessionInfo").style.display = "block";
+                        document.getElementById("sessionId").textContent = data.session_id;
+                        document.getElementById("resumeSessionId").value = data.session_id;
+                        document.getElementById("usageSessionId").value = data.session_id;
+                    }
+
+                    if (data.usage) {
+                        document.getElementById("usageBar").style.display = "flex";
+                        document.getElementById("inputTokens").textContent = data.usage.input_tokens;
+                        document.getElementById("outputTokens").textContent = data.usage.output_tokens;
+                    }
+
+                    (data.events || []).forEach(evt => appendEvent(container, evt));
+                } catch (e) {
+                    showResult("execResult", "Error: " + e.message, true);
+                } finally {
+                    execBtn.disabled = false;
+                    execBtn.textContent = "Execute";
+                }
+            }
+
+            async function resumeSession() {
+                const session_id = document.getElementById("resumeSessionId").value.trim();
+                const prompt = document.getElementById("resumePrompt").value.trim();
+                if (!session_id || !prompt) {
+                    showResult("resumeResult", "Session ID and prompt are required", true);
+                    return;
+                }
+
+                const resumeBtn = document.getElementById("resumeBtn");
+                resumeBtn.disabled = true;
+                resumeBtn.textContent = "Resuming...";
+
+                try {
+                    const resp = await fetch("/codex/resume", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ session_id, prompt }),
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok) {
+                        showResult("resumeResult", "Error: " + (data.error || JSON.stringify(data, null, 2)), true);
+                        return;
+                    }
+
+                    let html = "";
+                    (data.events || []).forEach(evt => {
+                        html += formatEvent(evt);
+                    });
+                    showResult("resumeResult", html || "No events", false);
+                } catch (e) {
+                    showResult("resumeResult", "Error: " + e.message, true);
+                } finally {
+                    resumeBtn.disabled = false;
+                    resumeBtn.textContent = "Resume";
+                }
+            }
+
+            async function getUsage() {
+                const session_id = document.getElementById("usageSessionId").value.trim();
+                if (!session_id) {
+                    showResult("usageResult", "Session ID is required", true);
+                    return;
+                }
+
+                try {
+                    const resp = await fetch("/codex/usage", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ session_id }),
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok) {
+                        showResult("usageResult", "Error: " + (data.error || JSON.stringify(data, null, 2)), true);
+                        return;
+                    }
+                    showResult("usageResult", "Input: " + data.input_tokens + ", Cached: " + data.cached_input_tokens + ", Output: " + data.output_tokens);
+                } catch (e) {
+                    showResult("usageResult", "Error: " + e.message, true);
+                }
+            }
+
+            function appendEvent(container, evt) {
+                const div = document.createElement("div");
+                div.innerHTML = formatEvent(evt);
+                container.appendChild(div.firstChild || div);
+            }
+
+            function formatEvent(evt) {
+                let cls = "event-item";
+                let label = evt.type || "unknown";
+                let content = "";
+
+                if (evt.item_type === "agent_message" && evt.text) {
+                    cls += " agent-message";
+                    label = "Agent";
+                    content = evt.text;
+                } else if (evt.command) {
+                    cls += " command";
+                    label = "Command";
+                    content = evt.command;
+                } else if (evt.type === "error") {
+                    cls += " error";
+                    content = evt.message || "Unknown error";
+                } else {
+                    if (evt.text) content = evt.text;
+                    else if (evt.item_type) content = "[" + evt.item_type + "]";
+                }
+
+                return '<div class="' + cls + '">' +
+                    '<span class="event-label">' + label + '</span>' +
+                    (content ? '<div style="margin-top:4px;">' + escapeHtml(content) + '</div>' : '') +
+                    '</div>';
+            }
+        </script>
+    </body>
+</html>

@@ -24,6 +24,8 @@ world http-api {
   import custom:feishu/bot-sender@0.1.0;
   import custom:feishu/docs-sender@0.1.0;
   import custom:mail/sender@0.1.0;
+  import custom:codex/executor@0.1.0;
+  import custom:codex/session@0.1.0;
 
   export custom:dingtalk-stream/handler@0.1.0;
   export custom:feishu/handler@0.1.0;

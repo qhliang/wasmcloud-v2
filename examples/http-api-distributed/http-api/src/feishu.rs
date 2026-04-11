@@ -1,10 +1,10 @@
+use crate::bindings::custom::feishu::types::FeishuError;
 use crate::bindings::custom::feishu::{
     ai_sender, bot_sender, calendar_sender, cardkit_sender, contact_sender, docs_sender,
     group_sender, mail_sender, sender, task_sender,
 };
-use crate::bindings::custom::feishu::types::FeishuError;
 use crate::bindings::wasi::logging::logging::{Level, log};
-use crate::{helpers, templates, LOG_CTX};
+use crate::{LOG_CTX, helpers, templates};
 use serde::Deserialize;
 use wstd::http::{Body, Request, Response, StatusCode};
 
@@ -36,7 +36,11 @@ struct ImSendTextRequest {
 
 pub async fn im_send_text(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
     let body: ImSendTextRequest = helpers::parse_json_body(&mut req).await?;
-    log(Level::Info, LOG_CTX, &format!("FEISHU IM SEND TEXT: chat={}", body.chat_id));
+    log(
+        Level::Info,
+        LOG_CTX,
+        &format!("FEISHU IM SEND TEXT: chat={}", body.chat_id),
+    );
     match sender::send_text(&body.chat_id, &body.content) {
         Ok(()) => {
             log(Level::Info, LOG_CTX, "FEISHU IM SEND TEXT OK");
@@ -112,7 +116,11 @@ struct ContactGetUserRequest {
 
 pub async fn contact_get_user(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
     let body: ContactGetUserRequest = helpers::parse_json_body(&mut req).await?;
-    log(Level::Info, LOG_CTX, &format!("FEISHU CONTACT GET USER: {}", body.user_id));
+    log(
+        Level::Info,
+        LOG_CTX,
+        &format!("FEISHU CONTACT GET USER: {}", body.user_id),
+    );
     match contact_sender::get_user(&body.user_id, &body.user_id_type) {
         Ok(json) => helpers::json_response(json),
         Err(e) => feishu_error(StatusCode::BAD_GATEWAY, e),
@@ -201,7 +209,11 @@ struct ChatIdRequest {
 
 pub async fn group_get_group(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
     let body: ChatIdRequest = helpers::parse_json_body(&mut req).await?;
-    log(Level::Info, LOG_CTX, &format!("FEISHU GROUP GET: {}", body.chat_id));
+    log(
+        Level::Info,
+        LOG_CTX,
+        &format!("FEISHU GROUP GET: {}", body.chat_id),
+    );
     match group_sender::get_group(&body.chat_id) {
         Ok(json) => helpers::json_response(json),
         Err(e) => feishu_error(StatusCode::BAD_GATEWAY, e),
@@ -216,7 +228,11 @@ struct GroupWithChatId {
 
 pub async fn group_update_group(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
     let body: GroupWithChatId = helpers::parse_json_body(&mut req).await?;
-    log(Level::Info, LOG_CTX, &format!("FEISHU GROUP UPDATE: {}", body.chat_id));
+    log(
+        Level::Info,
+        LOG_CTX,
+        &format!("FEISHU GROUP UPDATE: {}", body.chat_id),
+    );
     match group_sender::update_group(&body.chat_id, &body.request_json) {
         Ok(()) => helpers::json_response("{\"ok\":true}"),
         Err(e) => feishu_error(StatusCode::BAD_GATEWAY, e),
@@ -236,9 +252,7 @@ pub async fn group_add_group_members(mut req: Request<Body>) -> anyhow::Result<R
     }
 }
 
-pub async fn group_remove_group_members(
-    mut req: Request<Body>,
-) -> anyhow::Result<Response<Body>> {
+pub async fn group_remove_group_members(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
     let body: GroupWithChatId = helpers::parse_json_body(&mut req).await?;
     log(
         Level::Info,
@@ -251,9 +265,7 @@ pub async fn group_remove_group_members(
     }
 }
 
-pub async fn group_list_group_members(
-    mut req: Request<Body>,
-) -> anyhow::Result<Response<Body>> {
+pub async fn group_list_group_members(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
     let body: GroupWithChatId = helpers::parse_json_body(&mut req).await?;
     log(
         Level::Info,
@@ -339,9 +351,7 @@ struct CalendarEventRequest {
     event_id: String,
 }
 
-pub async fn calendar_get_calendar_event(
-    mut req: Request<Body>,
-) -> anyhow::Result<Response<Body>> {
+pub async fn calendar_get_calendar_event(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
     let body: CalendarEventRequest = helpers::parse_json_body(&mut req).await?;
     log(
         Level::Info,
@@ -394,7 +404,11 @@ struct CardIdRequest {
 
 pub async fn cardkit_update_card(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
     let body: CardIdRequest = helpers::parse_json_body(&mut req).await?;
-    log(Level::Info, LOG_CTX, &format!("FEISHU CARDKIT UPDATE: {}", body.card_id));
+    log(
+        Level::Info,
+        LOG_CTX,
+        &format!("FEISHU CARDKIT UPDATE: {}", body.card_id),
+    );
     match cardkit_sender::update_card(&body.card_id, &body.request_json) {
         Ok(()) => helpers::json_response("{\"ok\":true}"),
         Err(e) => feishu_error(StatusCode::BAD_GATEWAY, e),
@@ -472,7 +486,11 @@ struct TaskGuidRequest {
 
 pub async fn task_get_task(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
     let body: TaskGuidRequest = helpers::parse_json_body(&mut req).await?;
-    log(Level::Info, LOG_CTX, &format!("FEISHU TASK GET: {}", body.task_guid));
+    log(
+        Level::Info,
+        LOG_CTX,
+        &format!("FEISHU TASK GET: {}", body.task_guid),
+    );
     match task_sender::get_task(&body.task_guid) {
         Ok(json) => helpers::json_response(json),
         Err(e) => feishu_error(StatusCode::BAD_GATEWAY, e),
@@ -487,7 +505,11 @@ struct TaskUpdateRequest {
 
 pub async fn task_update_task(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
     let body: TaskUpdateRequest = helpers::parse_json_body(&mut req).await?;
-    log(Level::Info, LOG_CTX, &format!("FEISHU TASK UPDATE: {}", body.task_guid));
+    log(
+        Level::Info,
+        LOG_CTX,
+        &format!("FEISHU TASK UPDATE: {}", body.task_guid),
+    );
     match task_sender::update_task(&body.task_guid, &body.request_json) {
         Ok(()) => helpers::json_response("{\"ok\":true}"),
         Err(e) => feishu_error(StatusCode::BAD_GATEWAY, e),
@@ -496,7 +518,11 @@ pub async fn task_update_task(mut req: Request<Body>) -> anyhow::Result<Response
 
 pub async fn task_delete_task(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
     let body: TaskGuidRequest = helpers::parse_json_body(&mut req).await?;
-    log(Level::Info, LOG_CTX, &format!("FEISHU TASK DELETE: {}", body.task_guid));
+    log(
+        Level::Info,
+        LOG_CTX,
+        &format!("FEISHU TASK DELETE: {}", body.task_guid),
+    );
     match task_sender::delete_task(&body.task_guid) {
         Ok(()) => helpers::json_response("{\"ok\":true}"),
         Err(e) => feishu_error(StatusCode::BAD_GATEWAY, e),
@@ -630,9 +656,7 @@ struct BitableRecordsRequest {
     request_json: String,
 }
 
-pub async fn docs_list_bitable_records(
-    mut req: Request<Body>,
-) -> anyhow::Result<Response<Body>> {
+pub async fn docs_list_bitable_records(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
     let body: BitableRecordsRequest = helpers::parse_json_body(&mut req).await?;
     log(
         Level::Info,

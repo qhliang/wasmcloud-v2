@@ -1704,6 +1704,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "custom_plugin_codex"
+version = "2.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "etcetera 0.10.0",
+ "flate2",
+ "futures",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "wash-runtime",
+ "wasmtime",
+]
+
+[[package]]
 name = "custom_plugin_crontab"
 version = "2.0.1"
 dependencies = [
@@ -8359,6 +8380,7 @@ dependencies = [
  "custom_plugin_blobstore",
  "custom_plugin_cf_d1",
  "custom_plugin_cf_kv",
+ "custom_plugin_codex",
  "custom_plugin_crontab",
  "custom_plugin_dingtalk_stream",
  "custom_plugin_feishu",

@@ -1,8 +1,8 @@
+use crate::LOG_CTX;
 use crate::bindings::wasi::keyvalue::store;
 use crate::bindings::wasi::logging::logging::{Level, log};
 use crate::helpers;
 use crate::templates;
-use crate::LOG_CTX;
 use serde::Deserialize;
 use wstd::http::{Body, Request, Response, StatusCode};
 
@@ -42,7 +42,11 @@ pub async fn set(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
     bucket
         .set(&set_req.key, &value)
         .map_err(|e| anyhow::anyhow!("Failed to set value: {:?}", e))?;
-    log(Level::Debug, LOG_CTX, &format!("KV SET OK: key={}", set_req.key));
+    log(
+        Level::Debug,
+        LOG_CTX,
+        &format!("KV SET OK: key={}", set_req.key),
+    );
     helpers::text_response(StatusCode::OK, "OK")
 }
 pub async fn get(req: Request<Body>) -> anyhow::Result<Response<Body>> {
@@ -77,10 +81,7 @@ pub async fn get(req: Request<Body>) -> anyhow::Result<Response<Body>> {
                 LOG_CTX,
                 &format!("KV GET ERROR: key={}, error={:?}", key, e),
             );
-            helpers::text_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Error: {:?}", e),
-            )
+            helpers::text_response(StatusCode::INTERNAL_SERVER_ERROR, format!("Error: {:?}", e))
         }
     }
 }

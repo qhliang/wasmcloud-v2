@@ -198,6 +198,10 @@ impl CliCommand for DevCommand {
         host_builder = host_builder.with_plugin(Arc::new(custom_plugin_feishu::Feishu::new()))?;
         debug!("Feishu plugin enabled");
 
+        // Enable codex plugin
+        host_builder = host_builder.with_plugin(Arc::new(custom_plugin_codex::Codex::new()))?;
+        debug!("Codex plugin enabled");
+
         // Enable mail plugin
         host_builder = host_builder.with_plugin(Arc::new(custom_plugin_mail::Mail::new()))?;
         debug!("Mail plugin enabled");

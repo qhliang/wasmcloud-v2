@@ -1,7 +1,7 @@
 use crate::bindings::custom::dingtalk_stream::sender;
 use crate::bindings::custom::dingtalk_stream::types::DingtalkError;
 use crate::bindings::wasi::logging::logging::{Level, log};
-use crate::{helpers, templates, LOG_CTX};
+use crate::{LOG_CTX, helpers, templates};
 use serde::Deserialize;
 use wstd::http::{Body, Request, Response, StatusCode};
 
@@ -102,10 +102,7 @@ pub async fn get_access_token(_req: Request<Body>) -> anyhow::Result<Response<Bo
     }
 }
 
-fn dingtalk_error(
-    status: StatusCode,
-    e: DingtalkError,
-) -> anyhow::Result<Response<Body>> {
+fn dingtalk_error(status: StatusCode, e: DingtalkError) -> anyhow::Result<Response<Body>> {
     let msg = match e {
         DingtalkError::Internal(s) => format!("Internal: {s}"),
         DingtalkError::AuthFailed(s) => format!("Auth failed: {s}"),

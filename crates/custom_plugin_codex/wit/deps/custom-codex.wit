@@ -1,0 +1,58 @@
+package custom:codex@0.1.0;
+
+interface types {
+    variant codex-error {
+        internal(string),
+        config-error(string),
+        process-error(string),
+        not-found(string),
+        timeout(string),
+    }
+
+    record token-usage {
+        input-tokens: u64,
+        cached-input-tokens: u64,
+        output-tokens: u64,
+    }
+
+    record codex-event {
+        event-type: string,
+        item-id: option<string>,
+        item-type: option<string>,
+        text-content: option<string>,
+        command: option<string>,
+        status: option<string>,
+        raw-json: string,
+    }
+
+    variant exec-stream-event {
+        event(codex-event),
+        usage(token-usage),
+        done(string),
+        error(string),
+    }
+}
+
+interface executor {
+    use types.{codex-error, exec-stream-event};
+
+    resource exec-stream {
+        next: func() -> result<tuple<list<exec-stream-event>, bool>, codex-error>;
+    }
+
+    execute: func(prompt: string) -> result<exec-stream, codex-error>;
+}
+
+interface session {
+    use types.{codex-error, token-usage, exec-stream-event};
+    use executor.{exec-stream};
+
+    get-usage: func(session-id: string) -> result<token-usage, codex-error>;
+
+    resume: func(session-id: string, prompt: string) -> result<exec-stream, codex-error>;
+}
+
+world codex {
+    import executor;
+    import session;
+}

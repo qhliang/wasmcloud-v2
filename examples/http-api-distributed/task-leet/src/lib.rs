@@ -9,8 +9,8 @@ wit_bindgen::generate!({
 });
 
 use crate::wasmcloud::messaging::types::BrokerMessage;
+use wasi::logging::logging::{Level, log};
 use wasmcloud::messaging::consumer;
-use wasi::logging::logging::{log, Level};
 #[allow(unused)]
 use wstd::prelude::*;
 
@@ -22,27 +22,47 @@ export!(Component);
 
 impl exports::wasmcloud::messaging::handler::Guest for Component {
     fn handle_message(msg: BrokerMessage) -> Result<(), String> {
-        log(Level::Info, LOG_CTX, &format!("Received message on subject: {}", msg.subject));
+        log(
+            Level::Info,
+            LOG_CTX,
+            &format!("Received message on subject: {}", msg.subject),
+        );
 
         let Some(subject) = msg.reply_to else {
             log(Level::Error, LOG_CTX, "Missing reply_to in message");
             return Err("missing reply_to".to_string());
         };
 
-        let payload = String::from_utf8(msg.body.to_vec())
-            .map_err(|e| {
-                let err = format!("Failed to decode message body: {}", e);
-                log(Level::Error, LOG_CTX, &err);
-                err
-            })?;
+        let payload = String::from_utf8(msg.body.to_vec()).map_err(|e| {
+            let err = format!("Failed to decode message body: {}", e);
+            log(Level::Error, LOG_CTX, &err);
+            err
+        })?;
 
-        log(Level::Debug, LOG_CTX, &format!("Processing payload: {} bytes", payload.len()));
+        log(
+            Level::Debug,
+            LOG_CTX,
+            &format!("Processing payload: {} bytes", payload.len()),
+        );
 
         let leet_result = to_leet_speak(&payload);
-        log(Level::Info, LOG_CTX, &format!("Converted: '{}' -> '{}'",
-            if payload.len() > 50 { &payload[..50] } else { &payload },
-            if leet_result.len() > 50 { &leet_result[..50] } else { &leet_result }
-        ));
+        log(
+            Level::Info,
+            LOG_CTX,
+            &format!(
+                "Converted: '{}' -> '{}'",
+                if payload.len() > 50 {
+                    &payload[..50]
+                } else {
+                    &payload
+                },
+                if leet_result.len() > 50 {
+                    &leet_result[..50]
+                } else {
+                    &leet_result
+                }
+            ),
+        );
 
         let reply = BrokerMessage {
             subject,
@@ -51,7 +71,11 @@ impl exports::wasmcloud::messaging::handler::Guest for Component {
         };
 
         consumer::publish(&reply).map_err(|e| {
-            log(Level::Error, LOG_CTX, &format!("Failed to publish reply: {}", e));
+            log(
+                Level::Error,
+                LOG_CTX,
+                &format!("Failed to publish reply: {}", e),
+            );
             e
         })?;
 

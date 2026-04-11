@@ -1,7 +1,7 @@
+use crate::LOG_CTX;
 use crate::bindings::wasi::logging::logging::{Level, log};
 use crate::bindings::wasmcloud::messaging::consumer;
 use crate::helpers;
-use crate::LOG_CTX;
 
 use serde::Deserialize;
 use wstd::http::{Body, Request, Response, StatusCode};

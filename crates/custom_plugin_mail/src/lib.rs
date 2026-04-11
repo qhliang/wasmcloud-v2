@@ -128,8 +128,7 @@ fn parse_addresses(addrs: &str) -> Result<Vec<Mailbox>, String> {
 /// Connect to an IMAP server via TLS and authenticate.
 async fn connect_imap(
     config: &PluginConfig,
-) -> Result<async_imap::Session<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>, String>
-{
+) -> Result<async_imap::Session<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>, String> {
     let imap_host = match &config.imap_host {
         Some(h) => h.clone(),
         None => return Err("IMAP host not configured".to_string()),
@@ -140,9 +139,8 @@ async fn connect_imap(
         .await
         .map_err(|e| format!("failed to connect to IMAP server '{addr}': {e}"))?;
 
-    let root_cert_store = rustls::RootCertStore::from_iter(
-        webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
-    );
+    let root_cert_store =
+        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let client_config = rustls::ClientConfig::builder()
         .with_root_certificates(root_cert_store)
         .with_no_client_auth();
@@ -239,29 +237,29 @@ impl<'a> bindings::custom::mail::sender::Host for ActiveCtx<'a> {
             builder = builder.to(addr);
         }
 
-        if let Some(ref cc_str) = cc {
-            if !cc_str.is_empty() {
-                match parse_addresses(cc_str) {
-                    Ok(addrs) => {
-                        for addr in addrs {
-                            builder = builder.cc(addr);
-                        }
+        if let Some(ref cc_str) = cc
+            && !cc_str.is_empty()
+        {
+            match parse_addresses(cc_str) {
+                Ok(addrs) => {
+                    for addr in addrs {
+                        builder = builder.cc(addr);
                     }
-                    Err(e) => return Ok(Err(MailError::InvalidAddress(e))),
                 }
+                Err(e) => return Ok(Err(MailError::InvalidAddress(e))),
             }
         }
 
-        if let Some(ref bcc_str) = bcc {
-            if !bcc_str.is_empty() {
-                match parse_addresses(bcc_str) {
-                    Ok(addrs) => {
-                        for addr in addrs {
-                            builder = builder.bcc(addr);
-                        }
+        if let Some(ref bcc_str) = bcc
+            && !bcc_str.is_empty()
+        {
+            match parse_addresses(bcc_str) {
+                Ok(addrs) => {
+                    for addr in addrs {
+                        builder = builder.bcc(addr);
                     }
-                    Err(e) => return Ok(Err(MailError::InvalidAddress(e))),
                 }
+                Err(e) => return Ok(Err(MailError::InvalidAddress(e))),
             }
         }
 
@@ -309,11 +307,18 @@ impl<'a> bindings::custom::mail::sender::Host for ActiveCtx<'a> {
         // Build SMTP transport
         let creds = Credentials::new(config.username.clone(), config.password.clone());
 
-        let mailer = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&config.smtp_host)
-            .unwrap_or_else(|_| {
-                AsyncSmtpTransport::<Tokio1Executor>::relay(&config.smtp_host)
-                    .expect("failed to create SMTP transport")
-            })
+        let mailer =
+            match AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&config.smtp_host) {
+                Ok(m) => m,
+                Err(_) => match AsyncSmtpTransport::<Tokio1Executor>::relay(&config.smtp_host) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        return Ok(Err(MailError::Internal(format!(
+                            "failed to create SMTP transport: {e}"
+                        ))));
+                    }
+                },
+            }
             .port(config.smtp_port)
             .credentials(creds)
             .build();
@@ -372,10 +377,9 @@ impl<'a> bindings::custom::mail::sender::Host for ActiveCtx<'a> {
         let criteria = search_criteria.as_deref().unwrap_or("ALL");
         let max_results = limit.unwrap_or(20);
 
-        session
-            .select(mailbox_name)
-            .await
-            .map_err(|e| MailError::Internal(format!("failed to select mailbox '{mailbox_name}': {e}")))?;
+        session.select(mailbox_name).await.map_err(|e| {
+            MailError::Internal(format!("failed to select mailbox '{mailbox_name}': {e}"))
+        })?;
 
         let uids = session
             .uid_search(criteria)
@@ -386,7 +390,7 @@ impl<'a> bindings::custom::mail::sender::Host for ActiveCtx<'a> {
         let uid_vec: Vec<u32> = uids.iter().copied().collect();
         // Take only the last N UIDs (most recent)
         let start = uid_vec.len().saturating_sub(max_results as usize);
-        let selected_uids = &uid_vec[start..];
+        let selected_uids = uid_vec.get(start..).unwrap_or_default();
 
         if !selected_uids.is_empty() {
             let uid_set = selected_uids
@@ -493,10 +497,9 @@ impl<'a> bindings::custom::mail::sender::Host for ActiveCtx<'a> {
 
         let mailbox_name = mailbox.as_deref().unwrap_or("INBOX");
 
-        session
-            .select(mailbox_name)
-            .await
-            .map_err(|e| MailError::Internal(format!("failed to select mailbox '{mailbox_name}': {e}")))?;
+        session.select(mailbox_name).await.map_err(|e| {
+            MailError::Internal(format!("failed to select mailbox '{mailbox_name}': {e}"))
+        })?;
 
         let messages = session
             .uid_fetch(&message_id, "(UID BODY.PEEK[])")
@@ -539,15 +542,9 @@ impl<'a> bindings::custom::mail::sender::Host for ActiveCtx<'a> {
             .headers
             .get_first_value("Subject")
             .unwrap_or_default();
-        let from = parsed
-            .headers
-            .get_first_value("From")
-            .unwrap_or_default();
+        let from = parsed.headers.get_first_value("From").unwrap_or_default();
         let to = parsed.headers.get_first_value("To").unwrap_or_default();
-        let date = parsed
-            .headers
-            .get_first_value("Date")
-            .unwrap_or_default();
+        let date = parsed.headers.get_first_value("Date").unwrap_or_default();
 
         // Extract body text and HTML
         let mut body_text = None;

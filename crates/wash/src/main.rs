@@ -168,8 +168,7 @@ async fn main() {
         .unwrap_or_else(|e| {
             exit_with_output(
                 &mut stderr,
-                CommandOutput::error(format!("{e:?}"), None)
-                    .with_output_kind(global_args.output),
+                CommandOutput::error(format!("{e:?}"), None).with_output_kind(global_args.output),
             );
         });
 

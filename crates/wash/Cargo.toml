@@ -64,6 +64,7 @@ custom_plugin_mail = { path = "../custom_plugin_mail" }
 custom_plugin_crontab = { path = "../custom_plugin_crontab" }
 custom_plugin_dingtalk_stream = { path = "../custom_plugin_dingtalk_stream" }
 custom_plugin_feishu = { path = "../custom_plugin_feishu" }
+custom_plugin_codex = { path = "../custom_plugin_codex" }
 
 # Enable WebGPU support on non-Windows platforms
 # WebGPU is disabled on Windows due to dependency version conflicts with the windows crate
