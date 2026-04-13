@@ -128,6 +128,14 @@ dev:
         api_token: sk-4Saze9gon2X3ORsGGleSPjdCkCAOq9jHhFYdNPCMg2cYaF09
         model: glm-5.1
         codex_binary_path: "/usr/local/bin/codex"
+    - namespace: custom
+      package: wechat
+      interfaces:
+        - sender
+        - login
+        - handler
+      config:
+        token: "1186f1a5b736@im.bot:060000dc4f9761a269251f09961cccf0fc7866"
 
 new:
   command: cargo fetch

@@ -22,6 +22,7 @@ mod mail;
 mod r2;
 mod task;
 mod templates;
+mod wechat;
 
 use bindings::wasi::logging::logging::{Level, log};
 use wstd::http::{Body, Request, Response, StatusCode};
@@ -66,6 +67,39 @@ impl bindings::exports::custom::dingtalk_stream::handler::Guest for CustomHandle
             LOG_CTX,
             &format!("Received DingTalk message: {:?}", msg),
         );
+        Ok(())
+    }
+}
+
+impl bindings::exports::custom::wechat::handler::Guest for CustomHandler {
+    fn on_message(
+        msg: bindings::exports::custom::wechat::handler::WechatMessage,
+    ) -> Result<(), String> {
+        log(
+            Level::Info,
+            LOG_CTX,
+            &format!("Received WeChat message: {:?}", msg),
+        );
+
+        let replies = [
+            "Hello! I received your message.",
+            "Thanks for reaching out!",
+            "Got it, I'll get back to you soon.",
+            "Interesting! Tell me more.",
+            "I'm a bot, but I appreciate your message!",
+        ];
+        let idx = (msg.timestamp as usize) % replies.len();
+        let reply = replies[idx];
+
+        match bindings::custom::wechat::sender::send_text(&msg.sender, reply) {
+            Ok(()) => {
+                log(Level::Info, LOG_CTX, "WECHAT AUTO-REPLY sent");
+            }
+            Err(e) => {
+                log(Level::Error, LOG_CTX, &format!("WECHAT AUTO-REPLY failed: {:?}", e));
+            }
+        }
+
         Ok(())
     }
 }
@@ -168,6 +202,11 @@ async fn main(req: Request<Body>) -> anyhow::Result<Response<Body>> {
         "/codex/execute" => codex::execute(req).await,
         "/codex/usage" => codex::get_usage(req).await,
         "/codex/resume" => codex::resume(req).await,
+        "/wechat" | "/wechat/" => wechat::home(req).await,
+        "/wechat/send-text" => wechat::send_text(req).await,
+        "/wechat/send-media" => wechat::send_media(req).await,
+        "/wechat/qr-start" => wechat::qr_start(req).await,
+        "/wechat/qr-poll-status" => wechat::qr_poll_status(req).await,
         _ => {
             log(Level::Debug, LOG_CTX, &format!("Not found: {}", path));
 

@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>WeChat</title>
+        <style>
+            {BASE_CSS}
+                    .qr-container {
+                        text-align: center;
+                        margin: 16px 0;
+                    }
+                    .qr-container img {
+                        max-width: 280px;
+                        border: 1px solid #ddd;
+                        border-radius: 8px;
+                    }
+                    .qr-status {
+                        font-size: 14px;
+                        padding: 8px;
+                        margin-top: 8px;
+                        border-radius: 4px;
+                    }
+                    .qr-status.waiting { background: #fff3cd; color: #856404; }
+                    .qr-status.scanned { background: #d1ecf1; color: #0c5460; }
+                    .qr-status.confirmed { background: #d4edda; color: #155724; }
+                    .qr-status.expired { background: #f8d7da; color: #721c24; }
+                    .qr-status.error { background: #f8d7da; color: #721c24; }
+        </style>
+    </head>
+    <body>
+        <h1>WeChat</h1>
+        {NAV}
+
+        <div class="section">
+            <h2>Send Text Message</h2>
+            <label for="sendTextTo">To *</label>
+            <input type="text" id="sendTextTo" placeholder="wechat_id or open_id" />
+            <label for="sendTextContent">Content *</label>
+            <textarea id="sendTextContent" rows="3" placeholder="Hello from wasmCloud!"></textarea>
+            <button onclick="sendText()">Send Text</button>
+            <div id="sendTextResult" class="result"></div>
+        </div>
+
+        <div class="section">
+            <h2>Send Media</h2>
+            <label for="sendMediaTo">To *</label>
+            <input type="text" id="sendMediaTo" placeholder="wechat_id or open_id" />
+            <label for="sendMediaPath">File Path *</label>
+            <input type="text" id="sendMediaPath" placeholder="/tmp/image.png" />
+            <button onclick="sendMedia()">Send Media</button>
+            <div id="sendMediaResult" class="result"></div>
+        </div>
+
+        <div class="section">
+            <h2>QR Login (iLink Binding)</h2>
+            <p>Scan the QR code with WeChat to bind your iLink account.</p>
+            <button onclick="startQrLogin()" id="qrStartBtn">Start QR Login</button>
+            <div id="qrContainer" class="qr-container" style="display:none;">
+                <img id="qrImage" src="" alt="QR Code" />
+                <div id="qrStatus" class="qr-status"></div>
+                <div id="qrSessionData" style="display:none;"></div>
+            </div>
+            <div id="qrResult" class="result"></div>
+        </div>
+
+        <script>
+            {
+                BASE_JS;
+            }
+
+            async function sendText() {
+                const to = document.getElementById("sendTextTo").value.trim();
+                const text = document.getElementById("sendTextContent").value.trim();
+                if (!to || !text) {
+                    showResult("sendTextResult", "To and Content are required", true);
+                    return;
+                }
+                try {
+                    const resp = await fetch("/wechat/send-text", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ to, text }),
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok) {
+                        showResult("sendTextResult", "Error: " + (data.error || JSON.stringify(data, null, 2)), true);
+                    } else {
+                        showResult("sendTextResult", "Message sent successfully", false);
+                    }
+                } catch (e) {
+                    showResult("sendTextResult", "Error: " + e.message, true);
+                }
+            }
+
+            async function sendMedia() {
+                const to = document.getElementById("sendMediaTo").value.trim();
+                const file_path = document.getElementById("sendMediaPath").value.trim();
+                if (!to || !file_path) {
+                    showResult("sendMediaResult", "To and File Path are required", true);
+                    return;
+                }
+                try {
+                    const resp = await fetch("/wechat/send-media", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ to, file_path }),
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok) {
+                        showResult("sendMediaResult", "Error: " + (data.error || JSON.stringify(data, null, 2)), true);
+                    } else {
+                        showResult("sendMediaResult", "Media sent successfully", false);
+                    }
+                } catch (e) {
+                    showResult("sendMediaResult", "Error: " + e.message, true);
+                }
+            }
+
+            let qrPollTimer = null;
+            let qrSessionJson = null;
+
+            async function startQrLogin() {
+                const btn = document.getElementById("qrStartBtn");
+                btn.disabled = true;
+                btn.textContent = "Starting...";
+                document.getElementById("qrContainer").style.display = "none";
+
+                if (qrPollTimer) {
+                    clearInterval(qrPollTimer);
+                    qrPollTimer = null;
+                }
+
+                try {
+                    const resp = await fetch("/wechat/qr-start", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok) {
+                        showResult("qrResult", "Error: " + (data.error || JSON.stringify(data, null, 2)), true);
+                        return;
+                    }
+
+                    // data is a JSON string from the host
+                    const session = typeof data === "string" ? JSON.parse(data) : data;
+                    qrSessionJson = JSON.stringify(session);
+
+                    document.getElementById("qrContainer").style.display = "block";
+                    document.getElementById("qrImage").src = session.qrcode_img_content || "";
+                    setQrStatus("waiting", "Waiting for scan...");
+
+                    // Start polling
+                    qrPollTimer = setInterval(pollQrStatus, 3000);
+                } catch (e) {
+                    showResult("qrResult", "Error: " + e.message, true);
+                } finally {
+                    btn.disabled = false;
+                    btn.textContent = "Start QR Login";
+                }
+            }
+
+            async function pollQrStatus() {
+                if (!qrSessionJson) return;
+                try {
+                    const resp = await fetch("/wechat/qr-poll-status", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ session_json: qrSessionJson }),
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok) {
+                        setQrStatus("error", "Error: " + (data.error || "unknown"));
+                        clearInterval(qrPollTimer);
+                        qrPollTimer = null;
+                        return;
+                    }
+
+                    const status = typeof data === "string" ? JSON.parse(data) : data;
+                    switch (status.status) {
+                        case "wait":
+                            setQrStatus("waiting", "Waiting for scan...");
+                            break;
+                        case "scanned":
+                            setQrStatus("scanned", "Scanned! Waiting for confirmation...");
+                            break;
+                        case "scanned_redirect":
+                            setQrStatus("scanned", "Scanned (redirect: " + (status.redirect_host || "") + ")...");
+                            break;
+                        case "confirmed":
+                            setQrStatus("confirmed", "Confirmed! iLink user: " + (status.ilink_user_id || ""));
+                            clearInterval(qrPollTimer);
+                            qrPollTimer = null;
+                            break;
+                        case "expired":
+                            setQrStatus("expired", "QR code expired. Please try again.");
+                            clearInterval(qrPollTimer);
+                            qrPollTimer = null;
+                            break;
+                        default:
+                            setQrStatus("error", "Unknown status: " + status.status);
+                    }
+                } catch (e) {
+                    setQrStatus("error", "Poll error: " + e.message);
+                }
+            }
+
+            function setQrStatus(cls, msg) {
+                const el = document.getElementById("qrStatus");
+                el.className = "qr-status " + cls;
+                el.textContent = msg;
+            }
+        </script>
+    </body>
+</html>

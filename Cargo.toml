@@ -12,7 +12,9 @@ members = [
     "crates/custom_plugin_crontab",
     "crates/custom_plugin_dingtalk_stream",
     "crates/custom_plugin_feishu",
-    "crates/custom_plugin_codex"]
+    "crates/custom_plugin_codex",
+    "crates/custom_plugin_wechat",
+]
 
 [workspace.package]
 authors = ["The wasmCloud Team"]

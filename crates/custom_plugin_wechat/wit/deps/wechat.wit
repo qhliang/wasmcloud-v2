@@ -1,0 +1,57 @@
+package custom:wechat@0.1.0;
+
+interface types {
+    variant wechat-error {
+        internal(string),
+        send-failed(string),
+        not-ready(string),
+    }
+
+    record wechat-message {
+        message-id: string,
+        sender: string,
+        receiver: string,
+        message-type: string,
+        text-content: option<string>,
+        timestamp: s64,
+        raw-json: string,
+    }
+}
+
+interface sender {
+    use types.{wechat-error};
+
+    /// Send a text message to a user.
+    send-text: func(to: string, text: string) -> result<_, wechat-error>;
+
+    /// Send a media file to a user.
+    send-media: func(to: string, file-path: string) -> result<_, wechat-error>;
+}
+
+/// Guest-exported interface for receiving WeChat messages.
+interface handler {
+    use types.{wechat-message};
+
+    /// Called by the host when a WeChat message is received.
+    on-message: func(msg: wechat-message) -> result<_, string>;
+}
+
+/// QR code login for WeChat iLink binding.
+interface login {
+    use types.{wechat-error};
+
+    /// Start a QR login session. Returns a JSON string with fields:
+    /// `{"qrcode": "<token>", "qrcode_img_content": "<image_url>"}`
+    qr-start: func() -> result<string, wechat-error>;
+
+    /// Poll the login status for a QR session. Returns a JSON string with fields:
+    /// `{"status": "wait|scanned|confirmed|expired", "bot_token": "...", "ilink_user_id": "..."}`
+    /// (bot_token and ilink_user_id are only present when status is "confirmed")
+    qr-poll-status: func(session-json: string) -> result<string, wechat-error>;
+}
+
+world wechat {
+    import sender;
+    import login;
+    export handler;
+}

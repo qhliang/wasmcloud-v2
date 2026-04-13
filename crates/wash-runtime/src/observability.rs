@@ -29,6 +29,7 @@ pub fn initialize_observability(
         .add_directive(directive("wasmtime=info")?)
         .add_directive(directive("h2=info")?)
         .add_directive(directive("rustl=info")?)
+        .add_directive(directive("hyper_util::client=info")?)
         .add_directive(directive("open_lark::client::ws_client::client=info")?);
 
     if !verbose {
