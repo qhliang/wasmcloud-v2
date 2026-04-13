@@ -1,6 +1,6 @@
 use crate::bindings::custom::codex::executor;
 use crate::bindings::custom::codex::session;
-use crate::bindings::custom::codex::types::{CodexEvent, ExecStreamEvent};
+use crate::bindings::custom::codex::types::{ApprovalRequest, CodexEvent, ExecStreamEvent};
 use crate::bindings::custom::wechat::sender;
 use crate::bindings::wasi::clocks::monotonic_clock;
 use crate::bindings::wasi::logging::logging::{Level, log};
@@ -75,6 +75,13 @@ fn process_stream(
                             all_events.push(serde_json::json!({
                                 "type": "error",
                                 "message": err,
+                            }));
+                        }
+                        ExecStreamEvent::ApprovalNeeded(ApprovalRequest { item_id, command }) => {
+                            all_events.push(serde_json::json!({
+                                "type": "approval-needed",
+                                "item_id": item_id,
+                                "command": command,
                             }));
                         }
                     }
@@ -404,6 +411,9 @@ pub fn execute_for_chat(sender_id: &str, prompt: &str) -> Result<String, String>
                                 LOG_CTX,
                                 &format!("CODEX CHAT STREAM ERROR: {err}"),
                             );
+                        }
+                        ExecStreamEvent::ApprovalNeeded(_) => {
+                            // Auto-approve in chat mode (auto_approve=true by default)
                         }
                     }
                 }

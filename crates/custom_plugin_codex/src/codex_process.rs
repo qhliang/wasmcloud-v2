@@ -37,6 +37,8 @@ pub enum CodexJsonlEvent {
     TurnFailed { error: serde_json::Value },
     #[serde(rename = "error")]
     Error { message: String },
+    #[serde(rename = "exec.approval.request")]
+    ExecApprovalRequest { item: serde_json::Value },
 }
 
 /// Token usage accumulator for a session.
@@ -69,13 +71,13 @@ pub struct CodexSpawnConfig {
     pub project_dir: PathBuf,
 }
 
-/// Spawn `codex exec --json` as a subprocess and return the child handle.
+/// Spawn `codex exec --json` as a subprocess and return the child handle and stdin.
 #[instrument(skip(config))]
 pub fn spawn_codex_exec(
     config: &CodexSpawnConfig,
     prompt: &str,
     session_id: Option<&str>,
-) -> anyhow::Result<tokio::process::Child> {
+) -> anyhow::Result<(tokio::process::Child, tokio::process::ChildStdin)> {
     let mut cmd = tokio::process::Command::new(&config.binary_path);
 
     if let Some(sid) = session_id {
@@ -87,7 +89,6 @@ pub fn spawn_codex_exec(
     cmd.arg("--json")
         .arg("--model")
         .arg(&config.model)
-        .arg("--full-auto")
         .arg("--skip-git-repo-check")
         .arg("--color")
         .arg("never")
@@ -96,6 +97,7 @@ pub fn spawn_codex_exec(
     cmd.current_dir(&config.project_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::piped())
         .env("CODEX_API_KEY", &config.api_token);
 
     if let Some(ref base_url) = config.base_url {
@@ -107,10 +109,14 @@ pub fn spawn_codex_exec(
         model = %config.model,
         project_dir = %config.project_dir.display(),
         session_id = session_id.unwrap_or("none"),
-        "Spawning codex exec subprocess"
+        "Spawning codex exec subprocess (approval mode)"
     );
 
-    cmd.spawn().context("failed to spawn codex exec subprocess")
+    let mut child = cmd.spawn().context("failed to spawn codex exec subprocess")?;
+
+    let stdin = child.stdin.take().context("codex process has no stdin")?;
+
+    Ok((child, stdin))
 }
 
 // ---------------------------------------------------------------------------

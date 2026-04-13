@@ -25,11 +25,17 @@ interface types {
         raw-json: string,
     }
 
+    record approval-request {
+        item-id: string,
+        command: string,
+    }
+
     variant exec-stream-event {
         event(codex-event),
         usage(token-usage),
         done(string),
         error(string),
+        approval-needed(approval-request),
     }
 
     record session-info {
@@ -63,6 +69,10 @@ interface session {
     change-session: func(context-key: string, session-id: string) -> result<_, codex-error>;
     delete-session: func(session-id: string) -> result<_, codex-error>;
     list-sessions: func() -> result<list<session-info>, codex-error>;
+
+    // Approval control
+    set-auto-approve: func(session-id: string, auto-approve: bool) -> result<_, codex-error>;
+    approve: func(session-id: string, item-id: string, approved: bool) -> result<_, codex-error>;
 }
 
 world codex {

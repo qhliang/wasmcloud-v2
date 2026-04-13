@@ -50,8 +50,7 @@ mod bindings {
     });
 }
 
-use bindings::custom::codex::types::{CodexError, CodexEvent, ExecStreamEvent, SessionInfo, TokenUsage};
-
+use bindings::custom::codex::types::{ApprovalRequest, CodexError, CodexEvent, ExecStreamEvent, SessionInfo, TokenUsage};
 const PLUGIN_ID: &str = "codex";
 
 // ---------------------------------------------------------------------------
@@ -104,6 +103,12 @@ struct CodexSessionState {
     usage: TokenUsageAccum,
     /// The session ID from thread.started event
     session_id: Option<String>,
+    /// Stdin pipe to the codex process for writing approval responses
+    stdin: Option<tokio::process::ChildStdin>,
+    /// Whether to auto-approve all commands (default: true)
+    auto_approve: bool,
+    /// Item ID of the current pending approval request (if any)
+    pending_approval_item_id: Option<String>,
 }
 
 /// Configuration for a workload's codex integration
@@ -295,6 +300,26 @@ fn convert_event(event: CodexJsonlEvent) -> ExecStreamEvent {
             ExecStreamEvent::Error(msg)
         }
         CodexJsonlEvent::Error { message } => ExecStreamEvent::Error(message),
+        CodexJsonlEvent::ExecApprovalRequest { item } => {
+            let item_id = item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let command = item
+                .get("command")
+                .and_then(|v| {
+                    v.as_str()
+                        .map(|s| s.to_string())
+                        .or_else(|| serde_json::to_string(v).ok())
+                })
+                .unwrap_or_default();
+            ExecStreamEvent::ApprovalNeeded(ApprovalRequest {
+                item_id,
+                command,
+            })
+        }
     }
 }
 
@@ -314,6 +339,15 @@ fn drain_channel(session: &mut CodexSessionState) {
             }
             CodexJsonlEvent::TurnFailed { .. } | CodexJsonlEvent::Error { .. } => {
                 session.ended = true;
+            }
+            CodexJsonlEvent::ExecApprovalRequest { item } => {
+                let item_id = item
+                    .get("call_id")
+                    .or_else(|| item.get("id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                session.pending_approval_item_id = Some(item_id);
             }
             _ => {}
         }
@@ -363,8 +397,8 @@ async fn create_new_session(
         project_dir: config.project_dir.clone(),
     };
 
-    let mut child = match spawn_codex_exec(&spawn_config, prompt, None) {
-        Ok(c) => c,
+    let (mut child, child_stdin) = match spawn_codex_exec(&spawn_config, prompt, None) {
+        Ok(pair) => pair,
         Err(e) => {
             return Ok(Err(CodexError::ProcessError(format!(
                 "failed to spawn codex: {e}"
@@ -418,6 +452,9 @@ async fn create_new_session(
         ended: false,
         usage: TokenUsageAccum::default(),
         session_id: None,
+        stdin: Some(child_stdin),
+        auto_approve: true,
+        pending_approval_item_id: None,
     };
 
     {
@@ -568,6 +605,15 @@ impl<'a> bindings::custom::codex::executor::HostExecStream for ActiveCtx<'a> {
                     // Drain new events from channel
                     drain_channel(session);
 
+                    // Handle auto-approval for ExecApprovalRequest events
+                    if session.auto_approve && session.pending_approval_item_id.is_some() {
+                        if let Some(ref mut stdin) = session.stdin {
+                            use tokio::io::AsyncWriteExt;
+                            let _ = stdin.write(b"y\n").await;
+                        }
+                        session.pending_approval_item_id = None;
+                    }
+
                     // Convert pending events to WIT types
                     let wit_events: Vec<ExecStreamEvent> = session
                         .pending_events
@@ -575,6 +621,9 @@ impl<'a> bindings::custom::codex::executor::HostExecStream for ActiveCtx<'a> {
                         .map(convert_event)
                         .collect();
 
+                    // If not auto_approve and there's a pending approval, filter out
+                    // the approval event from auto-forwarding (it will be returned as
+                    // the last event for the Wasm component to handle)
                     let done = session.ended;
                     (wit_events, done)
                 }
@@ -715,8 +764,8 @@ impl<'a> bindings::custom::codex::session::Host for ActiveCtx<'a> {
             project_dir: config.project_dir.clone(),
         };
 
-        let mut child = match spawn_codex_exec(&spawn_config, &prompt, Some(&session_id)) {
-            Ok(c) => c,
+        let (mut child, child_stdin) = match spawn_codex_exec(&spawn_config, &prompt, Some(&session_id)) {
+            Ok(pair) => pair,
             Err(e) => {
                 return Ok(Err(CodexError::ProcessError(format!(
                     "failed to spawn codex resume: {e}"
@@ -767,6 +816,9 @@ impl<'a> bindings::custom::codex::session::Host for ActiveCtx<'a> {
             ended: false,
             usage: TokenUsageAccum::default(),
             session_id: Some(session_id.clone()),
+            stdin: Some(child_stdin),
+            auto_approve: true,
+            pending_approval_item_id: None,
         };
 
         {
@@ -944,6 +996,130 @@ impl<'a> bindings::custom::codex::session::Host for ActiveCtx<'a> {
                     })
                     .collect();
                 Ok(Ok(list))
+            }
+            None => Ok(Err(CodexError::NotFound(
+                "component not tracked".to_string(),
+            ))),
+        }
+    }
+
+    #[instrument(skip_all)]
+    async fn set_auto_approve(
+        &mut self,
+        session_id: String,
+        auto_approve: bool,
+    ) -> wasmtime::Result<Result<(), CodexError>> {
+        let Some(plugin) = self.get_plugin::<Codex>(PLUGIN_ID) else {
+            return Ok(Err(CodexError::Internal(
+                "codex plugin not available".to_string(),
+            )));
+        };
+
+        let component_id = self.component_id.as_ref().to_string();
+
+        let mut lock = plugin.tracker.write().await;
+        match lock.get_component_data_mut(&component_id) {
+            Some(data) => {
+                let internal_key = match data.session_id_map.get(&session_id) {
+                    Some(k) => k.clone(),
+                    None => {
+                        return Ok(Err(CodexError::NotFound(format!(
+                            "session '{session_id}' not found"
+                        ))));
+                    }
+                };
+
+                match data.sessions.get_mut(&internal_key) {
+                    Some(session) => {
+                        debug!(
+                            session_id = %session_id,
+                            auto_approve = auto_approve,
+                            "Codex session auto-approve mode changed"
+                        );
+                        session.auto_approve = auto_approve;
+                        Ok(Ok(()))
+                    }
+                    None => Ok(Err(CodexError::NotFound(format!(
+                        "session '{session_id}' not found"
+                    )))),
+                }
+            }
+            None => Ok(Err(CodexError::NotFound(
+                "component not tracked".to_string(),
+            ))),
+        }
+    }
+
+    #[instrument(skip_all)]
+    async fn approve(
+        &mut self,
+        session_id: String,
+        item_id: String,
+        approved: bool,
+    ) -> wasmtime::Result<Result<(), CodexError>> {
+        let Some(plugin) = self.get_plugin::<Codex>(PLUGIN_ID) else {
+            return Ok(Err(CodexError::Internal(
+                "codex plugin not available".to_string(),
+            )));
+        };
+
+        let component_id = self.component_id.as_ref().to_string();
+
+        let mut lock = plugin.tracker.write().await;
+        match lock.get_component_data_mut(&component_id) {
+            Some(data) => {
+                let internal_key = match data.session_id_map.get(&session_id) {
+                    Some(k) => k.clone(),
+                    None => {
+                        return Ok(Err(CodexError::NotFound(format!(
+                            "session '{session_id}' not found"
+                        ))));
+                    }
+                };
+
+                match data.sessions.get_mut(&internal_key) {
+                    Some(session) => {
+                        // Verify the item_id matches the pending approval
+                        match &session.pending_approval_item_id {
+                            Some(pending_id) if pending_id == &item_id => {}
+                            Some(_) => {
+                                return Ok(Err(CodexError::Internal(format!(
+                                    "item '{item_id}' does not match pending approval"
+                                ))));
+                            }
+                            None => {
+                                return Ok(Err(CodexError::Internal(
+                                    "no pending approval request".to_string(),
+                                )));
+                            }
+                        }
+
+                        // Write approval response to codex stdin
+                        if let Some(ref mut stdin) = session.stdin {
+                            let response = if approved { b"y\n" } else { b"n\n" };
+                            use tokio::io::AsyncWriteExt;
+                            if let Err(e) = stdin.write(response).await {
+                                return Ok(Err(CodexError::ProcessError(format!(
+                                    "failed to write approval to stdin: {e}"
+                                ))));
+                            }
+                        }
+
+                        debug!(
+                            session_id = %session_id,
+                            item_id = %item_id,
+                            approved = approved,
+                            "Codex approval response sent"
+                        );
+
+                        session.pending_approval_item_id = None;
+
+                        Ok(Ok(()))
+                    }
+                    None => Ok(Err(CodexError::NotFound(format!(
+                        "session '{session_id}' not found"
+                    )))),
+                }
             }
             None => Ok(Err(CodexError::NotFound(
                 "component not tracked".to_string(),
