@@ -491,7 +491,18 @@ impl<'a> bindings::custom::codex::executor::Host for ActiveCtx<'a> {
 
             if let Some(sid) = session_id {
                 // Resume existing current session
-                return bindings::custom::codex::session::Host::resume(self, sid, prompt).await;
+                let result = bindings::custom::codex::session::Host::resume(self, sid, prompt).await;
+                // Update current_sessions to point to the new internal key created by resume
+                if let Ok(Ok(ref resource)) = result {
+                    let new_key = self.table.get(resource).map(|h| h.session_key.clone()).unwrap_or_default();
+                    if !new_key.is_empty() {
+                        let mut lock = plugin.tracker.write().await;
+                        if let Some(data) = lock.get_component_data_mut(&component_id) {
+                            data.current_sessions.insert(context_key, new_key);
+                        }
+                    }
+                }
+                return result;
             }
             // No thread_id yet — fall through to create new
         }
