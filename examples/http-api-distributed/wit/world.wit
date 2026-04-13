@@ -8,6 +8,7 @@ world http-api {
   import wasi:blobstore/types@0.2.0-draft;
   import wasi:blobstore/container@0.2.0-draft;
   import wasi:blobstore/blobstore@0.2.0-draft;
+  import wasi:clocks/monotonic-clock@0.2.1;
   import wasi:logging/logging@0.1.0-draft;
   import custom:cf-d1/query@0.1.0;
   import custom:llm-gateway/chat@0.1.0;

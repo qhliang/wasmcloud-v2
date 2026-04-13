@@ -81,22 +81,30 @@ impl bindings::exports::custom::wechat::handler::Guest for CustomHandler {
             &format!("Received WeChat message: {:?}", msg),
         );
 
-        let replies = [
-            "Hello! I received your message.",
-            "Thanks for reaching out!",
-            "Got it, I'll get back to you soon.",
-            "Interesting! Tell me more.",
-            "I'm a bot, but I appreciate your message!",
-        ];
-        let idx = (msg.timestamp as usize) % replies.len();
-        let reply = replies[idx];
+        let prompt = msg.text_content.as_deref().unwrap_or("");
+        if prompt.is_empty() {
+            log(Level::Warn, LOG_CTX, "WECHAT: empty message, skipping codex");
+            return Ok(());
+        }
 
-        match bindings::custom::wechat::sender::send_text(&msg.sender, reply) {
+        let reply = match codex::execute_for_chat(&msg.sender, prompt) {
+            Ok(text) => text,
+            Err(e) => {
+                log(
+                    Level::Error,
+                    LOG_CTX,
+                    &format!("WECHAT CODEX ERROR: {e}"),
+                );
+                format!("处理消息时出错: {e}")
+            }
+        };
+
+        match bindings::custom::wechat::sender::send_text(&msg.sender, &reply) {
             Ok(()) => {
-                log(Level::Info, LOG_CTX, "WECHAT AUTO-REPLY sent");
+                log(Level::Info, LOG_CTX, "WECHAT CODEX REPLY sent");
             }
             Err(e) => {
-                log(Level::Error, LOG_CTX, &format!("WECHAT AUTO-REPLY failed: {:?}", e));
+                log(Level::Error, LOG_CTX, &format!("WECHAT CODEX REPLY failed: {:?}", e));
             }
         }
 

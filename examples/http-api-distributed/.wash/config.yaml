@@ -135,7 +135,7 @@ dev:
         - login
         - handler
       config:
-        token: "1186f1a5b736@im.bot:060000dc4f9761a269251f09961cccf0fc7866"
+        token: "aa1ab8847715@im.bot:060000dc2c2206b685e00be56d7342c340855f"
 
 new:
   command: cargo fetch

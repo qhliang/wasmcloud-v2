@@ -1,6 +1,8 @@
 use crate::bindings::custom::codex::executor;
 use crate::bindings::custom::codex::session;
 use crate::bindings::custom::codex::types::{CodexEvent, ExecStreamEvent};
+use crate::bindings::custom::wechat::sender;
+use crate::bindings::wasi::clocks::monotonic_clock;
 use crate::bindings::wasi::logging::logging::{Level, log};
 use crate::helpers;
 use crate::templates;
@@ -10,6 +12,9 @@ use wstd::http::{Body, Request, Response, StatusCode};
 use crate::LOG_CTX;
 
 const CODEX_HTML: &str = include_str!("../resources/codex.html");
+
+/// Timeout in nanoseconds before sending a "processing" interim message (10 seconds).
+const PROCESSING_TIMEOUT_NS: u64 = 10_000_000_000;
 
 pub async fn home(_req: Request<Body>) -> anyhow::Result<Response<Body>> {
     helpers::html_response(templates::render(CODEX_HTML))
@@ -356,4 +361,88 @@ pub async fn list_sessions(_req: Request<Body>) -> anyhow::Result<Response<Body>
             helpers::json_error(StatusCode::BAD_REQUEST, &format!("{:?}", e))
         }
     }
+}
+
+/// Execute a prompt via Codex for chat contexts (e.g. WeChat).
+/// Uses `sender_id` as the context key to maintain per-user sessions.
+/// Sends an interim "processing" message if execution takes longer than 10 seconds.
+/// Returns the collected text content from the Codex response.
+pub fn execute_for_chat(sender_id: &str, prompt: &str) -> Result<String, String> {
+    log(
+        Level::Info,
+        LOG_CTX,
+        &format!(
+            "CODEX CHAT: sender={}, prompt_len={}",
+            sender_id,
+            prompt.len()
+        ),
+    );
+
+    let stream = executor::execute(sender_id, prompt).map_err(|e| format!("{e:?}"))?;
+
+    let start = monotonic_clock::now();
+    let mut texts: Vec<String> = Vec::new();
+    let mut sent_processing = false;
+
+    loop {
+        match stream.next() {
+            Ok((events, ended)) => {
+                for event in &events {
+                    match event {
+                        ExecStreamEvent::Event(CodexEvent {
+                            text_content: Some(text),
+                            ..
+                        }) => {
+                            texts.push(text.clone());
+                        }
+                        ExecStreamEvent::Event(_) => {}
+                        ExecStreamEvent::Done(_) => {}
+                        ExecStreamEvent::Usage(_) => {}
+                        ExecStreamEvent::Error(err) => {
+                            log(
+                                Level::Error,
+                                LOG_CTX,
+                                &format!("CODEX CHAT STREAM ERROR: {err}"),
+                            );
+                        }
+                    }
+                }
+
+                if !ended && !sent_processing {
+                    let elapsed = monotonic_clock::now() - start;
+                    if elapsed >= PROCESSING_TIMEOUT_NS {
+                        let _ = sender::send_text(sender_id, "正在处理中，请稍候...");
+                        sent_processing = true;
+                        log(Level::Info, LOG_CTX, "CODEX CHAT: sent processing notice");
+                    }
+                }
+
+                if ended {
+                    break;
+                }
+            }
+            Err(e) => {
+                log(
+                    Level::Error,
+                    LOG_CTX,
+                    &format!("CODEX CHAT STREAM FATAL: {e:?}"),
+                );
+                break;
+            }
+        }
+    }
+
+    let result = if texts.is_empty() {
+        String::from("(无输出)")
+    } else {
+        texts.join("\n")
+    };
+
+    log(
+        Level::Info,
+        LOG_CTX,
+        &format!("CODEX CHAT DONE: sender={}, result_len={}", sender_id, result.len()),
+    );
+
+    Ok(result)
 }
