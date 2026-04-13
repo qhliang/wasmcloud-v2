@@ -50,7 +50,7 @@ mod bindings {
     });
 }
 
-use bindings::custom::codex::types::{CodexError, CodexEvent, ExecStreamEvent, TokenUsage};
+use bindings::custom::codex::types::{CodexError, CodexEvent, ExecStreamEvent, SessionInfo, TokenUsage};
 
 const PLUGIN_ID: &str = "codex";
 
@@ -67,6 +67,15 @@ pub struct ExecStreamHandle {
     ended: bool,
 }
 
+/// Metadata tracked for each session to support list/change/delete
+#[allow(dead_code)]
+struct SessionMetadata {
+    session_id: String,
+    thread_id: String,
+    context_key: String,
+    created_at: String,
+}
+
 /// Per-component data tracked by the plugin
 struct ComponentData {
     /// Token that cancels ALL background tasks for this component
@@ -77,6 +86,10 @@ struct ComponentData {
     sessions: HashMap<String, CodexSessionState>,
     /// Reverse map: codex thread_id -> internal session key
     session_id_map: HashMap<String, String>,
+    /// Current session per context-key: context-key -> internal session key
+    current_sessions: HashMap<String, String>,
+    /// Metadata for all sessions: internal session key -> metadata
+    session_metadata: HashMap<String, SessionMetadata>,
 }
 
 /// State for a single codex exec session
@@ -315,6 +328,130 @@ fn drain_channel(session: &mut CodexSessionState) {
 impl<'a> bindings::custom::codex::types::Host for ActiveCtx<'a> {}
 
 // ---------------------------------------------------------------------------
+// Helper: create a new codex session
+// ---------------------------------------------------------------------------
+
+async fn create_new_session(
+    ctx: &mut ActiveCtx<'_>,
+    plugin: &Codex,
+    component_id: &str,
+    context_key: &str,
+    prompt: &str,
+) -> wasmtime::Result<Result<(String, Resource<ExecStreamHandle>), CodexError>> {
+    // Get config
+    let config = {
+        let lock = plugin.tracker.read().await;
+        match lock.get_component_data(component_id) {
+            Some(data) => data.config.clone(),
+            None => return Ok(Err(CodexError::Internal("component not tracked".to_string()))),
+        }
+    };
+
+    // Ensure binary exists
+    if let Err(e) = ensure_codex_binary(&config.binary_path).await {
+        return Ok(Err(CodexError::ProcessError(format!(
+            "codex binary not available: {e}"
+        ))));
+    }
+
+    // Spawn codex subprocess
+    let spawn_config = CodexSpawnConfig {
+        binary_path: config.binary_path.clone(),
+        model: config.model.clone(),
+        api_token: config.api_token.clone(),
+        base_url: config.base_url.clone(),
+        project_dir: config.project_dir.clone(),
+    };
+
+    let mut child = match spawn_codex_exec(&spawn_config, prompt, None) {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(Err(CodexError::ProcessError(format!(
+                "failed to spawn codex: {e}"
+            ))));
+        }
+    };
+
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => {
+            return Ok(Err(CodexError::ProcessError(
+                "codex process has no stdout".to_string(),
+            )));
+        }
+    };
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let cancel_token = {
+        let lock = plugin.tracker.read().await;
+        match lock.get_component_data(component_id) {
+            Some(data) => data.cancel_token.clone(),
+            None => {
+                return Ok(Err(CodexError::Internal(
+                    "component not tracked".to_string(),
+                )));
+            }
+        }
+    };
+
+    let task_token = cancel_token.child_token();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = task_token.cancelled() => {
+                debug!("Codex JSONL reader cancelled");
+            }
+            _ = read_jsonl_output(stdout, tx) => {}
+        }
+    });
+
+    let session_key = new_session_key();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string();
+
+    let session = CodexSessionState {
+        event_rx: rx,
+        pending_events: Vec::new(),
+        ended: false,
+        usage: TokenUsageAccum::default(),
+        session_id: None,
+    };
+
+    {
+        let mut lock = plugin.tracker.write().await;
+        if let Some(data) = lock.get_component_data_mut(component_id) {
+            data.sessions.insert(session_key.clone(), session);
+            data.session_metadata.insert(
+                session_key.clone(),
+                SessionMetadata {
+                    session_id: String::new(),
+                    thread_id: String::new(),
+                    context_key: context_key.to_string(),
+                    created_at: now,
+                },
+            );
+        }
+    }
+
+    debug!(
+        component_id = %component_id,
+        session_key = %session_key,
+        "Codex exec session started"
+    );
+
+    let handle = ExecStreamHandle {
+        session_key: session_key.clone(),
+        ended: false,
+    };
+
+    let resource = ctx.table.push(handle)?;
+    Ok(Ok((session_key, resource)))
+}
+
+// ---------------------------------------------------------------------------
 // WIT executor::Host
 // ---------------------------------------------------------------------------
 
@@ -322,6 +459,7 @@ impl<'a> bindings::custom::codex::executor::Host for ActiveCtx<'a> {
     #[instrument(skip_all)]
     async fn execute(
         &mut self,
+        context_key: String,
         prompt: String,
     ) -> wasmtime::Result<Result<Resource<ExecStreamHandle>, CodexError>> {
         let Some(plugin) = self.get_plugin::<Codex>(PLUGIN_ID) else {
@@ -332,109 +470,55 @@ impl<'a> bindings::custom::codex::executor::Host for ActiveCtx<'a> {
 
         let component_id = self.component_id.as_ref().to_string();
 
-        // Get config from tracker
-        let config = {
+        // Check if context-key has a current session
+        let current_session_key = {
             let lock = plugin.tracker.read().await;
-            match lock.get_component_data(&component_id) {
-                Some(data) => data.config.clone(),
-                None => {
-                    return Ok(Err(CodexError::Internal(
-                        "component not tracked".to_string(),
-                    )));
-                }
-            }
+            lock.get_component_data(&component_id)
+                .and_then(|data| data.current_sessions.get(&context_key).cloned())
         };
 
-        // Ensure binary exists (download if needed)
-        if let Err(e) = ensure_codex_binary(&config.binary_path).await {
-            return Ok(Err(CodexError::ProcessError(format!(
-                "codex binary not available: {e}"
-            ))));
+        if let Some(ref internal_key) = current_session_key {
+            // Get session_id (codex thread_id) for resume
+            let session_id = {
+                let lock = plugin.tracker.read().await;
+                lock.get_component_data(&component_id)
+                    .and_then(|data| {
+                        data.sessions
+                            .get(internal_key)
+                            .and_then(|s| s.session_id.clone())
+                    })
+            };
+
+            if let Some(sid) = session_id {
+                // Resume existing current session
+                return bindings::custom::codex::session::Host::resume(self, sid, prompt).await;
+            }
+            // No thread_id yet — fall through to create new
         }
 
-        // Spawn codex subprocess
-        let spawn_config = CodexSpawnConfig {
-            binary_path: config.binary_path.clone(),
-            model: config.model.clone(),
-            api_token: config.api_token.clone(),
-            base_url: config.base_url.clone(),
-            project_dir: config.project_dir.clone(),
+        // No current session — create new
+        let (internal_key, resource) = match create_new_session(
+            self,
+            &plugin,
+            &component_id,
+            &context_key,
+            &prompt,
+        )
+        .await
+        {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(e)) => return Ok(Err(e)),
+            Err(e) => return Err(e),
         };
 
-        let mut child = match spawn_codex_exec(&spawn_config, &prompt, None) {
-            Ok(c) => c,
-            Err(e) => {
-                return Ok(Err(CodexError::ProcessError(format!(
-                    "failed to spawn codex: {e}"
-                ))));
-            }
-        };
-
-        let stdout = match child.stdout.take() {
-            Some(s) => s,
-            None => {
-                return Ok(Err(CodexError::ProcessError(
-                    "codex process has no stdout".to_string(),
-                )));
-            }
-        };
-
-        // Create channel for JSONL events
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-        // Spawn background reader task
-        let cancel_token = {
-            let lock = plugin.tracker.read().await;
-            match lock.get_component_data(&component_id) {
-                Some(data) => data.cancel_token.clone(),
-                None => {
-                    return Ok(Err(CodexError::Internal(
-                        "component not tracked".to_string(),
-                    )));
-                }
-            }
-        };
-
-        let task_token = cancel_token.child_token();
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = task_token.cancelled() => {
-                    debug!("Codex JSONL reader cancelled");
-                }
-                _ = read_jsonl_output(stdout, tx) => {}
-            }
-        });
-
-        // Store session in tracker
-        let session_key = new_session_key();
-        let session = CodexSessionState {
-            event_rx: rx,
-            pending_events: Vec::new(),
-            ended: false,
-            usage: TokenUsageAccum::default(),
-            session_id: None,
-        };
-
+        // Set as current session for this context-key
         {
             let mut lock = plugin.tracker.write().await;
             if let Some(data) = lock.get_component_data_mut(&component_id) {
-                data.sessions.insert(session_key.clone(), session);
+                data.current_sessions.insert(context_key, internal_key);
             }
         }
 
-        debug!(
-            component_id = %component_id,
-            session_key = %session_key,
-            "Codex exec session started"
-        );
-
-        // Push resource into table
-        let handle = ExecStreamHandle {
-            session_key: session_key.clone(),
-            ended: false,
-        };
-
-        let resource = self.table.push(handle)?;
         Ok(Ok(resource))
     }
 }
@@ -506,7 +590,20 @@ impl<'a> bindings::custom::codex::executor::HostExecStream for ActiveCtx<'a> {
             && let Some(ref sid) = session.session_id
             && !data.session_id_map.contains_key(sid)
         {
-            data.session_id_map.insert(sid.clone(), session_key);
+            data.session_id_map.insert(sid.clone(), session_key.clone());
+        }
+
+        // Update session_metadata with thread_id if it became available
+        if let Some(data) = lock.get_component_data_mut(&component_id)
+            && let Some(session) = data.sessions.get(&session_key)
+            && let Some(ref sid) = session.session_id
+        {
+            if let Some(meta) = data.session_metadata.get_mut(&session_key) {
+                if meta.session_id.is_empty() {
+                    meta.session_id = sid.clone();
+                    meta.thread_id = sid.clone();
+                }
+            }
         }
 
         Ok(Ok((events, done)))
@@ -680,11 +777,171 @@ impl<'a> bindings::custom::codex::session::Host for ActiveCtx<'a> {
         let resource = self.table.push(handle)?;
         Ok(Ok(resource))
     }
-}
 
-// ---------------------------------------------------------------------------
-// HostPlugin implementation
-// ---------------------------------------------------------------------------
+    #[instrument(skip_all)]
+    async fn new_session(
+        &mut self,
+        context_key: String,
+        prompt: String,
+    ) -> wasmtime::Result<Result<Resource<ExecStreamHandle>, CodexError>> {
+        let Some(plugin) = self.get_plugin::<Codex>(PLUGIN_ID) else {
+            return Ok(Err(CodexError::Internal(
+                "codex plugin not available".to_string(),
+            )));
+        };
+
+        let component_id = self.component_id.as_ref().to_string();
+
+        let (internal_key, resource) = match create_new_session(
+            self,
+            &plugin,
+            &component_id,
+            &context_key,
+            &prompt,
+        )
+        .await
+        {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(e)) => return Ok(Err(e)),
+            Err(e) => return Err(e),
+        };
+
+        // Set as current session for this context-key
+        {
+            let mut lock = plugin.tracker.write().await;
+            if let Some(data) = lock.get_component_data_mut(&component_id) {
+                data.current_sessions.insert(context_key, internal_key);
+            }
+        }
+
+        Ok(Ok(resource))
+    }
+
+    #[instrument(skip_all)]
+    async fn change_session(
+        &mut self,
+        context_key: String,
+        session_id: String,
+    ) -> wasmtime::Result<Result<(), CodexError>> {
+        let Some(plugin) = self.get_plugin::<Codex>(PLUGIN_ID) else {
+            return Ok(Err(CodexError::Internal(
+                "codex plugin not available".to_string(),
+            )));
+        };
+
+        let component_id = self.component_id.as_ref().to_string();
+
+        let mut lock = plugin.tracker.write().await;
+        match lock.get_component_data_mut(&component_id) {
+            Some(data) => {
+                let internal_key = match data.session_id_map.get(&session_id) {
+                    Some(k) => k.clone(),
+                    None => {
+                        return Ok(Err(CodexError::NotFound(format!(
+                            "session '{session_id}' not found"
+                        ))));
+                    }
+                };
+
+                if !data.sessions.contains_key(&internal_key) {
+                    return Ok(Err(CodexError::NotFound(format!(
+                        "session '{session_id}' not found"
+                    ))));
+                }
+
+                data.current_sessions.insert(context_key, internal_key);
+                Ok(Ok(()))
+            }
+            None => Ok(Err(CodexError::NotFound(
+                "component not tracked".to_string(),
+            ))),
+        }
+    }
+
+    #[instrument(skip_all)]
+    async fn delete_session(
+        &mut self,
+        session_id: String,
+    ) -> wasmtime::Result<Result<(), CodexError>> {
+        let Some(plugin) = self.get_plugin::<Codex>(PLUGIN_ID) else {
+            return Ok(Err(CodexError::Internal(
+                "codex plugin not available".to_string(),
+            )));
+        };
+
+        let component_id = self.component_id.as_ref().to_string();
+
+        let mut lock = plugin.tracker.write().await;
+        match lock.get_component_data_mut(&component_id) {
+            Some(data) => {
+                let internal_key = match data.session_id_map.get(&session_id) {
+                    Some(k) => k.clone(),
+                    None => {
+                        return Ok(Err(CodexError::NotFound(format!(
+                            "session '{session_id}' not found"
+                        ))));
+                    }
+                };
+
+                data.sessions.remove(&internal_key);
+                data.session_id_map.remove(&session_id);
+                data.session_metadata.remove(&internal_key);
+                data.current_sessions.retain(|_, v| *v != internal_key);
+
+                debug!(
+                    component_id = %component_id,
+                    session_id = %session_id,
+                    "Codex session deleted"
+                );
+
+                Ok(Ok(()))
+            }
+            None => Ok(Err(CodexError::NotFound(
+                "component not tracked".to_string(),
+            ))),
+        }
+    }
+
+    #[instrument(skip_all)]
+    async fn list_sessions(
+        &mut self,
+    ) -> wasmtime::Result<Result<Vec<SessionInfo>, CodexError>> {
+        let Some(plugin) = self.get_plugin::<Codex>(PLUGIN_ID) else {
+            return Ok(Err(CodexError::Internal(
+                "codex plugin not available".to_string(),
+            )));
+        };
+
+        let component_id = self.component_id.as_ref().to_string();
+
+        let lock = plugin.tracker.read().await;
+        match lock.get_component_data(&component_id) {
+            Some(data) => {
+                let list: Vec<SessionInfo> = data
+                    .session_metadata
+                    .iter()
+                    .map(|(internal_key, meta)| {
+                        let usage = data.sessions.get(internal_key).map(|s| TokenUsage {
+                            input_tokens: s.usage.input_tokens,
+                            cached_input_tokens: s.usage.cached_input_tokens,
+                            output_tokens: s.usage.output_tokens,
+                        });
+                        SessionInfo {
+                            session_id: meta.session_id.clone(),
+                            thread_id: meta.thread_id.clone(),
+                            created_at: meta.created_at.clone(),
+                            token_usage: usage,
+                        }
+                    })
+                    .collect();
+                Ok(Ok(list))
+            }
+            None => Ok(Err(CodexError::NotFound(
+                "component not tracked".to_string(),
+            ))),
+        }
+    }
+}
 
 #[async_trait]
 impl HostPlugin for Codex {
@@ -770,6 +1027,8 @@ impl HostPlugin for Codex {
                 config,
                 sessions: HashMap::new(),
                 session_id_map: HashMap::new(),
+                current_sessions: HashMap::new(),
+                session_metadata: HashMap::new(),
             },
         );
 
