@@ -214,6 +214,8 @@ async fn main(req: Request<Body>) -> anyhow::Result<Response<Body>> {
         "/codex/change" => codex::change_session(req).await,
         "/codex/delete" => codex::delete_session(req).await,
         "/codex/list" => codex::list_sessions(req).await,
+        "/codex/set-auto-approve" => codex::set_auto_approve(req).await,
+        "/codex/approve" => codex::approve(req).await,
         "/wechat" | "/wechat/" => wechat::home(req).await,
         "/wechat/send-text" => wechat::send_text(req).await,
         "/wechat/send-media" => wechat::send_media(req).await,

@@ -456,3 +456,70 @@ pub fn execute_for_chat(sender_id: &str, prompt: &str) -> Result<String, String>
 
     Ok(result)
 }
+
+#[derive(Deserialize)]
+struct SetAutoApproveRequest {
+    session_id: String,
+    auto_approve: bool,
+}
+
+/// POST /codex/set-auto-approve
+/// Toggle auto-approve mode for a session.
+pub async fn set_auto_approve(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
+    let body: SetAutoApproveRequest = helpers::parse_json_body(&mut req).await?;
+
+    match session::set_auto_approve(&body.session_id, body.auto_approve) {
+        Ok(()) => helpers::json_response(serde_json::to_string(&serde_json::json!({
+            "success": true,
+            "session_id": body.session_id,
+            "auto_approve": body.auto_approve,
+        }))?),
+        Err(e) => {
+            log(
+                Level::Error,
+                LOG_CTX,
+                &format!("CODEX SET AUTO APPROVE ERROR: {:?}", e),
+            );
+            helpers::json_error(StatusCode::BAD_REQUEST, &format!("{:?}", e))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ApproveRequest {
+    session_id: String,
+    item_id: String,
+    approved: bool,
+}
+
+/// POST /codex/approve
+/// Approve or deny a pending command execution.
+pub async fn approve(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
+    let body: ApproveRequest = helpers::parse_json_body(&mut req).await?;
+
+    log(
+        Level::Info,
+        LOG_CTX,
+        &format!(
+            "CODEX APPROVE: session_id={}, item_id={}, approved={}",
+            body.session_id, body.item_id, body.approved
+        ),
+    );
+
+    match session::approve(&body.session_id, &body.item_id, body.approved) {
+        Ok(()) => helpers::json_response(serde_json::to_string(&serde_json::json!({
+            "success": true,
+            "session_id": body.session_id,
+            "item_id": body.item_id,
+            "approved": body.approved,
+        }))?),
+        Err(e) => {
+            log(
+                Level::Error,
+                LOG_CTX,
+                &format!("CODEX APPROVE ERROR: {:?}", e),
+            );
+            helpers::json_error(StatusCode::BAD_REQUEST, &format!("{:?}", e))
+        }
+    }
+}

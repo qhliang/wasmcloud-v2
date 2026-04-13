@@ -69,6 +69,14 @@
                 BASE_JS;
             }
 
+            function formatQrImage(content) {
+                if (!content) return "";
+                if (content.startsWith("data:") || content.startsWith("http://") || content.startsWith("https://")) {
+                    return content;
+                }
+                return "data:image/png;base64," + content;
+            }
+
             async function sendText() {
                 const to = document.getElementById("sendTextTo").value.trim();
                 const text = document.getElementById("sendTextContent").value.trim();
@@ -147,7 +155,8 @@
                     qrSessionJson = JSON.stringify(session);
 
                     document.getElementById("qrContainer").style.display = "block";
-                    document.getElementById("qrImage").src = session.qrcode_img_content || "";
+                    const imgSrc = formatQrImage(session.qrcode_img_content || "");
+                    document.getElementById("qrImage").src = imgSrc;
                     setQrStatus("waiting", "Waiting for scan...");
 
                     // Start polling
