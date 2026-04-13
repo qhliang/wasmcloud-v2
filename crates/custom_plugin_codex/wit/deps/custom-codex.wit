@@ -31,6 +31,13 @@ interface types {
         done(string),
         error(string),
     }
+
+    record session-info {
+        session-id: string,
+        thread-id: string,
+        created-at: string,
+        token-usage: option<token-usage>,
+    }
 }
 
 interface executor {
@@ -40,16 +47,22 @@ interface executor {
         next: func() -> result<tuple<list<exec-stream-event>, bool>, codex-error>;
     }
 
-    execute: func(prompt: string) -> result<exec-stream, codex-error>;
+    execute: func(context-key: string, prompt: string) -> result<exec-stream, codex-error>;
 }
 
 interface session {
-    use types.{codex-error, token-usage, exec-stream-event};
+    use types.{codex-error, token-usage, exec-stream-event, session-info};
     use executor.{exec-stream};
 
+    // Existing
     get-usage: func(session-id: string) -> result<token-usage, codex-error>;
-
     resume: func(session-id: string, prompt: string) -> result<exec-stream, codex-error>;
+
+    // New session management
+    new-session: func(context-key: string, prompt: string) -> result<exec-stream, codex-error>;
+    change-session: func(context-key: string, session-id: string) -> result<_, codex-error>;
+    delete-session: func(session-id: string) -> result<_, codex-error>;
+    list-sessions: func() -> result<list<session-info>, codex-error>;
 }
 
 world codex {
