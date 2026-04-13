@@ -608,13 +608,11 @@ impl<'a> bindings::custom::codex::executor::HostExecStream for ActiveCtx<'a> {
         if let Some(data) = lock.get_component_data_mut(&component_id)
             && let Some(session) = data.sessions.get(&session_key)
             && let Some(ref sid) = session.session_id
+            && let Some(meta) = data.session_metadata.get_mut(&session_key)
+            && meta.session_id.is_empty()
         {
-            if let Some(meta) = data.session_metadata.get_mut(&session_key) {
-                if meta.session_id.is_empty() {
-                    meta.session_id = sid.clone();
-                    meta.thread_id = sid.clone();
-                }
-            }
+            meta.session_id = sid.clone();
+            meta.thread_id = sid.clone();
         }
 
         Ok(Ok((events, done)))
