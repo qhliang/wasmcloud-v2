@@ -50,6 +50,9 @@
 
         <div class="section">
             <h2>Execute Task</h2>
+            <label for="contextKey">Context Key</label>
+            <input type="text" id="contextKey" value="default" placeholder="Context key for session tracking" />
+
             <label for="prompt">Prompt</label>
             <textarea
                 id="prompt"
@@ -58,6 +61,7 @@
             ></textarea>
 
             <button onclick="executeTask()" id="execBtn">Execute</button>
+            <button onclick="newSession()" id="newBtn">New Session</button>
 
             <div id="sessionInfo" class="meta" style="display:none;">
                 Session ID: <code id="sessionId"></code>
@@ -70,6 +74,17 @@
 
             <div id="execResult" class="result"></div>
             <div id="eventsContainer"></div>
+        </div>
+
+        <div class="section">
+            <h2>Session Management</h2>
+
+            <div style="display:flex; gap:8px; margin-bottom:12px;">
+                <button onclick="listSessions()">List Sessions</button>
+                <button onclick="deleteSelectedSession()" id="deleteBtn" disabled>Delete Selected</button>
+            </div>
+
+            <div id="sessionsList"></div>
         </div>
 
         <div class="section">
@@ -108,6 +123,7 @@
                     showResult("execResult", "Prompt is required", true);
                     return;
                 }
+                const context_key = document.getElementById("contextKey").value.trim() || "default";
 
                 const execBtn = document.getElementById("execBtn");
                 execBtn.disabled = true;
@@ -119,7 +135,7 @@
                     const resp = await fetch("/codex/execute", {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ prompt }),
+                        body: JSON.stringify({ context_key, prompt }),
                     });
                     const data = await resp.json();
                     if (!resp.ok) {
@@ -146,6 +162,125 @@
                 } finally {
                     execBtn.disabled = false;
                     execBtn.textContent = "Execute";
+                }
+            }
+
+            async function newSession() {
+                const prompt = document.getElementById("prompt").value.trim();
+                if (!prompt) {
+                    showResult("execResult", "Prompt is required", true);
+                    return;
+                }
+                const context_key = document.getElementById("contextKey").value.trim() || "default";
+
+                const newBtn = document.getElementById("newBtn");
+                newBtn.disabled = true;
+                newBtn.textContent = "Creating...";
+                const container = document.getElementById("eventsContainer");
+                container.innerHTML = "";
+
+                try {
+                    const resp = await fetch("/codex/new", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ context_key, prompt }),
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok) {
+                        showResult("execResult", "Error: " + (data.error || JSON.stringify(data, null, 2)), true);
+                        return;
+                    }
+                    if (data.session_id) {
+                        document.getElementById("sessionInfo").style.display = "block";
+                        document.getElementById("sessionId").textContent = data.session_id;
+                        document.getElementById("resumeSessionId").value = data.session_id;
+                        document.getElementById("usageSessionId").value = data.session_id;
+                    }
+                    if (data.usage) {
+                        document.getElementById("usageBar").style.display = "flex";
+                        document.getElementById("inputTokens").textContent = data.usage.input_tokens;
+                        document.getElementById("outputTokens").textContent = data.usage.output_tokens;
+                    }
+                    (data.events || []).forEach(evt => appendEvent(container, evt));
+                } catch (e) {
+                    showResult("execResult", "Error: " + e.message, true);
+                } finally {
+                    newBtn.disabled = false;
+                    newBtn.textContent = "New Session";
+                }
+            }
+
+            async function listSessions() {
+                try {
+                    const resp = await fetch("/codex/list");
+                    const data = await resp.json();
+                    const container = document.getElementById("sessionsList");
+                    if (!data.sessions || data.sessions.length === 0) {
+                        container.innerHTML = '<div class="event-item">No sessions found</div>';
+                        return;
+                    }
+                    var html = '<table style="width:100%;border-collapse:collapse;font-size:13px;">' +
+                        '<tr style="background:#f0f0f0;"><th style="padding:6px;text-align:left;">Select</th><th style="padding:6px;text-align:left;">Session ID</th><th style="padding:6px;text-align:left;">Created</th><th style="padding:6px;text-align:left;">Tokens</th><th style="padding:6px;text-align:left;">Actions</th></tr>';
+                    data.sessions.forEach(function(s) {
+                        var usage = s.token_usage ? (s.token_usage.input_tokens + s.token_usage.output_tokens) : 0;
+                        html += '<tr style="border-bottom:1px solid #eee;">' +
+                            '<td style="padding:6px;"><input type="radio" name="selectedSession" value="' + escapeHtml(s.session_id) + '" onchange="document.getElementById(\'deleteBtn\').disabled=false"></td>' +
+                            '<td style="padding:6px;font-family:monospace;font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escapeHtml(s.session_id) + '</td>' +
+                            '<td style="padding:6px;">' + escapeHtml(s.created_at) + '</td>' +
+                            '<td style="padding:6px;">' + usage + '</td>' +
+                            '<td style="padding:6px;"><button onclick="changeToSession(\'' + escapeHtml(s.session_id) + '\')">Use</button></td>' +
+                            '</tr>';
+                    });
+                    html += '</table>';
+                    container.innerHTML = html;
+                } catch (e) {
+                    showResult("sessionsList", "Error: " + e.message, true);
+                }
+            }
+
+            async function deleteSelectedSession() {
+                var selected = document.querySelector('input[name="selectedSession"]:checked');
+                if (!selected) return;
+                var session_id = selected.value;
+                if (!confirm("Delete session " + session_id + "?")) return;
+
+                try {
+                    var resp = await fetch("/codex/delete", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ session_id: session_id }),
+                    });
+                    var data = await resp.json();
+                    if (data.success) {
+                        listSessions();
+                    } else {
+                        alert("Error: " + (data.error || JSON.stringify(data)));
+                    }
+                } catch (e) {
+                    alert("Error: " + e.message);
+                }
+            }
+
+            async function changeToSession(session_id) {
+                var context_key = document.getElementById("contextKey").value.trim() || "default";
+                try {
+                    var resp = await fetch("/codex/change", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ session_id: session_id, context_key: context_key }),
+                    });
+                    var data = await resp.json();
+                    if (data.success) {
+                        document.getElementById("resumeSessionId").value = session_id;
+                        document.getElementById("usageSessionId").value = session_id;
+                        document.getElementById("sessionId").textContent = session_id;
+                        document.getElementById("sessionInfo").style.display = "block";
+                        alert("Switched to session: " + session_id);
+                    } else {
+                        alert("Error: " + (data.error || JSON.stringify(data)));
+                    }
+                } catch (e) {
+                    alert("Error: " + e.message);
                 }
             }
 
