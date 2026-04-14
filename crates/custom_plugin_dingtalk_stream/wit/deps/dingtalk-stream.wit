@@ -7,6 +7,11 @@ interface types {
         send-failed(string),
     }
 
+    record dingtalk-config {
+        client-id: string,
+        client-secret: string,
+    }
+
     record chatbot-message {
         conversation-type: string,
         conversation-id: string,
@@ -20,34 +25,22 @@ interface types {
     }
 }
 
-/// Host-provided API for guest to send messages via DingTalk.
 interface sender {
-    use types.{dingtalk-error};
+    use types.{dingtalk-error, dingtalk-config};
 
-    /// Reply text message to a conversation.
-    /// Uses conversation-id and sender-id to route the reply.
-    send-text: func(conversation-id: string, sender-id: string, content: string) -> result<_, dingtalk-error>;
-
-    /// Reply markdown message to a conversation.
-    send-markdown: func(conversation-id: string, sender-id: string, title: string, content: string) -> result<_, dingtalk-error>;
-
-    /// Send a proactive text message to a user (one-to-one single chat).
-    send-oto-text: func(user-id: string, content: string) -> result<_, dingtalk-error>;
-
-    /// Get the current DingTalk access token.
-    get-access-token: func() -> result<string, dingtalk-error>;
+    resource dingtalk-client {
+        constructor(config: option<dingtalk-config>);
+        send-text: func(conversation-id: string, sender-id: string, content: string) -> result<_, dingtalk-error>;
+        send-markdown: func(conversation-id: string, sender-id: string, title: string, content: string) -> result<_, dingtalk-error>;
+        send-oto-text: func(user-id: string, content: string) -> result<_, dingtalk-error>;
+        get-access-token: func() -> result<string, dingtalk-error>;
+        stop: func() -> result<_, dingtalk-error>;
+    }
 }
 
-/// Interface that the guest component must export.
-/// The host calls `on-message` when a DingTalk chatbot message arrives.
 interface handler {
     use types.{chatbot-message};
+    use sender.{dingtalk-client};
 
-    /// Called by the host when a DingTalk chatbot message is received.
-    on-message: func(msg: chatbot-message) -> result<_, string>;
-}
-
-world dingtalk-stream {
-    import sender;
-    export handler;
+    on-message: func(client: borrow<dingtalk-client>, msg: chatbot-message) -> result<_, string>;
 }

@@ -1,33 +1,32 @@
-//! # DingTalk Stream Host Plugin
+//! # DingTalk Stream Host Plugin (Resource-based)
 //!
 //! This plugin provides DingTalk Stream Mode messaging to WASM components.
 //! It uses the `dingtalk-stream` crate to maintain a WebSocket connection
 //! to DingTalk servers and routes chatbot messages to guest components.
 //!
-//! ## Configuration
-//!
-//! ```yaml
-//! custom:dingtalk-stream:
-//!   config:
-//!     client-id: "your_client_id"
-//!     client-secret: "your_client_secret"
-//! ```
+//! Two config sources with priority:
+//! 1. Wasm dynamic config (passed via resource constructor)
+//! 2. Static interface config (fallback from wasmcloud config)
 //!
 //! ## Guest Export
 //!
 //! The guest component must export `custom:dingtalk-stream/handler@0.1.0`:
 //! ```wit
-//! on-message: func(msg: chatbot-message) -> result<_, string>;
+//! on-message: func(client: borrow<dingtalk-client>, msg: chatbot-message) -> result<_, string>;
 //! ```
 //!
 //! ## Guest Import
 //!
 //! The guest can call `custom:dingtalk-stream/sender@0.1.0`:
 //! ```wit
-//! send-text: func(conversation-id: string, sender-id: string, content: string) -> result<_, dingtalk-error>;
-//! send-markdown: func(conversation-id: string, sender-id: string, title: string, content: string) -> result<_, dingtalk-error>;
-//! send-oto-text: func(user-id: string, content: string) -> result<_, dingtalk-error>;
-//! get-access-token: func() -> result<string, dingtalk-error>;
+//! resource dingtalk-client {
+//!     constructor(config: option<dingtalk-config>);
+//!     send-text: func(...) -> result<_, dingtalk-error>;
+//!     send-markdown: func(...) -> result<_, dingtalk-error>;
+//!     send-oto-text: func(...) -> result<_, dingtalk-error>;
+//!     get-access-token: func() -> result<string, dingtalk-error>;
+//!     stop: func() -> result<_, dingtalk-error>;
+//! }
 //! ```
 
 use std::collections::{HashMap, HashSet};
@@ -37,11 +36,12 @@ use async_trait::async_trait;
 use dingtalk_stream::{ChatbotMessage, ChatbotReplier, Credential, DingTalkStreamClient};
 use tokio::sync::RwLock;
 use tracing::{debug, instrument, warn};
+use wasmtime::component::Resource;
 
-use anyhow::Context as _;
 
 use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use wash_runtime::engine::workload::{ResolvedWorkload, WorkloadItem};
+use wash_runtime::plugin::config::resolve_field;
 use wash_runtime::plugin::HostPlugin;
 use wash_runtime::plugin::WorkloadTracker;
 use wash_runtime::wit::{WitInterface, WitWorld};
@@ -49,43 +49,42 @@ use wash_runtime::wit::{WitInterface, WitWorld};
 mod bindings {
     wasmtime::component::bindgen!({
         world: "dingtalk-stream",
-        imports: { default: async | trappable | tracing },
-        exports: { default: async | tracing },
+        imports: {
+            default: async | trappable | tracing,
+        },
+        with: {
+            "custom:dingtalk-stream/sender.dingtalk-client": super::DingtalkClientHandle,
+        },
     });
 }
 
-use bindings::custom::dingtalk_stream::types::DingtalkError;
+use bindings::custom::dingtalk_stream::types::{DingtalkConfig, DingtalkError};
 
 const PLUGIN_ID: &str = "dingtalk-stream";
 
 // ---------------------------------------------------------------------------
-// Per-component data
+// Types
 // ---------------------------------------------------------------------------
 
-/// Configuration extracted from interface config.
-#[derive(Clone, Debug)]
-struct PluginConfig {
-    client_id: String,
-    client_secret: String,
+/// Host-side state for a dingtalk-client resource instance.
+pub struct DingtalkClientHandle {
+    replier: ChatbotReplier,
+    credential: Credential,
+    cancel_token: tokio_util::sync::CancellationToken,
 }
 
-/// Per-component data tracked by the plugin.
+/// Per-component data.
 struct ComponentData {
-    /// Token that cancels the DingTalk stream background task.
-    cancel_token: tokio_util::sync::CancellationToken,
-    /// Resolved workload — set during on_workload_resolved.
+    /// Static interface config from wasmcloud config (fallback source)
+    interface_config: HashMap<String, String>,
+    /// Resolved workload
     workload: Option<ResolvedWorkload>,
-    /// ChatbotReplier for sending messages.
-    replier: Option<ChatbotReplier>,
-    /// Plugin config.
-    config: PluginConfig,
 }
 
 // ---------------------------------------------------------------------------
 // Plugin struct
 // ---------------------------------------------------------------------------
 
-/// The DingTalk Stream host plugin.
 #[derive(Clone)]
 pub struct DingTalk {
     tracker: Arc<RwLock<WorkloadTracker<(), ComponentData>>>,
@@ -106,20 +105,197 @@ impl DingTalk {
 }
 
 // ---------------------------------------------------------------------------
-// Config parsing
+// WIT types::Host
 // ---------------------------------------------------------------------------
 
-fn extract_config(interface_config: &HashMap<String, String>) -> Option<PluginConfig> {
-    let client_id = interface_config.get("client-id")?;
-    let client_secret = interface_config.get("client-secret")?;
-    Some(PluginConfig {
-        client_id: client_id.clone(),
-        client_secret: client_secret.clone(),
-    })
+impl<'a> bindings::custom::dingtalk_stream::types::Host for ActiveCtx<'a> {}
+
+// ---------------------------------------------------------------------------
+// WIT sender::Host — empty (resource lives in HostDingtalkClient)
+// ---------------------------------------------------------------------------
+
+impl<'a> bindings::custom::dingtalk_stream::sender::Host for ActiveCtx<'a> {}
+
+// ---------------------------------------------------------------------------
+// WIT sender::HostDingtalkClient — resource constructor + methods
+// ---------------------------------------------------------------------------
+
+impl<'a> bindings::custom::dingtalk_stream::sender::HostDingtalkClient for ActiveCtx<'a> {
+    async fn new(
+        &mut self,
+        config: Option<DingtalkConfig>,
+    ) -> wasmtime::Result<Resource<DingtalkClientHandle>> {
+        let Some(plugin) = self.get_plugin::<DingTalk>(PLUGIN_ID) else {
+            return Err(wasmtime::Error::msg("dingtalk-stream plugin not available"));
+        };
+
+        let component_id: Arc<str> = self.component_id.clone();
+        let lock = plugin.tracker.read().await;
+        let Some(data) = lock.get_component_data(&component_id) else {
+            return Err(wasmtime::Error::msg("component not tracked"));
+        };
+
+        // Resolve client-id and client-secret with priority:
+        // Wasm dynamic config > static interface config
+        let client_id = match resolve_field(
+            config.as_ref().map(|c| c.client_id.clone()),
+            &data.interface_config,
+            "client-id",
+        ) {
+            Ok(id) => id,
+            Err(_) => {
+                return Err(wasmtime::Error::msg(
+                    "missing client-id: provide via constructor or interface config",
+                ));
+            }
+        };
+
+        let client_secret = match resolve_field(
+            config.as_ref().map(|c| c.client_secret.clone()),
+            &data.interface_config,
+            "client-secret",
+        ) {
+            Ok(secret) => secret,
+            Err(_) => {
+                return Err(wasmtime::Error::msg(
+                    "missing client-secret: provide via constructor or interface config",
+                ));
+            }
+        };
+
+        let Some(workload) = &data.workload else {
+            return Err(wasmtime::Error::msg("workload not resolved yet"));
+        };
+
+        let workload = workload.clone();
+
+        drop(lock);
+
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        let credential = Credential::new(&client_id, &client_secret);
+
+        // Build a temporary client to get a ChatbotReplier
+        let temp_client = DingTalkStreamClient::builder(credential.clone()).build();
+        let replier = temp_client.chatbot_replier();
+
+        // Spawn the background stream client
+        spawn_dingtalk_stream(
+            workload,
+            component_id.to_string(),
+            replier.clone(),
+            credential.clone(),
+            cancel_token.clone(),
+        );
+
+        let handle = DingtalkClientHandle {
+            replier,
+            credential,
+            cancel_token,
+        };
+
+        let resource = self.table.push(handle)?;
+        Ok(resource)
+    }
+
+    #[instrument(skip_all, fields(conversation_id = %conversation_id, sender_id = %sender_id))]
+    async fn send_text(
+        &mut self,
+        client: Resource<DingtalkClientHandle>,
+        conversation_id: String,
+        sender_id: String,
+        content: String,
+    ) -> wasmtime::Result<Result<(), DingtalkError>> {
+        let handle = self.table.get(&client)?;
+        let synthetic = build_synthetic_message(&conversation_id, &sender_id);
+        match handle.replier.reply_text(&content, &synthetic).await {
+            Ok(_) => Ok(Ok(())),
+            Err(dingtalk_stream::Error::Auth(e)) => {
+                Ok(Err(DingtalkError::AuthFailed(e.to_string())))
+            }
+            Err(e) => Ok(Err(DingtalkError::SendFailed(e.to_string()))),
+        }
+    }
+
+    #[instrument(skip_all, fields(conversation_id = %conversation_id, sender_id = %sender_id))]
+    async fn send_markdown(
+        &mut self,
+        client: Resource<DingtalkClientHandle>,
+        conversation_id: String,
+        sender_id: String,
+        title: String,
+        content: String,
+    ) -> wasmtime::Result<Result<(), DingtalkError>> {
+        let handle = self.table.get(&client)?;
+        let synthetic = build_synthetic_message(&conversation_id, &sender_id);
+        match handle.replier.reply_markdown(&title, &content, &synthetic).await {
+            Ok(_) => Ok(Ok(())),
+            Err(dingtalk_stream::Error::Auth(e)) => {
+                Ok(Err(DingtalkError::AuthFailed(e.to_string())))
+            }
+            Err(e) => Ok(Err(DingtalkError::SendFailed(e.to_string()))),
+        }
+    }
+
+    #[instrument(skip_all, fields(user_id = %user_id))]
+    async fn send_oto_text(
+        &mut self,
+        client: Resource<DingtalkClientHandle>,
+        user_id: String,
+        content: String,
+    ) -> wasmtime::Result<Result<(), DingtalkError>> {
+        let handle = self.table.get(&client)?;
+        let msg_param = serde_json::json!({"content": content}).to_string();
+        match handle
+            .replier
+            .send_oto_message(&user_id, "sampleText", &msg_param)
+            .await
+        {
+            Ok(_) => Ok(Ok(())),
+            Err(dingtalk_stream::Error::Auth(e)) => {
+                Ok(Err(DingtalkError::AuthFailed(e.to_string())))
+            }
+            Err(e) => Ok(Err(DingtalkError::SendFailed(e.to_string()))),
+        }
+    }
+
+    async fn get_access_token(
+        &mut self,
+        client: Resource<DingtalkClientHandle>,
+    ) -> wasmtime::Result<Result<String, DingtalkError>> {
+        let handle = self.table.get(&client)?;
+        let client = DingTalkStreamClient::builder(handle.credential.clone()).build();
+        match client.get_access_token().await {
+            Ok(token) => Ok(Ok(token)),
+            Err(dingtalk_stream::Error::Auth(e)) => {
+                Ok(Err(DingtalkError::AuthFailed(e.to_string())))
+            }
+            Err(e) => Ok(Err(DingtalkError::Internal(e.to_string()))),
+        }
+    }
+
+    async fn stop(
+        &mut self,
+        client: Resource<DingtalkClientHandle>,
+    ) -> wasmtime::Result<Result<(), DingtalkError>> {
+        let handle = self.table.get(&client)?;
+        handle.cancel_token.cancel();
+        debug!("DingTalk stream client stopped via stop()");
+        Ok(Ok(()))
+    }
+
+    async fn drop(
+        &mut self,
+        rep: Resource<DingtalkClientHandle>,
+    ) -> wasmtime::Result<()> {
+        if let Ok(handle) = self.table.delete(rep) {
+            handle.cancel_token.cancel();
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Bridge: CallbackHandler → guest on-message
+// Bridge: CallbackHandler -> guest on-message
 // ---------------------------------------------------------------------------
 
 /// A bridge that receives DingTalk CallbackHandler invocations and forwards
@@ -127,14 +303,14 @@ fn extract_config(interface_config: &HashMap<String, String>) -> Option<PluginCo
 struct GuestCallbackBridge {
     workload: ResolvedWorkload,
     component_id: String,
-    #[expect(dead_code)]
     replier: ChatbotReplier,
+    credential: Credential,
+    cancel_token: tokio_util::sync::CancellationToken,
 }
 
 #[async_trait]
 impl dingtalk_stream::CallbackHandler for GuestCallbackBridge {
     async fn process(&self, callback_message: &dingtalk_stream::MessageBody) -> (u16, String) {
-        // Parse the raw callback data into a ChatbotMessage
         let data: serde_json::Value = match serde_json::from_str(&callback_message.data) {
             Ok(v) => v,
             Err(e) => {
@@ -159,13 +335,11 @@ impl dingtalk_stream::CallbackHandler for GuestCallbackBridge {
             }
         };
 
-        // Extract text content
         let text_content =
             ChatbotReplier::extract_text(&incoming).and_then(|v| v.into_iter().next());
 
         let is_at = incoming.is_in_at_list.unwrap_or(false);
 
-        // Build WIT chatbot-message record
         let wit_msg = bindings::custom::dingtalk_stream::types::ChatbotMessage {
             conversation_type: incoming.conversation_type.clone().unwrap_or_default(),
             conversation_id: incoming.conversation_id.clone().unwrap_or_default(),
@@ -178,81 +352,105 @@ impl dingtalk_stream::CallbackHandler for GuestCallbackBridge {
             raw_json: callback_message.data.clone(),
         };
 
-        // Instantiate the guest component and call on-message
-        let mut store = match self.workload.new_store(&self.component_id).await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(
-                    component_id = %self.component_id,
-                    error = %e,
-                    "Failed to create store for callback"
-                );
-                return (200, "OK".to_owned());
-            }
-        };
+        let workload = Arc::new(self.workload.clone());
+        let cid = self.component_id.clone();
+        let replier = self.replier.clone();
+        let credential = self.credential.clone();
+        let cancel_token = self.cancel_token.clone();
 
-        let instance_pre = match self.workload.instantiate_pre(&self.component_id).await {
-            Ok(pre) => pre,
-            Err(e) => {
-                warn!(
-                    component_id = %self.component_id,
-                    error = %e,
-                    "Failed to instantiate_pre for callback"
-                );
-                return (200, "OK".to_owned());
-            }
-        };
+        tokio::spawn(async move {
+            let mut store = match workload.new_store(&cid).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        component_id = %cid,
+                        error = %e,
+                        "Failed to create store for callback"
+                    );
+                    return;
+                }
+            };
 
-        let pre = match bindings::DingtalkStreamPre::new(instance_pre) {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(
-                    component_id = %self.component_id,
-                    error = %e,
-                    "Failed to create DingtalkStreamPre"
-                );
-                return (200, "OK".to_owned());
-            }
-        };
+            // Create a temporary client handle for the callback
+            let temp_handle = DingtalkClientHandle {
+                replier,
+                credential,
+                cancel_token,
+            };
+            let client_resource = match store.data_mut().table.push(temp_handle) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(
+                        component_id = %cid,
+                        error = %e,
+                        "Failed to push client resource for callback"
+                    );
+                    return;
+                }
+            };
 
-        let proxy = match pre.instantiate_async(&mut store).await {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(
-                    component_id = %self.component_id,
-                    error = %e,
-                    "Failed to instantiate for callback"
-                );
-                return (200, "OK".to_owned());
-            }
-        };
+            let instance_pre = match workload.instantiate_pre(&cid).await {
+                Ok(pre) => pre,
+                Err(e) => {
+                    warn!(
+                        component_id = %cid,
+                        error = %e,
+                        "Failed to instantiate_pre for callback"
+                    );
+                    return;
+                }
+            };
 
-        match proxy
-            .custom_dingtalk_stream_handler()
-            .call_on_message(&mut store, &wit_msg)
-            .await
-        {
-            Ok(Ok(())) => {
-                debug!(
-                    component_id = %self.component_id,
-                    "Guest on-message handled successfully"
-                );
+            let pre = match bindings::DingtalkStreamPre::new(instance_pre) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(
+                        component_id = %cid,
+                        error = %e,
+                        "Failed to create DingtalkStreamPre"
+                    );
+                    return;
+                }
+            };
+
+            let proxy = match pre.instantiate_async(&mut store).await {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(
+                        component_id = %cid,
+                        error = %e,
+                        "Failed to instantiate for callback"
+                    );
+                    return;
+                }
+            };
+
+            match proxy
+                .custom_dingtalk_stream_handler()
+                .call_on_message(&mut store, client_resource, &wit_msg)
+            {
+                Ok(Ok(())) => {
+                    debug!(
+                        component_id = %cid,
+                        "Guest on-message handled successfully"
+                    );
+                }
+                Ok(Err(e)) => {
+                    warn!(
+                        component_id = %cid,
+                        error = %e,
+                        "Guest on-message returned error"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        component_id = %cid,
+                        error = %e,
+                        "Guest on-message call failed"
+                    );
+                }
             }
-            Ok(Err(e)) => {
-                warn!(
-                    component_id = %self.component_id,
-                    error = %e,
-                    "Guest on-message returned error"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    component_id = %self.component_id,
-                    error = %e,
-                    "Guest on-message call failed"
-                );
-            }
-        }
+        });
 
         (200, "OK".to_owned())
     }
@@ -265,30 +463,30 @@ impl dingtalk_stream::CallbackHandler for GuestCallbackBridge {
 fn spawn_dingtalk_stream(
     workload: ResolvedWorkload,
     component_id: String,
-    config: PluginConfig,
+    replier: ChatbotReplier,
+    credential: Credential,
     cancel_token: tokio_util::sync::CancellationToken,
-) -> ChatbotReplier {
-    let credential = Credential::new(&config.client_id, &config.client_secret);
-
-    // Build a temporary client just to get a ChatbotReplier
-    let temp_client = DingTalkStreamClient::builder(credential.clone()).build();
-    let replier = temp_client.chatbot_replier();
-
+) {
     let bridge = GuestCallbackBridge {
-        workload,
+        workload: workload.clone(),
         component_id: component_id.clone(),
         replier: replier.clone(),
+        credential: credential.clone(),
+        cancel_token: cancel_token.clone(),
     };
 
     let mut client = DingTalkStreamClient::builder(credential)
         .register_callback_handler(ChatbotMessage::TOPIC, bridge)
         .build();
 
+    let cid_for_log = component_id.clone();
+
     tokio::spawn(async move {
+        debug!(component_id = %cid_for_log, "Starting DingTalk stream client");
         tokio::select! {
             _ = cancel_token.cancelled() => {
                 debug!(
-                    component_id = %component_id,
+                    component_id = %cid_for_log,
                     "DingTalk stream task cancelled"
                 );
             }
@@ -296,13 +494,13 @@ fn spawn_dingtalk_stream(
                 match result {
                     Ok(()) => {
                         warn!(
-                            component_id = %component_id,
+                            component_id = %cid_for_log,
                             "DingTalk stream client exited"
                         );
                     }
                     Err(e) => {
                         warn!(
-                            component_id = %component_id,
+                            component_id = %cid_for_log,
                             error = %e,
                             "DingTalk stream client error"
                         );
@@ -311,8 +509,6 @@ fn spawn_dingtalk_stream(
             }
         }
     });
-
-    replier
 }
 
 // ---------------------------------------------------------------------------
@@ -329,183 +525,6 @@ fn build_synthetic_message(conversation_id: &str, sender_id: &str) -> ChatbotMes
         "msgId": "",
     });
     serde_json::from_value(value).unwrap_or_default()
-}
-
-// ---------------------------------------------------------------------------
-// WIT types::Host
-// ---------------------------------------------------------------------------
-
-impl bindings::custom::dingtalk_stream::types::Host for ActiveCtx<'_> {}
-
-// ---------------------------------------------------------------------------
-// WIT sender::Host — runtime message sending by the guest
-// ---------------------------------------------------------------------------
-
-impl<'a> bindings::custom::dingtalk_stream::sender::Host for ActiveCtx<'a> {
-    #[instrument(skip_all, fields(conversation_id = %conversation_id, sender_id = %sender_id))]
-    async fn send_text(
-        &mut self,
-        conversation_id: String,
-        sender_id: String,
-        content: String,
-    ) -> wasmtime::Result<Result<(), DingtalkError>> {
-        let Some(plugin) = self.get_plugin::<DingTalk>(PLUGIN_ID) else {
-            return Ok(Err(DingtalkError::Internal(
-                "dingtalk-stream plugin not available".to_string(),
-            )));
-        };
-
-        let replier = {
-            let lock = plugin.tracker.read().await;
-            let component_id = self.component_id.as_ref().to_string();
-            match lock.get_component_data(&component_id) {
-                Some(data) => match &data.replier {
-                    Some(r) => r.clone(),
-                    None => {
-                        return Ok(Err(DingtalkError::Internal(
-                            "replier not initialized".to_string(),
-                        )));
-                    }
-                },
-                None => {
-                    return Ok(Err(DingtalkError::Internal(
-                        "component not tracked".to_string(),
-                    )));
-                }
-            }
-        };
-
-        let synthetic = build_synthetic_message(&conversation_id, &sender_id);
-        match replier.reply_text(&content, &synthetic).await {
-            Ok(_) => Ok(Ok(())),
-            Err(dingtalk_stream::Error::Auth(e)) => {
-                Ok(Err(DingtalkError::AuthFailed(e.to_string())))
-            }
-            Err(e) => Ok(Err(DingtalkError::SendFailed(e.to_string()))),
-        }
-    }
-
-    #[instrument(skip_all, fields(conversation_id = %conversation_id, sender_id = %sender_id))]
-    async fn send_markdown(
-        &mut self,
-        conversation_id: String,
-        sender_id: String,
-        title: String,
-        content: String,
-    ) -> wasmtime::Result<Result<(), DingtalkError>> {
-        let Some(plugin) = self.get_plugin::<DingTalk>(PLUGIN_ID) else {
-            return Ok(Err(DingtalkError::Internal(
-                "dingtalk-stream plugin not available".to_string(),
-            )));
-        };
-
-        let replier = {
-            let lock = plugin.tracker.read().await;
-            let component_id = self.component_id.as_ref().to_string();
-            match lock.get_component_data(&component_id) {
-                Some(data) => match &data.replier {
-                    Some(r) => r.clone(),
-                    None => {
-                        return Ok(Err(DingtalkError::Internal(
-                            "replier not initialized".to_string(),
-                        )));
-                    }
-                },
-                None => {
-                    return Ok(Err(DingtalkError::Internal(
-                        "component not tracked".to_string(),
-                    )));
-                }
-            }
-        };
-
-        let synthetic = build_synthetic_message(&conversation_id, &sender_id);
-        match replier.reply_markdown(&title, &content, &synthetic).await {
-            Ok(_) => Ok(Ok(())),
-            Err(dingtalk_stream::Error::Auth(e)) => {
-                Ok(Err(DingtalkError::AuthFailed(e.to_string())))
-            }
-            Err(e) => Ok(Err(DingtalkError::SendFailed(e.to_string()))),
-        }
-    }
-
-    #[instrument(skip_all, fields(user_id = %user_id))]
-    async fn send_oto_text(
-        &mut self,
-        user_id: String,
-        content: String,
-    ) -> wasmtime::Result<Result<(), DingtalkError>> {
-        let Some(plugin) = self.get_plugin::<DingTalk>(PLUGIN_ID) else {
-            return Ok(Err(DingtalkError::Internal(
-                "dingtalk-stream plugin not available".to_string(),
-            )));
-        };
-
-        let replier = {
-            let lock = plugin.tracker.read().await;
-            let component_id = self.component_id.as_ref().to_string();
-            match lock.get_component_data(&component_id) {
-                Some(data) => match &data.replier {
-                    Some(r) => r.clone(),
-                    None => {
-                        return Ok(Err(DingtalkError::Internal(
-                            "replier not initialized".to_string(),
-                        )));
-                    }
-                },
-                None => {
-                    return Ok(Err(DingtalkError::Internal(
-                        "component not tracked".to_string(),
-                    )));
-                }
-            }
-        };
-
-        let msg_param = serde_json::json!({"content": content}).to_string();
-        match replier
-            .send_oto_message(&user_id, "sampleText", &msg_param)
-            .await
-        {
-            Ok(_) => Ok(Ok(())),
-            Err(dingtalk_stream::Error::Auth(e)) => {
-                Ok(Err(DingtalkError::AuthFailed(e.to_string())))
-            }
-            Err(e) => Ok(Err(DingtalkError::SendFailed(e.to_string()))),
-        }
-    }
-
-    async fn get_access_token(&mut self) -> wasmtime::Result<Result<String, DingtalkError>> {
-        let Some(plugin) = self.get_plugin::<DingTalk>(PLUGIN_ID) else {
-            return Ok(Err(DingtalkError::Internal(
-                "dingtalk-stream plugin not available".to_string(),
-            )));
-        };
-
-        // We need to get the access token from a DingTalk client.
-        // Build a temporary client from config to get the token.
-        let config = {
-            let lock = plugin.tracker.read().await;
-            let component_id = self.component_id.as_ref().to_string();
-            match lock.get_component_data(&component_id) {
-                Some(data) => data.config.clone(),
-                None => {
-                    return Ok(Err(DingtalkError::Internal(
-                        "component not tracked".to_string(),
-                    )));
-                }
-            }
-        };
-
-        let credential = Credential::new(&config.client_id, &config.client_secret);
-        let client = DingTalkStreamClient::builder(credential).build();
-        match client.get_access_token().await {
-            Ok(token) => Ok(Ok(token)),
-            Err(dingtalk_stream::Error::Auth(e)) => {
-                Ok(Err(DingtalkError::AuthFailed(e.to_string())))
-            }
-            Err(e) => Ok(Err(DingtalkError::Internal(e.to_string()))),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -532,7 +551,6 @@ impl HostPlugin for DingTalk {
         item: &mut WorkloadItem<'a>,
         interfaces: HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
-        // Only handle dingtalk-stream interfaces
         let Some(interface) = interfaces
             .iter()
             .find(|i| i.namespace == "custom" && i.package == "dingtalk-stream")
@@ -540,14 +558,7 @@ impl HostPlugin for DingTalk {
             return Ok(());
         };
 
-        // Parse config
-        let config = match extract_config(&interface.config) {
-            Some(c) => c,
-            None => {
-                warn!("Missing client-id or client-secret in dingtalk-stream interface config");
-                return Ok(());
-            }
-        };
+        let interface_config = interface.config.clone();
 
         // Add sender imports to linker
         bindings::custom::dingtalk_stream::types::add_to_linker::<_, SharedCtx>(
@@ -564,29 +575,18 @@ impl HostPlugin for DingTalk {
             return Ok(());
         };
 
-        // Check if this component exports the handler interface
-        let has_handler = component_handle
-            .world()
-            .exports
-            .iter()
-            .any(|i| i.namespace == "custom" && i.package == "dingtalk-stream");
+        debug!(
+            component_id = component_handle.id(),
+            "DingTalk stream plugin bound to component"
+        );
 
-        if has_handler {
-            debug!(
-                component_id = component_handle.id(),
-                "Tracking component for DingTalk stream callbacks"
-            );
-
-            self.tracker.write().await.add_component(
-                component_handle,
-                ComponentData {
-                    cancel_token: tokio_util::sync::CancellationToken::new(),
-                    workload: None,
-                    replier: None,
-                    config,
-                },
-            );
-        }
+        self.tracker.write().await.add_component(
+            component_handle,
+            ComponentData {
+                interface_config,
+                workload: None,
+            },
+        );
 
         Ok(())
     }
@@ -596,44 +596,10 @@ impl HostPlugin for DingTalk {
         workload: &ResolvedWorkload,
         component_id: &str,
     ) -> anyhow::Result<()> {
-        let (cancel_token, config) = {
-            let mut lock = self.tracker.write().await;
-            match lock.get_component_data_mut(component_id) {
-                Some(data) => {
-                    data.workload = Some(workload.clone());
-                    (data.cancel_token.clone(), data.config.clone())
-                }
-                None => return Ok(()),
-            }
-        };
-
-        // Validate that the component exports the handler interface
-        let instance_pre = workload.instantiate_pre(component_id).await?;
-        let _pre = bindings::DingtalkStreamPre::new(instance_pre)
-            .map_err(anyhow::Error::from)
-            .context("failed to instantiate dingtalk-stream pre")?;
-
-        // Spawn the DingTalk stream client
-        let replier = spawn_dingtalk_stream(
-            workload.clone(),
-            component_id.to_string(),
-            config,
-            cancel_token,
-        );
-
-        // Store the replier
-        {
-            let mut lock = self.tracker.write().await;
-            if let Some(data) = lock.get_component_data_mut(component_id) {
-                data.replier = Some(replier);
-            }
+        let mut lock = self.tracker.write().await;
+        if let Some(data) = lock.get_component_data_mut(component_id) {
+            data.workload = Some(workload.clone());
         }
-
-        debug!(
-            component_id = %component_id,
-            "DingTalk stream plugin resolved and client started"
-        );
-
         Ok(())
     }
 
@@ -642,17 +608,12 @@ impl HostPlugin for DingTalk {
         workload_id: &str,
         _interfaces: HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
-        let workload_cleanup = |_| async {};
-        let component_cleanup = |component_data: ComponentData| async move {
-            component_data.cancel_token.cancel();
-        };
-
         self.tracker
             .write()
             .await
-            .remove_workload_with_cleanup(workload_id, workload_cleanup, component_cleanup)
+            .remove_workload_with_cleanup(workload_id, |_| async {}, |_| async {})
             .await;
-
+        debug!(workload_id = %workload_id, "DingTalk stream plugin unbound");
         Ok(())
     }
 }
@@ -693,27 +654,6 @@ mod tests {
                 .iter()
                 .any(|i| i.namespace == "custom" && i.package == "dingtalk-stream")
         );
-    }
-
-    #[test]
-    fn test_extract_config() {
-        let mut config = HashMap::new();
-        config.insert("client-id".to_string(), "test_id".to_string());
-        config.insert("client-secret".to_string(), "test_secret".to_string());
-
-        let pc = extract_config(&config).unwrap();
-        assert_eq!(pc.client_id, "test_id");
-        assert_eq!(pc.client_secret, "test_secret");
-    }
-
-    #[test]
-    fn test_extract_config_missing() {
-        let config = HashMap::new();
-        assert!(extract_config(&config).is_none());
-
-        let mut config = HashMap::new();
-        config.insert("client-id".to_string(), "test_id".to_string());
-        assert!(extract_config(&config).is_none());
     }
 
     #[test]
