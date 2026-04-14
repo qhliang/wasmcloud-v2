@@ -6,7 +6,7 @@ ENV RUST_BACKTRACE=1
 
 # tools
 USER root
-RUN apk --no-cache add protoc protobuf protobuf-dev
+RUN apk --no-cache add protoc protobuf protobuf-dev openssl-dev
 USER nonroot
 
 # copy source code
