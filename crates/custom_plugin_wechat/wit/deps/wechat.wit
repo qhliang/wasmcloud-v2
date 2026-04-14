@@ -7,6 +7,10 @@ interface types {
         not-ready(string),
     }
 
+    record wechat-config {
+        token: string,
+    }
+
     record wechat-message {
         message-id: string,
         sender: string,
@@ -19,39 +23,26 @@ interface types {
 }
 
 interface sender {
-    use types.{wechat-error};
+    use types.{wechat-error, wechat-config};
 
-    /// Send a text message to a user.
-    send-text: func(to: string, text: string) -> result<_, wechat-error>;
-
-    /// Send a media file to a user.
-    send-media: func(to: string, file-path: string) -> result<_, wechat-error>;
+    resource wechat-client {
+        constructor(config: option<wechat-config>);
+        send-text: func(to: string, text: string) -> result<_, wechat-error>;
+        send-media: func(to: string, file-path: string) -> result<_, wechat-error>;
+        qr-start: func() -> result<string, wechat-error>;
+        qr-poll-status: func(session-json: string) -> result<string, wechat-error>;
+        stop: func() -> result<_, wechat-error>;
+    }
 }
 
-/// Guest-exported interface for receiving WeChat messages.
 interface handler {
     use types.{wechat-message};
+    use sender.{wechat-client};
 
-    /// Called by the host when a WeChat message is received.
-    on-message: func(msg: wechat-message) -> result<_, string>;
-}
-
-/// QR code login for WeChat iLink binding.
-interface login {
-    use types.{wechat-error};
-
-    /// Start a QR login session. Returns a JSON string with fields:
-    /// `{"qrcode": "<token>", "qrcode_img_content": "<image_url>"}`
-    qr-start: func() -> result<string, wechat-error>;
-
-    /// Poll the login status for a QR session. Returns a JSON string with fields:
-    /// `{"status": "wait|scanned|confirmed|expired", "bot_token": "...", "ilink_user_id": "..."}`
-    /// (bot_token and ilink_user_id are only present when status is "confirmed")
-    qr-poll-status: func(session-json: string) -> result<string, wechat-error>;
+    on-message: func(client: borrow<wechat-client>, msg: wechat-message) -> result<_, string>;
 }
 
 world wechat {
     import sender;
-    import login;
     export handler;
 }

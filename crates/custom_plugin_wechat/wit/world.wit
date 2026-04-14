@@ -2,6 +2,5 @@ package my:wechat;
 
 world wechat {
     import custom:wechat/sender@0.1.0;
-    import custom:wechat/login@0.1.0;
     export custom:wechat/handler@0.1.0;
 }

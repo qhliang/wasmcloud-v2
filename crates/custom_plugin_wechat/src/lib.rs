@@ -1,61 +1,55 @@
-//! # WeChat iLink Bot Host Plugin
+//! # WeChat iLink Bot Host Plugin (Resource-based)
 //!
-//! This plugin provides WeChat iLink Bot messaging integration for WASM components
-//! via the `weixin-agent` SDK. It uses long-poll message monitoring and supports
-//! sending text/media messages to arbitrary contacts.
-//!
-//! ## Configuration (via interface config)
-//!
-//! ```ignore
-//! custom:wechat:
-//!   config:
-//!     token: "your-bot-token"    // Required. iLink Bot token
-//! ```
+//! Two config sources with priority:
+//! 1. Wasm dynamic config (passed via resource constructor)
+//! 2. Static interface config (fallback from wasmcloud config)
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::sync::RwLock;
-use tracing::{debug, warn};
+use tracing::{debug, instrument, warn};
+use wasmtime::component::Resource;
 
 use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use wash_runtime::engine::workload::{ResolvedWorkload, WorkloadItem};
+use wash_runtime::plugin::config::resolve_field;
 use wash_runtime::plugin::{HostPlugin, WorkloadTracker};
 use wash_runtime::wit::{WitInterface, WitWorld};
 
 mod bindings {
     wasmtime::component::bindgen!({
         world: "wechat",
-        imports: { default: async | trappable | tracing },
-        exports: { default: async | tracing },
+        imports: {
+            default: async | trappable | tracing,
+        },
+        with: {
+            "custom:wechat/sender.wechat-client": super::WechatClientHandle,
+        },
     });
 }
 
-use bindings::custom::wechat::types::WechatError;
+use bindings::custom::wechat::types::{WechatConfig, WechatError, WechatMessage};
 
 const PLUGIN_ID: &str = "wechat";
 
 // ---------------------------------------------------------------------------
-// Per-component data
+// Types
 // ---------------------------------------------------------------------------
 
-/// Configuration extracted from interface config.
-#[derive(Clone, Debug)]
-pub(crate) struct PluginConfig {
-    pub token: String,
+/// Host-side state for a wechat-client resource instance.
+pub struct WechatClientHandle {
+    client: Arc<weixin_agent::WeixinClient>,
+    cancel_token: tokio_util::sync::CancellationToken,
 }
 
-/// Per-component data tracked by the plugin.
-pub(crate) struct ComponentData {
-    /// Token that cancels the WeixinClient background task.
-    pub cancel_token: tokio_util::sync::CancellationToken,
-    /// Resolved workload — set during on_workload_resolved.
-    pub workload: Option<ResolvedWorkload>,
-    /// The weixin-agent client for sending messages.
-    pub client: Option<Arc<weixin_agent::WeixinClient>>,
-    /// Plugin config.
-    pub config: PluginConfig,
+/// Per-component data.
+struct ComponentData {
+    /// Static interface config from wasmcloud config (fallback source)
+    interface_config: HashMap<String, String>,
+    /// Resolved workload
+    workload: Option<ResolvedWorkload>,
 }
 
 // ---------------------------------------------------------------------------
@@ -82,14 +76,220 @@ impl Wechat {
 }
 
 // ---------------------------------------------------------------------------
-// Config parsing
+// WIT types::Host
 // ---------------------------------------------------------------------------
 
-fn extract_config(interface_config: &HashMap<String, String>) -> Option<PluginConfig> {
-    let token = interface_config.get("token")?;
-    Some(PluginConfig {
-        token: token.clone(),
-    })
+impl<'a> bindings::custom::wechat::types::Host for ActiveCtx<'a> {}
+
+// ---------------------------------------------------------------------------
+// WIT sender::Host — empty (resource lives in HostWechatClient)
+// ---------------------------------------------------------------------------
+
+impl<'a> bindings::custom::wechat::sender::Host for ActiveCtx<'a> {}
+
+// ---------------------------------------------------------------------------
+// WIT sender::HostWechatClient — resource constructor + methods
+// ---------------------------------------------------------------------------
+
+impl<'a> bindings::custom::wechat::sender::HostWechatClient for ActiveCtx<'a> {
+    async fn new(
+        &mut self,
+        config: Option<WechatConfig>,
+    ) -> wasmtime::Result<Resource<WechatClientHandle>> {
+        let Some(plugin) = self.get_plugin::<Wechat>(PLUGIN_ID) else {
+            return Err(wasmtime::Error::msg("wechat plugin not available"));
+        };
+
+        let component_id: Arc<str> = self.component_id.clone();
+        let lock = plugin.tracker.read().await;
+        let Some(data) = lock.get_component_data(&component_id) else {
+            return Err(wasmtime::Error::msg("component not tracked"));
+        };
+
+        let token = match resolve_field(
+            config.as_ref().map(|c| c.token.clone()),
+            &data.interface_config,
+            "token",
+        ) {
+            Ok(t) => t,
+            Err(_) => {
+                return Err(wasmtime::Error::msg(
+                    "missing token: provide via constructor or interface config",
+                ));
+            }
+        };
+
+        let Some(workload) = &data.workload else {
+            return Err(wasmtime::Error::msg("workload not resolved yet"));
+        };
+
+        let workload = workload.clone();
+
+        drop(lock);
+
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+
+        let client = spawn_weixin_client(
+            workload,
+            component_id.to_string(),
+            token,
+            cancel_token.clone(),
+        )
+        .ok_or_else(|| wasmtime::Error::msg("failed to create wechat client"))?;
+
+        let handle = WechatClientHandle {
+            client,
+            cancel_token,
+        };
+
+        let resource = self.table.push(handle)?;
+        Ok(resource)
+    }
+
+    #[instrument(skip_all)]
+    async fn send_text(
+        &mut self,
+        client: Resource<WechatClientHandle>,
+        to: String,
+        text: String,
+    ) -> wasmtime::Result<Result<(), WechatError>> {
+        let handle = self.table.get(&client)?;
+
+        match handle.client.send_text(&to, &text, None).await {
+            Ok(_) => {
+                debug!(to = %to, "WeChat send_text OK");
+                Ok(Ok(()))
+            }
+            Err(e) => {
+                warn!(to = %to, error = %e, "WeChat send_text failed");
+                Ok(Err(WechatError::SendFailed(e.to_string())))
+            }
+        }
+    }
+
+    #[instrument(skip_all)]
+    async fn send_media(
+        &mut self,
+        client: Resource<WechatClientHandle>,
+        to: String,
+        file_path: String,
+    ) -> wasmtime::Result<Result<(), WechatError>> {
+        let handle = self.table.get(&client)?;
+        let path = std::path::Path::new(&file_path);
+
+        match handle.client.send_media(&to, path, None).await {
+            Ok(_) => {
+                debug!(to = %to, "WeChat send_media OK");
+                Ok(Ok(()))
+            }
+            Err(e) => {
+                warn!(to = %to, error = %e, "WeChat send_media failed");
+                Ok(Err(WechatError::SendFailed(e.to_string())))
+            }
+        }
+    }
+
+    async fn qr_start(
+        &mut self,
+        client: Resource<WechatClientHandle>,
+    ) -> wasmtime::Result<Result<String, WechatError>> {
+        let handle = self.table.get(&client)?;
+
+        let qr_api = handle.client.qr_login();
+        match qr_api.start(None).await {
+            Ok(session) => {
+                let json = serde_json::json!({
+                    "qrcode": session.qrcode,
+                    "qrcode_img_content": session.qrcode_img_content,
+                });
+                Ok(Ok(json.to_string()))
+            }
+            Err(e) => Ok(Err(WechatError::Internal(e.to_string()))),
+        }
+    }
+
+    async fn qr_poll_status(
+        &mut self,
+        client: Resource<WechatClientHandle>,
+        session_json: String,
+    ) -> wasmtime::Result<Result<String, WechatError>> {
+        let handle = self.table.get(&client)?;
+
+        let parsed: serde_json::Value = match serde_json::from_str(&session_json) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(Err(WechatError::Internal(e.to_string())));
+            }
+        };
+        let session = weixin_agent::QrLoginSession {
+            qrcode: parsed
+                .get("qrcode")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            qrcode_img_content: parsed
+                .get("qrcode_img_content")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        };
+
+        let qr_api = handle.client.qr_login();
+        match qr_api.poll_status(&session).await {
+            Ok(status) => {
+                let json = match status {
+                    weixin_agent::LoginStatus::Wait => {
+                        serde_json::json!({"status": "wait"})
+                    }
+                    weixin_agent::LoginStatus::Scanned => {
+                        serde_json::json!({"status": "scanned"})
+                    }
+                    weixin_agent::LoginStatus::ScannedButRedirect { redirect_host } => {
+                        serde_json::json!({"status": "scanned_redirect", "redirect_host": redirect_host})
+                    }
+                    weixin_agent::LoginStatus::Confirmed {
+                        bot_token,
+                        ilink_bot_id,
+                        base_url,
+                        ilink_user_id,
+                    } => {
+                        serde_json::json!({
+                            "status": "confirmed",
+                            "bot_token": bot_token,
+                            "ilink_bot_id": ilink_bot_id,
+                            "base_url": base_url,
+                            "ilink_user_id": ilink_user_id,
+                        })
+                    }
+                    weixin_agent::LoginStatus::Expired => {
+                        serde_json::json!({"status": "expired"})
+                    }
+                };
+                Ok(Ok(json.to_string()))
+            }
+            Err(e) => Ok(Err(WechatError::Internal(e.to_string()))),
+        }
+    }
+
+    async fn stop(
+        &mut self,
+        client: Resource<WechatClientHandle>,
+    ) -> wasmtime::Result<Result<(), WechatError>> {
+        let handle = self.table.get(&client)?;
+        handle.cancel_token.cancel();
+        debug!("WeChat client stopped via stop()");
+        Ok(Ok(()))
+    }
+
+    async fn drop(
+        &mut self,
+        rep: Resource<WechatClientHandle>,
+    ) -> wasmtime::Result<()> {
+        if let Ok(handle) = self.table.delete(rep) {
+            handle.cancel_token.cancel();
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -99,14 +299,17 @@ fn extract_config(interface_config: &HashMap<String, String>) -> Option<PluginCo
 fn spawn_weixin_client(
     workload: ResolvedWorkload,
     component_id: String,
-    config: PluginConfig,
+    token: String,
     cancel_token: tokio_util::sync::CancellationToken,
 ) -> Option<Arc<weixin_agent::WeixinClient>> {
+    use std::sync::Mutex;
     use weixin_agent::{MessageContext, MessageHandler, WeixinClient, WeixinConfig};
 
     struct WasmMessageHandler {
         workload: Arc<ResolvedWorkload>,
         component_id: String,
+        /// Shared reference to the client, set after construction.
+        client_ref: Arc<Mutex<Option<Arc<WeixinClient>>>>,
     }
 
     #[async_trait::async_trait]
@@ -114,7 +317,7 @@ fn spawn_weixin_client(
         async fn on_message(&self, ctx: &MessageContext) -> weixin_agent::Result<()> {
             let media_type = ctx.media.as_ref().map(|_| "media").unwrap_or("text");
 
-            let wx_msg = bindings::custom::wechat::types::WechatMessage {
+            let wx_msg = WechatMessage {
                 message_id: ctx.message_id.clone(),
                 sender: ctx.from.clone(),
                 receiver: ctx.to.clone(),
@@ -133,6 +336,22 @@ fn spawn_weixin_client(
                 .to_string(),
             };
 
+            let client = {
+                let guard = self
+                    .client_ref
+                    .lock()
+                    .map_err(|_| weixin_agent::Error::Config("client lock poisoned".to_string()))?;
+                match guard.clone() {
+                    Some(c) => c,
+                    None => {
+                        warn!(component_id = %self.component_id, "WeChat client not set in handler yet");
+                        return Err(weixin_agent::Error::Config(
+                            "client not initialized".to_string(),
+                        ));
+                    }
+                }
+            };
+
             let workload = self.workload.clone();
             let cid = self.component_id.clone();
 
@@ -141,6 +360,19 @@ fn spawn_weixin_client(
                     Ok(s) => s,
                     Err(e) => {
                         warn!(component_id = %cid, error = %e, "Failed to create store for WeChat callback");
+                        return;
+                    }
+                };
+
+                // Temporary client handle for the callback — guest can call methods on it
+                let temp_handle = WechatClientHandle {
+                    client,
+                    cancel_token: tokio_util::sync::CancellationToken::new(),
+                };
+                let client_resource = match store.data_mut().table.push(temp_handle) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!(component_id = %cid, error = %e, "Failed to push client resource for callback");
                         return;
                     }
                 };
@@ -171,17 +403,16 @@ fn spawn_weixin_client(
 
                 match proxy
                     .custom_wechat_handler()
-                    .call_on_message(&mut store, &wx_msg)
-                    .await
+                    .call_on_message(&mut store, client_resource, &wx_msg)
                 {
                     Ok(Ok(())) => {
-                        debug!(component_id = %cid, "Guest on-message handled successfully");
+                        debug!(component_id = %cid, "Guest WeChat on-message handled successfully");
                     }
                     Ok(Err(e)) => {
-                        warn!(component_id = %cid, error = %e, "Guest on-message returned error");
+                        warn!(component_id = %cid, error = %e, "Guest WeChat on-message returned error");
                     }
                     Err(e) => {
-                        warn!(component_id = %cid, error = %e, "Guest on-message call failed");
+                        warn!(component_id = %cid, error = %e, "Guest WeChat on-message call failed");
                     }
                 }
             });
@@ -190,7 +421,10 @@ fn spawn_weixin_client(
         }
     }
 
-    let wx_config = match WeixinConfig::builder().token(&config.token).build() {
+    let client_ref: Arc<Mutex<Option<Arc<WeixinClient>>>> =
+        Arc::new(Mutex::new(None));
+
+    let wx_config = match WeixinConfig::builder().token(&token).build() {
         Ok(c) => c,
         Err(e) => {
             warn!(
@@ -205,6 +439,7 @@ fn spawn_weixin_client(
     let handler = WasmMessageHandler {
         workload: Arc::new(workload),
         component_id: component_id.clone(),
+        client_ref: client_ref.clone(),
     };
 
     let client = match WeixinClient::builder(wx_config).on_message(handler).build() {
@@ -218,6 +453,11 @@ fn spawn_weixin_client(
             return None;
         }
     };
+
+    // Set the client reference so the handler can access it in callbacks
+    if let Ok(mut guard) = client_ref.lock() {
+        *guard = Some(client.clone());
+    }
 
     let shared_client = client.clone();
     let cancel_token_for_thread = cancel_token.clone();
@@ -262,230 +502,6 @@ fn spawn_weixin_client(
 }
 
 // ---------------------------------------------------------------------------
-// WIT types::Host
-// ---------------------------------------------------------------------------
-
-impl bindings::custom::wechat::types::Host for ActiveCtx<'_> {}
-
-// ---------------------------------------------------------------------------
-// WIT sender::Host
-// ---------------------------------------------------------------------------
-
-impl bindings::custom::wechat::sender::Host for ActiveCtx<'_> {
-    async fn send_text(
-        &mut self,
-        to: String,
-        text: String,
-    ) -> wasmtime::Result<Result<(), WechatError>> {
-        let Some(plugin) = self.get_plugin::<Wechat>(PLUGIN_ID) else {
-            return Ok(Err(WechatError::Internal(
-                "wechat plugin not available".to_string(),
-            )));
-        };
-
-        let component_id = self.component_id.as_ref().to_string();
-
-        let client = {
-            let lock = plugin.tracker.read().await;
-            match lock.get_component_data(&component_id) {
-                Some(data) => match &data.client {
-                    Some(c) => c.clone(),
-                    None => {
-                        return Ok(Err(WechatError::NotReady(
-                            "wechat client not initialized".to_string(),
-                        )));
-                    }
-                },
-                None => {
-                    return Ok(Err(WechatError::Internal(
-                        "component not tracked".to_string(),
-                    )));
-                }
-            }
-        };
-
-        match client.send_text(&to, &text, None).await {
-            Ok(_) => Ok(Ok(())),
-            Err(e) => Ok(Err(WechatError::SendFailed(e.to_string()))),
-        }
-    }
-
-    async fn send_media(
-        &mut self,
-        to: String,
-        file_path: String,
-    ) -> wasmtime::Result<Result<(), WechatError>> {
-        let Some(plugin) = self.get_plugin::<Wechat>(PLUGIN_ID) else {
-            return Ok(Err(WechatError::Internal(
-                "wechat plugin not available".to_string(),
-            )));
-        };
-
-        let component_id = self.component_id.as_ref().to_string();
-
-        let client = {
-            let lock = plugin.tracker.read().await;
-            match lock.get_component_data(&component_id) {
-                Some(data) => match &data.client {
-                    Some(c) => c.clone(),
-                    None => {
-                        return Ok(Err(WechatError::NotReady(
-                            "wechat client not initialized".to_string(),
-                        )));
-                    }
-                },
-                None => {
-                    return Ok(Err(WechatError::Internal(
-                        "component not tracked".to_string(),
-                    )));
-                }
-            }
-        };
-
-        let path = std::path::Path::new(&file_path);
-        match client.send_media(&to, path, None).await {
-            Ok(_) => Ok(Ok(())),
-            Err(e) => Ok(Err(WechatError::SendFailed(e.to_string()))),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// WIT login::Host
-// ---------------------------------------------------------------------------
-
-impl bindings::custom::wechat::login::Host for ActiveCtx<'_> {
-    async fn qr_start(&mut self) -> wasmtime::Result<Result<String, WechatError>> {
-        let Some(plugin) = self.get_plugin::<Wechat>(PLUGIN_ID) else {
-            return Ok(Err(WechatError::Internal(
-                "wechat plugin not available".to_string(),
-            )));
-        };
-
-        let component_id = self.component_id.as_ref().to_string();
-
-        let client = {
-            let lock = plugin.tracker.read().await;
-            match lock.get_component_data(&component_id) {
-                Some(data) => match &data.client {
-                    Some(c) => c.clone(),
-                    None => {
-                        return Ok(Err(WechatError::NotReady(
-                            "wechat client not initialized".to_string(),
-                        )));
-                    }
-                },
-                None => {
-                    return Ok(Err(WechatError::Internal(
-                        "component not tracked".to_string(),
-                    )));
-                }
-            }
-        };
-
-        let qr_api = client.qr_login();
-        match qr_api.start(None).await {
-            Ok(session) => {
-                let json = serde_json::json!({
-                    "qrcode": session.qrcode,
-                    "qrcode_img_content": session.qrcode_img_content,
-                });
-                Ok(Ok(json.to_string()))
-            }
-            Err(e) => Ok(Err(WechatError::Internal(e.to_string()))),
-        }
-    }
-
-    async fn qr_poll_status(
-        &mut self,
-        session_json: String,
-    ) -> wasmtime::Result<Result<String, WechatError>> {
-        let Some(plugin) = self.get_plugin::<Wechat>(PLUGIN_ID) else {
-            return Ok(Err(WechatError::Internal(
-                "wechat plugin not available".to_string(),
-            )));
-        };
-
-        let component_id = self.component_id.as_ref().to_string();
-
-        let client = {
-            let lock = plugin.tracker.read().await;
-            match lock.get_component_data(&component_id) {
-                Some(data) => match &data.client {
-                    Some(c) => c.clone(),
-                    None => {
-                        return Ok(Err(WechatError::NotReady(
-                            "wechat client not initialized".to_string(),
-                        )));
-                    }
-                },
-                None => {
-                    return Ok(Err(WechatError::Internal(
-                        "component not tracked".to_string(),
-                    )));
-                }
-            }
-        };
-
-        // Parse session from JSON
-        let parsed: serde_json::Value = match serde_json::from_str(&session_json) {
-            Ok(v) => v,
-            Err(e) => {
-                return Ok(Err(WechatError::Internal(e.to_string())));
-            }
-        };
-        let session = weixin_agent::QrLoginSession {
-            qrcode: parsed
-                .get("qrcode")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            qrcode_img_content: parsed
-                .get("qrcode_img_content")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
-        };
-
-        let qr_api = client.qr_login();
-        match qr_api.poll_status(&session).await {
-            Ok(status) => {
-                let json = match status {
-                    weixin_agent::LoginStatus::Wait => {
-                        serde_json::json!({"status": "wait"})
-                    }
-                    weixin_agent::LoginStatus::Scanned => {
-                        serde_json::json!({"status": "scanned"})
-                    }
-                    weixin_agent::LoginStatus::ScannedButRedirect { redirect_host } => {
-                        serde_json::json!({"status": "scanned_redirect", "redirect_host": redirect_host})
-                    }
-                    weixin_agent::LoginStatus::Confirmed {
-                        bot_token,
-                        ilink_bot_id,
-                        base_url,
-                        ilink_user_id,
-                    } => {
-                        serde_json::json!({
-                            "status": "confirmed",
-                            "bot_token": bot_token,
-                            "ilink_bot_id": ilink_bot_id,
-                            "base_url": base_url,
-                            "ilink_user_id": ilink_user_id,
-                        })
-                    }
-                    weixin_agent::LoginStatus::Expired => {
-                        serde_json::json!({"status": "expired"})
-                    }
-                };
-                Ok(Ok(json.to_string()))
-            }
-            Err(e) => Ok(Err(WechatError::Internal(e.to_string()))),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // HostPlugin implementation
 // ---------------------------------------------------------------------------
 
@@ -498,7 +514,7 @@ impl HostPlugin for Wechat {
     fn world(&self) -> WitWorld {
         WitWorld {
             imports: HashSet::from([WitInterface::from("custom:wechat/handler@0.1.0")]),
-            exports: HashSet::from([WitInterface::from("custom:wechat/sender,login@0.1.0")]),
+            exports: HashSet::from([WitInterface::from("custom:wechat/sender@0.1.0")]),
         }
     }
 
@@ -514,13 +530,7 @@ impl HostPlugin for Wechat {
             return Ok(());
         };
 
-        let config = match extract_config(&interface.config) {
-            Some(c) => c,
-            None => {
-                warn!("Missing token in wechat interface config");
-                return Ok(());
-            }
-        };
+        let interface_config = interface.config.clone();
 
         bindings::custom::wechat::types::add_to_linker::<_, SharedCtx>(
             item.linker(),
@@ -530,27 +540,18 @@ impl HostPlugin for Wechat {
             item.linker(),
             extract_active_ctx,
         )?;
-        bindings::custom::wechat::login::add_to_linker::<_, SharedCtx>(
-            item.linker(),
-            extract_active_ctx,
-        )?;
 
         let WorkloadItem::Component(component_handle) = item else {
             return Ok(());
         };
 
-        debug!(
-            component_id = component_handle.id(),
-            "Tracking component for WeChat callbacks"
-        );
+        debug!(component_id = component_handle.id(), "WeChat plugin bound to component");
 
         self.tracker.write().await.add_component(
             component_handle,
             ComponentData {
-                cancel_token: tokio_util::sync::CancellationToken::new(),
+                interface_config,
                 workload: None,
-                client: None,
-                config,
             },
         );
 
@@ -562,39 +563,10 @@ impl HostPlugin for Wechat {
         workload: &ResolvedWorkload,
         component_id: &str,
     ) -> anyhow::Result<()> {
-        let (cancel_token, config) = {
-            let mut lock = self.tracker.write().await;
-            match lock.get_component_data_mut(component_id) {
-                Some(data) => {
-                    data.workload = Some(workload.clone());
-                    (data.cancel_token.clone(), data.config.clone())
-                }
-                None => return Ok(()),
-            }
-        };
-
-        let instance_pre = workload.instantiate_pre(component_id).await?;
-        let _pre = bindings::WechatPre::new(instance_pre)?;
-
-        let client = spawn_weixin_client(
-            workload.clone(),
-            component_id.to_string(),
-            config,
-            cancel_token,
-        );
-
-        if let Some(client) = client {
-            let mut lock = self.tracker.write().await;
-            if let Some(data) = lock.get_component_data_mut(component_id) {
-                data.client = Some(client);
-            }
+        let mut lock = self.tracker.write().await;
+        if let Some(data) = lock.get_component_data_mut(component_id) {
+            data.workload = Some(workload.clone());
         }
-
-        debug!(
-            component_id = %component_id,
-            "WeChat plugin resolved and client started"
-        );
-
         Ok(())
     }
 
@@ -603,17 +575,12 @@ impl HostPlugin for Wechat {
         workload_id: &str,
         _interfaces: HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
-        let workload_cleanup = |_| async {};
-        let component_cleanup = |component_data: ComponentData| async move {
-            component_data.cancel_token.cancel();
-        };
-
         self.tracker
             .write()
             .await
-            .remove_workload_with_cleanup(workload_id, workload_cleanup, component_cleanup)
+            .remove_workload_with_cleanup(workload_id, |_| async {}, |_| async {})
             .await;
-
+        debug!(workload_id = %workload_id, "WeChat plugin unbound");
         Ok(())
     }
 }
@@ -661,13 +628,13 @@ mod tests {
         let mut config = HashMap::new();
         config.insert("token".to_string(), "test-bot-token".to_string());
 
-        let pc = extract_config(&config).unwrap();
-        assert_eq!(pc.token, "test-bot-token");
+        let val = resolve_field(None, &config, "token").unwrap();
+        assert_eq!(val, "test-bot-token");
     }
 
     #[test]
     fn test_extract_config_missing() {
         let config = HashMap::new();
-        assert!(extract_config(&config).is_none());
+        assert!(resolve_field(None, &config, "token").is_err());
     }
 }
