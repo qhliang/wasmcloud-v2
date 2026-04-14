@@ -16,6 +16,16 @@ interface types {
         unexpected(string),
     }
 
+    /// Configuration for a D1 client
+    record d1-config {
+        /// Cloudflare account ID
+        account-id: string,
+        /// Cloudflare API token with D1 permissions
+        api-token: string,
+        /// D1 database ID
+        database-id: string,
+    }
+
     /// A column value from a query result
     variant column-value {
         null,
@@ -39,7 +49,7 @@ interface types {
         column-type: option<string>,
     }
 
-    /// Result of multiple query execution
+    /// Result of query execution
     record query-result {
         /// Column metadata
         columns: list<column-meta>,
@@ -54,26 +64,35 @@ interface types {
 
 /// Interface for executing SQL queries against Cloudflare D1
 interface query {
-    use types.{query-error, query-result, column-value, result-row};
+    use types.{query-error, query-result, column-value, result-row, d1-config};
 
-    /// Execute a SQL query with parameters
+    /// A D1 client resource that manages connection to a Cloudflare D1 database.
     ///
-    /// Parameters use SQLite syntax: ?, ?1, ?2, etc.
-    ///
-    /// Example:
-    /// ```sql
-    /// SELECT * FROM users WHERE id = ? AND status = ?
-    /// ```
-    query: func(sql: string, params: list<column-value>) -> result<query-result, query-error>;
+    /// Configuration can be provided dynamically via the constructor,
+    /// or statically via interface config as a fallback.
+    resource d1-client {
+        /// Create a new D1 client.
+        ///
+        /// If config is provided, it is used directly.
+        /// If config is None, the plugin falls back to static interface config.
+        constructor(config: option<d1-config>);
 
-    /// Execute a batch of SQL statements (no parameters allowed)
-    ///
-    /// Useful for migrations or multiple statements.
-    /// Each statement is executed in sequence.
-    query-batch: func(sql: string) -> result<list<query-result>, query-error>;
+        /// Execute a SQL query with parameters
+        ///
+        /// Parameters use SQLite syntax: ?, ?1, ?2, etc.
+        query: func(sql: string, params: list<column-value>) -> result<query-result, query-error>;
 
-    /// Execute a SQL query and return only the first row
-    query-one: func(sql: string, params: list<column-value>) -> result<option<result-row>, query-error>;
+        /// Execute a batch of SQL statements (no parameters allowed)
+        ///
+        /// Useful for migrations or multiple statements.
+        query-batch: func(sql: string) -> result<list<query-result>, query-error>;
+
+        /// Execute a SQL query and return only the first row
+        query-one: func(sql: string, params: list<column-value>) -> result<option<result-row>, query-error>;
+
+        /// Stop the client (no-op for D1, no background tasks)
+        stop: func() -> result<_, query-error>;
+    }
 }
 
 /// World defining the D1 database interface

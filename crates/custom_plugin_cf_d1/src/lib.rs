@@ -1,52 +1,8 @@
-//! # Cloudflare D1 Host Plugin
+//! # Cloudflare D1 Host Plugin (Resource-based)
 //!
-//! This module implements a wasmCloud host plugin that provides `cf:d1@0.1.0`
-//! interfaces using Cloudflare D1 as the backend SQL database.
-//!
-//! ## Usage
-//!
-//! ```ignore
-//! use custom_plugin_cf_d1::CloudflareD1;
-//! use wash_runtime::host::HostBuilder;
-//! use std::sync::Arc;
-//!
-//! // Create the plugin (credentials are configured per-workload via interface config)
-//! let cf_d1 = CloudflareD1::new();
-//!
-//! // Add to host builder
-//! let host = HostBuilder::new()
-//!     .with_plugin(Arc::new(cf_d1))?
-//!     .build()?;
-//! ```
-//!
-//! ## per-Workload Configuration
-//!
-//! Each workload must configure its credentials via interface config:
-//!
-//! ```ignore
-//! // In the workload manifest or interface configuration:
-//! // cf:d1:
-//! //   config:
-//! //     account_id: "your-cloudflare-account-id"
-//! //     api_token: "your-cloudflare-api-token"
-//! //     database_id: "your-d1-database-id"
-//! ```
-//!
-//! ## API Endpoints
-//!
-//! Cloudflare D1 has two endpoints with different response formats:
-//!
-//! ### /query endpoint
-//! - URL: https://api.cloudflare.com/client/v4/accounts/{account_id}/d1/database/{database_id}/query
-//! - Response: `{"result":[{"results":[{"id":1,"name":"Test"},...}],"success":true,...}]}`
-//! - The `results` field is an **array of row objects** (key-value pairs)
-//!
-//! ### /raw endpoint
-//! - URL: https://api.cloudflare.com/client/v4/accounts/{account_id}/d1/database/{database_id}/raw
-//! - Response: `{"result":[{"results":{"columns":["id","name",...],"rows":[[1,"Test"],...]},"success":true,...}]}`
-//! - The `results` field is an **object** with `columns` and `rows` arrays
-
-//!
+//! Two config sources with priority:
+//! 1. Wasm dynamic config (passed via resource constructor)
+//! 2. Static interface config (fallback from wasmcloud config)
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -58,10 +14,12 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::debug;
+use wasmtime::component::Resource;
 
 use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use wash_runtime::engine::workload::WorkloadItem;
-use wash_runtime::plugin::HostPlugin;
+use wash_runtime::plugin::config::resolve_field;
+use wash_runtime::plugin::{HostPlugin, WorkloadTracker};
 use wash_runtime::wit::{WitInterface, WitWorld};
 
 mod bindings {
@@ -70,43 +28,49 @@ mod bindings {
         imports: {
             default: async | trappable | tracing,
         },
+        with: {
+            "custom:cf-d1/query.d1-client": super::D1ClientHandle,
+        },
     });
 }
 
-use bindings::custom::cf_d1::types::{ColumnMeta, ColumnValue, QueryError, QueryResult, ResultRow};
+use bindings::custom::cf_d1::types::{
+    ColumnMeta, ColumnValue, D1Config, QueryError, QueryResult, ResultRow,
+};
 
 const PLUGIN_ID: &str = "cf-d1";
 
-/// Configuration for Cloudflare D1 (per-workload)
-#[derive(Clone, Debug)]
-pub struct CloudflareD1Config {
-    /// Cloudflare account ID
-    pub account_id: String,
-    /// Cloudflare API token with D1 permissions
-    pub api_token: String,
-    /// D1 database ID
-    pub database_id: String,
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/// Host-side state for a d1-client resource instance.
+pub struct D1ClientHandle {
+    account_id: String,
+    database_id: String,
+    client: Client,
 }
 
-/// Cloudflare D1 SQL database plugin
-#[derive(Clone, Default)]
-pub struct CloudflareD1 {
-    /// Mapping from workload_id to workload-specific config
-    configs: Arc<RwLock<HashMap<String, CloudflareD1Config>>>,
-    /// HTTP clients per workload
-    clients: Arc<RwLock<HashMap<String, Client>>>,
-    /// Metrics
-    metrics: Arc<CloudflareD1Metrics>,
+/// Per-component data.
+struct ComponentData {
+    /// Static interface config from wasmcloud config (fallback source)
+    interface_config: HashMap<String, String>,
 }
+
+// ---------------------------------------------------------------------------
+// Metrics
+// ---------------------------------------------------------------------------
 
 struct CloudflareD1Metrics {
     queries_total: Counter<u64>,
 }
+
 impl Default for CloudflareD1Metrics {
     fn default() -> Self {
         Self::new()
     }
 }
+
 impl CloudflareD1Metrics {
     fn new() -> Self {
         let meter = opentelemetry::global::meter("cf-d1");
@@ -117,17 +81,33 @@ impl CloudflareD1Metrics {
         Self { queries_total }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Plugin struct
+// ---------------------------------------------------------------------------
+
+/// Cloudflare D1 SQL database plugin
+#[derive(Clone)]
+pub struct CloudflareD1 {
+    tracker: Arc<RwLock<WorkloadTracker<(), ComponentData>>>,
+    metrics: Arc<CloudflareD1Metrics>,
+}
+
+impl Default for CloudflareD1 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CloudflareD1 {
     /// Create a new Cloudflare D1 plugin
-    /// Credentials are configured per-workload via interface config
     pub fn new() -> Self {
-        let metrics = CloudflareD1Metrics::new();
         Self {
-            configs: Arc::new(RwLock::new(HashMap::new())),
-            clients: Arc::new(RwLock::new(HashMap::new())),
-            metrics: Arc::new(metrics),
+            tracker: Arc::new(RwLock::new(WorkloadTracker::default())),
+            metrics: Arc::new(CloudflareD1Metrics::new()),
         }
     }
+
     fn record_query(&self, operation: &str) {
         let attributes = [opentelemetry::KeyValue::new(
             "operation",
@@ -135,44 +115,12 @@ impl CloudflareD1 {
         )];
         self.metrics.queries_total.add(1, &attributes);
     }
-    async fn get_or_create_client(&self, workload_id: &str) -> anyhow::Result<Client> {
-        // Check if client already exists
-        {
-            let clients = self.clients.read().await;
-            if let Some(client) = clients.get(workload_id) {
-                return Ok(client.clone());
-            }
-        }
-        // Get config for this workload
-        let configs = self.configs.read().await;
-        let config = configs
-            .get(workload_id)
-            .ok_or_else(|| anyhow::anyhow!("No D1 config found for workload '{}'", workload_id))?;
-        let api_token = config.api_token.clone();
-        drop(configs);
-        // Build HTTP client with auth
-        let client = Client::builder()
-            .default_headers({
-                let mut headers = reqwest::header::HeaderMap::new();
-                headers.insert(
-                    reqwest::header::AUTHORIZATION,
-                    format!("Bearer {}", api_token).parse()?,
-                );
-                headers.insert(reqwest::header::CONTENT_TYPE, "application/json".parse()?);
-                headers
-            })
-            .build()?;
-        // Cache the client
-        {
-            let mut clients = self.clients.write().await;
-            clients.insert(workload_id.to_string(), client.clone());
-        }
-        Ok(client)
-    }
 }
-// ============================================================================
+
+// ---------------------------------------------------------------------------
 // D1 API Request/Response Types
-// ============================================================================
+// ---------------------------------------------------------------------------
+
 /// D1 API query request
 #[derive(Serialize)]
 struct D1QueryRequest {
@@ -180,11 +128,13 @@ struct D1QueryRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     params: Option<Vec<serde_json::Value>>,
 }
+
 /// D1 API raw query request (for batch operations)
 #[derive(Serialize)]
 struct D1RawRequest {
     sql: String,
 }
+
 /// D1 API response (for /query endpoint - results is an array of objects)
 #[derive(Deserialize)]
 struct D1Response {
@@ -193,6 +143,7 @@ struct D1Response {
     #[serde(default)]
     errors: Vec<D1Error>,
 }
+
 /// D1 query result (for /query endpoint - results is an array of row objects)
 #[derive(Deserialize, Default)]
 struct D1Result {
@@ -201,6 +152,7 @@ struct D1Result {
     #[serde(default)]
     meta: Option<D1Meta>,
 }
+
 /// D1 API response (for /raw endpoint - results has columns and rows arrays)
 #[derive(Deserialize)]
 struct D1ResponseRaw {
@@ -209,6 +161,7 @@ struct D1ResponseRaw {
     #[serde(default)]
     errors: Vec<D1Error>,
 }
+
 /// D1 query result (for /raw endpoint - results is an object with columns/rows)
 #[derive(Deserialize, Default)]
 struct D1ResultRaw {
@@ -217,6 +170,7 @@ struct D1ResultRaw {
     #[serde(default)]
     meta: Option<D1Meta>,
 }
+
 #[derive(Deserialize, Default)]
 struct D1ResultRawInner {
     #[serde(default)]
@@ -224,6 +178,7 @@ struct D1ResultRawInner {
     #[serde(default)]
     rows: Vec<Vec<serde_json::Value>>,
 }
+
 /// D1 result metadata
 #[derive(Deserialize, Default)]
 #[allow(dead_code)]
@@ -243,15 +198,18 @@ struct D1Meta {
     #[serde(default)]
     size_after: Option<u64>,
 }
+
 /// D1 API error
 #[derive(Deserialize)]
 struct D1Error {
     code: Option<i32>,
     message: String,
 }
-// ============================================================================
-// Query Interface Implementation
-// ============================================================================
+
+// ---------------------------------------------------------------------------
+// Conversion helpers
+// ---------------------------------------------------------------------------
+
 fn json_value_to_column_value(value: serde_json::Value) -> ColumnValue {
     match value {
         serde_json::Value::Null => ColumnValue::Null,
@@ -267,7 +225,6 @@ fn json_value_to_column_value(value: serde_json::Value) -> ColumnValue {
         }
         serde_json::Value::String(s) => ColumnValue::Text(s),
         serde_json::Value::Array(arr) => {
-            // Treat as blob if it looks like bytes
             ColumnValue::Blob(
                 arr.iter()
                     .filter_map(|v| v.as_u64().map(|n| n as u8))
@@ -277,6 +234,7 @@ fn json_value_to_column_value(value: serde_json::Value) -> ColumnValue {
         serde_json::Value::Object(_) => ColumnValue::Text(value.to_string()),
     }
 }
+
 fn column_value_to_json(value: ColumnValue) -> serde_json::Value {
     match value {
         ColumnValue::Null => serde_json::Value::Null,
@@ -292,54 +250,138 @@ fn column_value_to_json(value: ColumnValue) -> serde_json::Value {
         ),
     }
 }
-impl<'a> bindings::custom::cf_d1::query::Host for ActiveCtx<'a> {
+
+// ---------------------------------------------------------------------------
+// WIT types::Host — empty (all methods live on the resource)
+// ---------------------------------------------------------------------------
+
+impl<'a> bindings::custom::cf_d1::types::Host for ActiveCtx<'a> {}
+
+// ---------------------------------------------------------------------------
+// WIT query::Host — empty (resource lives in HostD1Client)
+// ---------------------------------------------------------------------------
+
+impl<'a> bindings::custom::cf_d1::query::Host for ActiveCtx<'a> {}
+
+// ---------------------------------------------------------------------------
+// WIT query::HostD1Client — resource constructor + methods
+// ---------------------------------------------------------------------------
+
+impl<'a> bindings::custom::cf_d1::query::HostD1Client for ActiveCtx<'a> {
+    async fn new(
+        &mut self,
+        config: Option<D1Config>,
+    ) -> wasmtime::Result<Resource<D1ClientHandle>> {
+        let Some(plugin) = self.get_plugin::<CloudflareD1>(PLUGIN_ID) else {
+            return Err(wasmtime::Error::msg("cf-d1 plugin not available"));
+        };
+
+        let component_id: Arc<str> = self.component_id.clone();
+        let lock = plugin.tracker.read().await;
+        let Some(data) = lock.get_component_data(&component_id) else {
+            return Err(wasmtime::Error::msg("component not tracked"));
+        };
+
+        let account_id = match resolve_field(
+            config.as_ref().map(|c| c.account_id.clone()),
+            &data.interface_config,
+            "account_id",
+        ) {
+            Ok(v) => v,
+            Err(_) => {
+                return Err(wasmtime::Error::msg(
+                    "missing account_id: provide via constructor or interface config",
+                ));
+            }
+        };
+
+        let api_token = match resolve_field(
+            config.as_ref().map(|c| c.api_token.clone()),
+            &data.interface_config,
+            "api_token",
+        ) {
+            Ok(v) => v,
+            Err(_) => {
+                return Err(wasmtime::Error::msg(
+                    "missing api_token: provide via constructor or interface config",
+                ));
+            }
+        };
+
+        let database_id = match resolve_field(
+            config.as_ref().map(|c| c.database_id.clone()),
+            &data.interface_config,
+            "database_id",
+        ) {
+            Ok(v) => v,
+            Err(_) => {
+                return Err(wasmtime::Error::msg(
+                    "missing database_id: provide via constructor or interface config",
+                ));
+            }
+        };
+
+        drop(lock);
+
+        // Build HTTP client with auth
+        let client = Client::builder()
+            .default_headers({
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert(
+                    reqwest::header::AUTHORIZATION,
+                    format!("Bearer {api_token}").parse()?,
+                );
+                headers.insert(reqwest::header::CONTENT_TYPE, "application/json".parse()?);
+                headers
+            })
+            .build()
+            .map_err(|e| wasmtime::Error::msg(format!("failed to create HTTP client: {e}")))?;
+
+        debug!(
+            account_id = %account_id,
+            database_id = %database_id,
+            "Created D1 client"
+        );
+
+        let handle = D1ClientHandle {
+            account_id,
+            database_id,
+            client,
+        };
+
+        let resource = self.table.push(handle)?;
+        Ok(resource)
+    }
+
     async fn query(
         &mut self,
+        handle: Resource<D1ClientHandle>,
         sql: String,
         params: Vec<ColumnValue>,
     ) -> wasmtime::Result<Result<QueryResult, QueryError>> {
         let Some(plugin) = self.get_plugin::<CloudflareD1>(PLUGIN_ID) else {
             return Ok(Err(QueryError::ConnectionError(
-                "Cloudflare D1 plugin not available".to_string(),
+                "cf-d1 plugin not available".to_string(),
             )));
         };
         plugin.record_query("query");
-        let workload_id = self.workload_id.as_ref().to_string();
-        // Get config
-        let configs = plugin.configs.read().await;
-        let config = match configs.get(&workload_id) {
-            Some(cfg) => cfg.clone(),
-            None => {
-                return Ok(Err(QueryError::ConnectionError(format!(
-                    "No D1 config found for workload '{}'",
-                    workload_id
-                ))));
-            }
-        };
-        drop(configs);
+
+        let h = self.table.get(&handle)?;
+        let config_account_id = h.account_id.clone();
+        let config_database_id = h.database_id.clone();
+        let client = h.client.clone();
+
         debug!(
-            workload_id = %workload_id,
-            database_id = %config.database_id,
+            database_id = %config_database_id,
             sql = %sql,
             params_count = params.len(),
             "Executing D1 query"
         );
-        // Get or create HTTP client
-        let client = match plugin.get_or_create_client(&workload_id).await {
-            Ok(c) => c,
-            Err(e) => {
-                return Ok(Err(QueryError::ConnectionError(format!(
-                    "Failed to create HTTP client: {}",
-                    e
-                ))));
-            }
-        };
-        // Build API URL
+
         let url = format!(
-            "https://api.cloudflare.com/client/v4/accounts/{}/d1/database/{}/query",
-            config.account_id, config.database_id
+            "https://api.cloudflare.com/client/v4/accounts/{config_account_id}/d1/database/{config_database_id}/query"
         );
-        // Convert params to JSON
+
         let json_params: Vec<serde_json::Value> =
             params.into_iter().map(column_value_to_json).collect();
         let request = D1QueryRequest {
@@ -350,13 +392,12 @@ impl<'a> bindings::custom::cf_d1::query::Host for ActiveCtx<'a> {
                 Some(json_params)
             },
         };
-        // Execute query
+
         let response = match client.post(&url).json(&request).send().await {
             Ok(r) => r,
             Err(e) => {
                 return Ok(Err(QueryError::ConnectionError(format!(
-                    "HTTP request failed: {}",
-                    e
+                    "HTTP request failed: {e}"
                 ))));
             }
         };
@@ -365,22 +406,21 @@ impl<'a> bindings::custom::cf_d1::query::Host for ActiveCtx<'a> {
             Ok(c) => c,
             Err(err) => {
                 return Ok(Err(QueryError::Unexpected(format!(
-                    "Read HTTP response failed: {}",
-                    err
+                    "Read HTTP response failed: {err}"
                 ))));
             }
         };
         debug!("d1 response status: {status_code}, content: {content}");
-        // Parse response
+
         let d1_response: D1Response = match serde_json::from_str(&content) {
             Ok(r) => r,
             Err(e) => {
                 return Ok(Err(QueryError::Unexpected(format!(
-                    "Failed to parse response: {}",
-                    e
+                    "Failed to parse response: {e}"
                 ))));
             }
         };
+
         if !d1_response.success {
             let error_msg = d1_response
                 .errors
@@ -389,11 +429,10 @@ impl<'a> bindings::custom::cf_d1::query::Host for ActiveCtx<'a> {
                 .unwrap_or_else(|| "Unknown D1 error".to_string());
             return Ok(Err(QueryError::DatabaseError(error_msg)));
         }
-        // Convert D1 result to our QueryResult
+
         let d1_result = d1_response.result.first();
         let (columns, rows, rows_affected, last_insert_rowid) = match d1_result {
             Some(result) => {
-                // Extract column names from first row (query endpoint returns array of objects)
                 let columns: Vec<ColumnMeta> = result
                     .results
                     .first()
@@ -401,12 +440,11 @@ impl<'a> bindings::custom::cf_d1::query::Host for ActiveCtx<'a> {
                         row.keys()
                             .map(|k| ColumnMeta {
                                 name: k.clone(),
-                                column_type: None, // D1 doesn't provide type info in results
+                                column_type: None,
                             })
                             .collect()
                     })
                     .unwrap_or_default();
-                // Convert rows (each row is a HashMap)
                 let rows = result
                     .results
                     .iter()
@@ -424,6 +462,7 @@ impl<'a> bindings::custom::cf_d1::query::Host for ActiveCtx<'a> {
             }
             None => (vec![], vec![], 0, None),
         };
+
         Ok(Ok(QueryResult {
             columns,
             rows,
@@ -431,58 +470,40 @@ impl<'a> bindings::custom::cf_d1::query::Host for ActiveCtx<'a> {
             last_insert_rowid,
         }))
     }
+
     async fn query_batch(
         &mut self,
+        handle: Resource<D1ClientHandle>,
         sql: String,
     ) -> wasmtime::Result<Result<Vec<QueryResult>, QueryError>> {
         let Some(plugin) = self.get_plugin::<CloudflareD1>(PLUGIN_ID) else {
             return Ok(Err(QueryError::ConnectionError(
-                "Cloudflare D1 plugin not available".to_string(),
+                "cf-d1 plugin not available".to_string(),
             )));
         };
         plugin.record_query("query_batch");
-        let workload_id = self.workload_id.as_ref().to_string();
-        // Get config
-        let configs = plugin.configs.read().await;
-        let config = match configs.get(&workload_id) {
-            Some(cfg) => cfg.clone(),
-            None => {
-                return Ok(Err(QueryError::ConnectionError(format!(
-                    "No D1 config found for workload '{}'",
-                    workload_id
-                ))));
-            }
-        };
-        drop(configs);
+
+        let h = self.table.get(&handle)?;
+        let config_account_id = h.account_id.clone();
+        let config_database_id = h.database_id.clone();
+        let client = h.client.clone();
+
         debug!(
-            workload_id = %workload_id,
-            database_id = %config.database_id,
+            database_id = %config_database_id,
             sql_len = sql.len(),
             "Executing D1 batch query"
         );
-        // Get or create HTTP client
-        let client = match plugin.get_or_create_client(&workload_id).await {
-            Ok(c) => c,
-            Err(e) => {
-                return Ok(Err(QueryError::ConnectionError(format!(
-                    "Failed to create HTTP client: {}",
-                    e
-                ))));
-            }
-        };
-        // Build API URL for raw endpoint
+
         let url = format!(
-            "https://api.cloudflare.com/client/v4/accounts/{}/d1/database/{}/raw",
-            config.account_id, config.database_id
+            "https://api.cloudflare.com/client/v4/accounts/{config_account_id}/d1/database/{config_database_id}/raw"
         );
         let request = D1RawRequest { sql };
-        // Execute query
+
         let response = match client.post(&url).json(&request).send().await {
             Ok(r) => r,
             Err(e) => {
                 return Ok(Err(QueryError::ConnectionError(format!(
-                    "HTTP request failed: {}",
-                    e
+                    "HTTP request failed: {e}"
                 ))));
             }
         };
@@ -491,22 +512,21 @@ impl<'a> bindings::custom::cf_d1::query::Host for ActiveCtx<'a> {
             Ok(c) => c,
             Err(err) => {
                 return Ok(Err(QueryError::Unexpected(format!(
-                    "Read HTTP response failed: {}",
-                    err
+                    "Read HTTP response failed: {err}"
                 ))));
             }
         };
         debug!("d1 response status: {status_code}, content: {content}");
-        // Parse response
+
         let d1_response: D1ResponseRaw = match serde_json::from_str(&content) {
             Ok(r) => r,
             Err(e) => {
                 return Ok(Err(QueryError::Unexpected(format!(
-                    "Failed to parse response: {}",
-                    e
+                    "Failed to parse response: {e}"
                 ))));
             }
         };
+
         if !d1_response.success {
             let error_msg = d1_response
                 .errors
@@ -515,7 +535,7 @@ impl<'a> bindings::custom::cf_d1::query::Host for ActiveCtx<'a> {
                 .unwrap_or_else(|| "Unknown D1 error".to_string());
             return Ok(Err(QueryError::DatabaseError(error_msg)));
         }
-        // Convert all D1 results
+
         let results: Vec<QueryResult> = d1_response
             .result
             .iter()
@@ -551,159 +571,142 @@ impl<'a> bindings::custom::cf_d1::query::Host for ActiveCtx<'a> {
                 }
             })
             .collect();
+
         Ok(Ok(results))
     }
+
     async fn query_one(
         &mut self,
+        handle: Resource<D1ClientHandle>,
         sql: String,
         params: Vec<ColumnValue>,
     ) -> wasmtime::Result<Result<Option<ResultRow>, QueryError>> {
-        // Execute normal query and return first row
-        let result = self.query(sql, params).await?;
+        let result = self.query(handle, sql, params).await?;
         match result {
             Ok(query_result) => Ok(Ok(query_result.rows.into_iter().next())),
             Err(e) => Ok(Err(e)),
         }
     }
+
+    async fn stop(
+        &mut self,
+        _handle: Resource<D1ClientHandle>,
+    ) -> wasmtime::Result<Result<(), QueryError>> {
+        // No-op: D1 has no background tasks
+        Ok(Ok(()))
+    }
+
+    async fn drop(
+        &mut self,
+        rep: Resource<D1ClientHandle>,
+    ) -> wasmtime::Result<()> {
+        // Just remove from the table, no cleanup needed
+        let _ = self.table.delete(rep);
+        Ok(())
+    }
 }
+
+// ---------------------------------------------------------------------------
+// HostPlugin implementation
+// ---------------------------------------------------------------------------
+
 #[async_trait]
 impl HostPlugin for CloudflareD1 {
     fn id(&self) -> &'static str {
         PLUGIN_ID
     }
+
     fn world(&self) -> WitWorld {
         WitWorld {
             exports: HashSet::from([WitInterface::from("custom:cf-d1/query@0.1.0")]),
             ..Default::default()
         }
     }
+
     async fn on_workload_item_bind<'a>(
         &self,
-        component_handle: &mut WorkloadItem<'a>,
+        item: &mut WorkloadItem<'a>,
         interfaces: HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
-        // Find the cf:d1 interface
-        let d1_interface = interfaces
+        let Some(interface) = interfaces
             .iter()
-            .find(|i| i.namespace == "custom" && i.package == "cf-d1");
-        let Some(interface) = d1_interface else {
+            .find(|i| i.namespace == "custom" && i.package == "cf-d1")
+        else {
             tracing::warn!(
                 "CloudflareD1 plugin requested for non-cf:d1 interface(s): {:?}",
                 interfaces
             );
             return Ok(());
         };
-        let workload_id = component_handle.workload_id().to_string();
-        // Extract config from interface
-        let account_id = interface
-            .config
-            .get("account_id")
-            .cloned()
-            .unwrap_or_else(|| {
-                tracing::error!(
-                    workload_id = %workload_id,
-                    "No 'account_id' configured for cf:d1 interface"
-                );
-                String::new()
-            });
-        let api_token = interface
-            .config
-            .get("api_token")
-            .cloned()
-            .unwrap_or_else(|| {
-                tracing::error!(
-                    workload_id = %workload_id,
-                    "No 'api_token' configured for cf:d1 endpoint"
-                );
-                String::new()
-            });
-        let database_id = interface
-            .config
-            .get("database_id")
-            .cloned()
-            .unwrap_or_else(|| {
-                tracing::error!(
-                    workload_id = %workload_id,
-                    "No 'database_id' configured for cf:d1 interface"
-                );
-                String::new()
-            });
-        if account_id.is_empty() || api_token.is_empty() || database_id.is_empty() {
-            tracing::error!(
-                workload_id = %workload_id,
-                "Cloudflare D1 plugin bound with incomplete config. \
-                 Required: account_id, api_token, database_id"
-            );
-        }
-        debug!(
-            workload_id = %workload_id,
-            account_id = %account_id,
-            database_id = %database_id,
-            "Configuring Cloudflare D1 for workload"
+
+        let interface_config = interface.config.clone();
+
+        bindings::custom::cf_d1::types::add_to_linker::<_, SharedCtx>(
+            item.linker(),
+            extract_active_ctx,
+        )?;
+        bindings::custom::cf_d1::query::add_to_linker::<_, SharedCtx>(
+            item.linker(),
+            extract_active_ctx,
+        )?;
+
+        let WorkloadItem::Component(component_handle) = item else {
+            return Ok(());
+        };
+
+        debug!(component_id = component_handle.id(), "CloudflareD1 plugin bound to component");
+
+        self.tracker.write().await.add_component(
+            component_handle,
+            ComponentData { interface_config },
         );
-        // Save the config for this workload
-        {
-            let mut configs = self.configs.write().await;
-            configs.insert(
-                workload_id.clone(),
-                CloudflareD1Config {
-                    account_id,
-                    api_token,
-                    database_id,
-                },
-            );
-        }
-        debug!(
-            workload_id = %workload_id,
-            "Adding Cloudflare D1 query interface to linker for workload"
-        );
-        let linker = component_handle.linker();
-        bindings::custom::cf_d1::query::add_to_linker::<_, SharedCtx>(linker, extract_active_ctx)?;
-        debug!("CloudflareD1 plugin bound to workload '{workload_id}'");
+
         Ok(())
     }
+
     async fn on_workload_unbind(
         &self,
         workload_id: &str,
         _interfaces: HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
-        // Clean up the config and client for this workload
-        {
-            let mut configs = self.configs.write().await;
-            configs.remove(workload_id);
-        }
-        {
-            let mut clients = self.clients.write().await;
-            clients.remove(workload_id);
-        }
-        debug!("CloudflareD1 plugin unbound from workload '{workload_id}'");
+        self.tracker
+            .write()
+            .await
+            .remove_workload_with_cleanup(workload_id, |_| async {}, |_| async {})
+            .await;
+        debug!(workload_id = %workload_id, "CloudflareD1 plugin unbound");
         Ok(())
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn test_plugin_id() {
         let plugin = CloudflareD1::new();
         assert_eq!(plugin.id(), PLUGIN_ID);
     }
+
     #[test]
     fn test_world_imports() {
         let plugin = CloudflareD1::new();
         let world = plugin.world();
         assert!(
             world
-                .imports
+                .exports
                 .iter()
                 .any(|i| i.namespace == "custom" && i.package == "cf-d1")
         );
     }
+
     #[test]
     fn test_default() {
         let plugin = CloudflareD1::default();
         assert_eq!(plugin.id(), PLUGIN_ID);
     }
+
     #[test]
     fn test_json_value_to_column_value() {
         assert!(matches!(
@@ -727,6 +730,7 @@ mod tests {
             ColumnValue::Text(s) if s == "hello"
         ));
     }
+
     #[test]
     fn test_column_value_to_json() {
         assert_eq!(
