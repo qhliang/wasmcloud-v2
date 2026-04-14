@@ -7,6 +7,10 @@ interface types {
         not-ready(string),
     }
 
+    record telegram-config {
+        bot-token: string,
+    }
+
     record telegram-message {
         message-id: string,
         chat-id: string,
@@ -18,18 +22,21 @@ interface types {
 }
 
 interface sender {
-    use types.{telegram-error};
+    use types.{telegram-error, telegram-config};
 
-    /// Send a text message to a chat.
-    send-text: func(chat-id: string, text: string) -> result<_, telegram-error>;
-
-    /// Send a media file to a chat.
-    send-media: func(chat-id: string, file-path: string, caption: option<string>) -> result<_, telegram-error>;
+    resource telegram-bot {
+        constructor(config: option<telegram-config>);
+        send-text: func(chat-id: string, text: string) -> result<_, telegram-error>;
+        send-media: func(chat-id: string, file-path: string, caption: option<string>) -> result<_, telegram-error>;
+        stop: func() -> result<_, telegram-error>;
+    }
 }
 
 interface handler {
     use types.{telegram-message};
+    use sender.{telegram-bot};
 
-    /// Called by the host when a Telegram message is received.
-    on-message: func(msg: telegram-message) -> result<_, string>;
+    /// Called by the host when a Telegram message arrives.
+    /// Passes the bot instance that received the message.
+    on-message: func(bot: borrow<telegram-bot>, msg: telegram-message) -> result<_, string>;
 }

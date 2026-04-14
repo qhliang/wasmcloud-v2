@@ -74,6 +74,7 @@ impl bindings::exports::custom::dingtalk_stream::handler::Guest for CustomHandle
 
 impl bindings::exports::custom::telegram::handler::Guest for CustomHandler {
     fn on_message(
+        _bot: &bindings::custom::telegram::sender::TelegramBot,
         msg: bindings::exports::custom::telegram::handler::TelegramMessage,
     ) -> Result<(), String> {
         log(

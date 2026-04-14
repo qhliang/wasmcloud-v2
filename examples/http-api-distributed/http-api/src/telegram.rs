@@ -1,4 +1,4 @@
-use crate::bindings::custom::telegram::sender;
+use crate::bindings::custom::telegram::sender::TelegramBot;
 use crate::bindings::custom::telegram::types::TelegramError;
 use crate::bindings::wasi::logging::logging::{Level, log};
 use crate::{LOG_CTX, helpers, templates};
@@ -36,7 +36,8 @@ pub async fn send_text(mut req: Request<Body>) -> anyhow::Result<Response<Body>>
         LOG_CTX,
         &format!("TELEGRAM SEND TEXT: chat_id={}", body.chat_id),
     );
-    match sender::send_text(&body.chat_id, &body.text) {
+    let bot = TelegramBot::new(None);
+    match bot.send_text(&body.chat_id, &body.text) {
         Ok(()) => {
             log(Level::Info, LOG_CTX, "TELEGRAM SEND TEXT OK");
             helpers::json_response("{\"ok\":true}")
@@ -59,7 +60,8 @@ pub async fn send_media(mut req: Request<Body>) -> anyhow::Result<Response<Body>
         LOG_CTX,
         &format!("TELEGRAM SEND MEDIA: chat_id={}", body.chat_id),
     );
-    match sender::send_media(&body.chat_id, &body.file_path, body.caption.as_deref()) {
+    let bot = TelegramBot::new(None);
+    match bot.send_media(&body.chat_id, &body.file_path, body.caption.as_deref()) {
         Ok(()) => {
             log(Level::Info, LOG_CTX, "TELEGRAM SEND MEDIA OK");
             helpers::json_response("{\"ok\":true}")
