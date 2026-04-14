@@ -2,14 +2,5 @@ package my:feishu;
 
 world feishu {
     import custom:feishu/sender@0.1.0;
-    import custom:feishu/contact-sender@0.1.0;
-    import custom:feishu/group-sender@0.1.0;
-    import custom:feishu/ai-sender@0.1.0;
-    import custom:feishu/calendar-sender@0.1.0;
-    import custom:feishu/cardkit-sender@0.1.0;
-    import custom:feishu/mail-sender@0.1.0;
-    import custom:feishu/task-sender@0.1.0;
-    import custom:feishu/bot-sender@0.1.0;
-    import custom:feishu/docs-sender@0.1.0;
     export custom:feishu/handler@0.1.0;
 }

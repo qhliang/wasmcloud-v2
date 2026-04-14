@@ -1,68 +1,55 @@
-//! # Feishu (Lark) Host Plugin
+//! # Feishu (Lark) Host Plugin (Resource-based)
 //!
-//! This plugin provides Feishu IM messaging and full platform API access to WASM
-//! components via the WebSocket long-connection (长连接) mode using the `open-lark` SDK.
+//! All 10 sender interfaces collapsed into one `feishu-client` resource with ~35 methods.
+//! Config sources (priority):
+//! 1. Wasm dynamic config (passed via resource constructor)
+//! 2. Static interface config (fallback from wasmcloud config)
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use tokio::sync::RwLock;
-use tracing::{debug, warn};
-
-use anyhow::Context as _;
-
+use tracing::{debug, instrument, warn};
 use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
-use wash_runtime::engine::workload::{ResolvedWorkload, WorkloadItem};
-use wash_runtime::plugin::HostPlugin;
-use wash_runtime::plugin::WorkloadTracker;
+use wash_runtime::engine::workload::ResolvedWorkload;
+use wash_runtime::plugin::config::resolve_field;
+use wash_runtime::plugin::{HostPlugin, WorkloadTracker};
 use wash_runtime::wit::{WitInterface, WitWorld};
+use wasmtime::component::Resource;
 
 mod bindings {
     wasmtime::component::bindgen!({
         world: "feishu",
-        imports: { default: async | trappable | tracing },
-        exports: { default: async | tracing },
+        imports: {
+            default: async | trappable | tracing,
+        },
+        with: {
+            "custom:feishu/sender.feishu-client": super::FeishuClientHandle,
+        },
     });
 }
 
-// Feature modules — each implements the corresponding WIT Host trait.
-mod r#ai;
-mod r#bot;
-mod calendar;
-mod cardkit;
-mod contact;
-mod docs;
-mod group;
-mod http;
-mod im;
-mod mail;
-mod task;
-
-use bindings::custom::feishu::types::FeishuError;
+use bindings::custom::feishu::types::{FeishuConfig, FeishuError, ImMessage};
 
 pub(crate) const PLUGIN_ID: &str = "feishu";
 
 // ---------------------------------------------------------------------------
-// Per-component data
+// Types
 // ---------------------------------------------------------------------------
 
-/// Configuration extracted from interface config.
-#[derive(Clone, Debug)]
-pub(crate) struct PluginConfig {
-    pub app_id: String,
-    pub app_secret: String,
+/// Host-side state for a feishu-client resource instance.
+pub struct FeishuClientHandle {
+    pub client: Arc<open_lark::prelude::LarkClient>,
+    pub cancel_token: tokio_util::sync::CancellationToken,
 }
 
-/// Per-component data tracked by the plugin.
-pub(crate) struct ComponentData {
-    /// Token that cancels the Feishu WebSocket background task.
-    pub cancel_token: tokio_util::sync::CancellationToken,
-    /// Resolved workload — set during on_workload_resolved.
-    pub workload: Option<ResolvedWorkload>,
-    /// The open-lark LarkClient for sending messages.
-    pub client: Option<Arc<open_lark::prelude::LarkClient>>,
-    /// Plugin config.
-    pub config: PluginConfig,
+/// Per-component data.
+struct ComponentData {
+    /// Static interface config from wasmcloud config (fallback source)
+    interface_config: HashMap<String, String>,
+    /// Resolved workload
+    workload: Option<ResolvedWorkload>,
 }
 
 // ---------------------------------------------------------------------------
@@ -89,16 +76,50 @@ impl Feishu {
 }
 
 // ---------------------------------------------------------------------------
-// Config parsing
+// WIT types::Host
 // ---------------------------------------------------------------------------
 
-fn extract_config(interface_config: &HashMap<String, String>) -> Option<PluginConfig> {
-    let app_id = interface_config.get("app-id")?;
-    let app_secret = interface_config.get("app-secret")?;
-    Some(PluginConfig {
-        app_id: app_id.clone(),
-        app_secret: app_secret.clone(),
-    })
+impl<'a> bindings::custom::feishu::types::Host for ActiveCtx<'a> {}
+
+// ---------------------------------------------------------------------------
+// WIT sender::Host — empty (resource lives in HostFeishuClient)
+// ---------------------------------------------------------------------------
+
+impl<'a> bindings::custom::feishu::sender::Host for ActiveCtx<'a> {}
+
+// ---------------------------------------------------------------------------
+// HTTP helpers
+// ---------------------------------------------------------------------------
+
+mod http;
+
+async fn get_tenant_token(
+    client: &open_lark::prelude::LarkClient,
+) -> Result<String, FeishuError> {
+    let token_manager = client.config.token_manager.lock().await;
+    token_manager
+        .get_tenant_access_token(&client.config, "", "", &client.config.app_ticket_manager)
+        .await
+        .map_err(|e| FeishuError::AuthFailed(e.to_string()))
+}
+
+fn build_query_string(params: &serde_json::Value) -> String {
+    params
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| format!("{k}={s}")))
+                .collect::<Vec<_>>()
+                .join("&")
+        })
+        .unwrap_or_default()
+}
+
+/// Helper: get tenant token from a resource handle.
+async fn token_from_handle(
+    handle: &FeishuClientHandle,
+) -> Result<String, FeishuError> {
+    get_tenant_token(&handle.client).await
 }
 
 // ---------------------------------------------------------------------------
@@ -108,26 +129,15 @@ fn extract_config(interface_config: &HashMap<String, String>) -> Option<PluginCo
 fn spawn_feishu_ws(
     workload: ResolvedWorkload,
     component_id: String,
-    config: PluginConfig,
+    client: Arc<open_lark::prelude::LarkClient>,
     cancel_token: tokio_util::sync::CancellationToken,
-) -> Arc<open_lark::prelude::LarkClient> {
+) {
     use open_lark::prelude::*;
 
-    let client = Arc::new(
-        LarkClient::builder(&config.app_id, &config.app_secret)
-            .with_app_type(AppType::SelfBuild)
-            .with_enable_token_cache(true)
-            .build(),
-    );
-
     let shared_config = Arc::new(client.config.clone());
-
     let workload = Arc::new(workload);
     let cid = component_id.clone();
 
-    // EventDispatcherHandler contains `Box<dyn EventHandler>` which is not
-    // Send+Sync, so we must construct it **inside** the dedicated thread to
-    // avoid crossing the Send boundary.
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -163,7 +173,7 @@ fn spawn_feishu_ws(
                     None
                 };
 
-                let im_msg = bindings::custom::feishu::types::ImMessage {
+                let im_msg = ImMessage {
                     message_id: msg.message_id.clone(),
                     chat_id: msg.chat_id.clone(),
                     sender_id: sender.sender_id.open_id.clone(),
@@ -183,12 +193,26 @@ fn spawn_feishu_ws(
 
                 let workload = workload.clone();
                 let cid = cid.clone();
+                let client = client.clone();
 
                 tokio::spawn(async move {
                     let mut store = match workload.new_store(&cid).await {
                         Ok(s) => s,
                         Err(e) => {
                             warn!(component_id = %cid, error = %e, "Failed to create store for Feishu callback");
+                            return;
+                        }
+                    };
+
+                    // Temporary client handle for the callback — guest can call methods on it
+                    let temp_handle = FeishuClientHandle {
+                        client,
+                        cancel_token: tokio_util::sync::CancellationToken::new(),
+                    };
+                    let client_resource = match store.data_mut().table.push(temp_handle) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!(component_id = %cid, error = %e, "Failed to push client resource for callback");
                             return;
                         }
                     };
@@ -217,7 +241,7 @@ fn spawn_feishu_ws(
                         }
                     };
 
-                    match proxy.custom_feishu_handler().call_on_message(&mut store, &im_msg).await {
+                    match proxy.custom_feishu_handler().call_on_message(&mut store, client_resource, &im_msg) {
                         Ok(Ok(())) => {
                             debug!(component_id = %cid, "Guest on-message handled successfully");
                         }
@@ -263,75 +287,1001 @@ fn spawn_feishu_ws(
             }
         });
     });
-
-    client
 }
 
 // ---------------------------------------------------------------------------
-// WIT types::Host
+// WIT sender::HostFeishuClient — resource constructor + all methods
 // ---------------------------------------------------------------------------
 
-impl bindings::custom::feishu::types::Host for ActiveCtx<'_> {}
+impl<'a> bindings::custom::feishu::sender::HostFeishuClient for ActiveCtx<'a> {
+    async fn new(
+        &mut self,
+        config: Option<FeishuConfig>,
+    ) -> wasmtime::Result<Resource<FeishuClientHandle>> {
+        let Some(plugin) = self.get_plugin::<Feishu>(PLUGIN_ID) else {
+            return Err(wasmtime::Error::msg("feishu plugin not available"));
+        };
 
-// ---------------------------------------------------------------------------
-// Helper: get tenant access token
-// ---------------------------------------------------------------------------
+        let component_id: Arc<str> = self.component_id.clone();
+        let lock = plugin.tracker.read().await;
+        let Some(data) = lock.get_component_data(&component_id) else {
+            return Err(wasmtime::Error::msg("component not tracked"));
+        };
 
-pub(crate) async fn get_tenant_token(
-    client: &open_lark::prelude::LarkClient,
-) -> Result<String, FeishuError> {
-    let token_manager = client.config.token_manager.lock().await;
-    token_manager
-        .get_tenant_access_token(&client.config, "", "", &client.config.app_ticket_manager)
-        .await
-        .map_err(|e| FeishuError::AuthFailed(e.to_string()))
-}
+        let app_id = match resolve_field(
+            config.as_ref().map(|c| c.app_id.clone()),
+            &data.interface_config,
+            "app-id",
+        ) {
+            Ok(v) => v,
+            Err(_) => {
+                return Err(wasmtime::Error::msg(
+                    "missing app-id: provide via constructor or interface config",
+                ));
+            }
+        };
 
-// ---------------------------------------------------------------------------
-// Helper: get client from plugin tracker
-// ---------------------------------------------------------------------------
+        let app_secret = match resolve_field(
+            config.as_ref().map(|c| c.app_secret.clone()),
+            &data.interface_config,
+            "app-secret",
+        ) {
+            Ok(v) => v,
+            Err(_) => {
+                return Err(wasmtime::Error::msg(
+                    "missing app-secret: provide via constructor or interface config",
+                ));
+            }
+        };
 
-pub(crate) async fn get_client(
-    plugin: &Feishu,
-    component_id: &str,
-) -> Result<Arc<open_lark::prelude::LarkClient>, FeishuError> {
-    let lock = plugin.tracker.read().await;
-    match lock.get_component_data(component_id) {
-        Some(data) => match &data.client {
-            Some(c) => Ok(c.clone()),
-            None => Err(FeishuError::Internal(
-                "Feishu client not initialized".to_string(),
-            )),
-        },
-        None => Err(FeishuError::Internal("component not tracked".to_string())),
+        let Some(workload) = &data.workload else {
+            return Err(wasmtime::Error::msg("workload not resolved yet"));
+        };
+
+        let workload = workload.clone();
+        drop(lock);
+
+        use open_lark::prelude::*;
+
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        let client = Arc::new(
+            LarkClient::builder(&app_id, &app_secret)
+                .with_app_type(AppType::SelfBuild)
+                .with_enable_token_cache(true)
+                .build(),
+        );
+
+        spawn_feishu_ws(
+            workload,
+            component_id.to_string(),
+            client.clone(),
+            cancel_token.clone(),
+        );
+
+        let handle = FeishuClientHandle {
+            client,
+            cancel_token,
+        };
+
+        let resource = self.table.push(handle)?;
+        Ok(resource)
     }
-}
 
-// ---------------------------------------------------------------------------
-// Macro: add all feishu interfaces to linker
-// ---------------------------------------------------------------------------
+    // -- IM --
 
-macro_rules! add_all_feishu_linkers {
-    ($linker:expr, $ctx_fn:expr) => {{
-        bindings::custom::feishu::types::add_to_linker::<_, SharedCtx>($linker, $ctx_fn)?;
-        bindings::custom::feishu::sender::add_to_linker::<_, SharedCtx>($linker, $ctx_fn)?;
-        bindings::custom::feishu::contact_sender::add_to_linker::<_, SharedCtx>($linker, $ctx_fn)?;
-        bindings::custom::feishu::group_sender::add_to_linker::<_, SharedCtx>($linker, $ctx_fn)?;
-        bindings::custom::feishu::ai_sender::add_to_linker::<_, SharedCtx>($linker, $ctx_fn)?;
-        bindings::custom::feishu::calendar_sender::add_to_linker::<_, SharedCtx>($linker, $ctx_fn)?;
-        bindings::custom::feishu::cardkit_sender::add_to_linker::<_, SharedCtx>($linker, $ctx_fn)?;
-        bindings::custom::feishu::mail_sender::add_to_linker::<_, SharedCtx>($linker, $ctx_fn)?;
-        bindings::custom::feishu::task_sender::add_to_linker::<_, SharedCtx>($linker, $ctx_fn)?;
-        bindings::custom::feishu::bot_sender::add_to_linker::<_, SharedCtx>($linker, $ctx_fn)?;
-        bindings::custom::feishu::docs_sender::add_to_linker::<_, SharedCtx>($linker, $ctx_fn)?;
-    }};
+    #[instrument(skip_all)]
+    async fn send_text(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        chat_id: String,
+        content: String,
+    ) -> wasmtime::Result<Result<(), FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let msg = open_lark::service::im::v1::message::MessageText::new(&content);
+        let request = open_lark::service::im::v1::message::CreateMessageRequest::with_msg(
+            &chat_id, msg, "chat_id",
+        );
+        match h.client.im.v1.message.create(request, None).await {
+            Ok(_) => Ok(Ok(())),
+            Err(e) => Ok(Err(FeishuError::SendFailed(e.to_string()))),
+        }
+    }
+
+    #[instrument(skip_all)]
+    async fn send_text_to_user(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        receive_id: String,
+        receive_id_type: String,
+        content: String,
+    ) -> wasmtime::Result<Result<(), FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let msg = open_lark::service::im::v1::message::MessageText::new(&content);
+        let request = open_lark::service::im::v1::message::CreateMessageRequest::with_msg(
+            &receive_id,
+            msg,
+            &receive_id_type,
+        );
+        match h.client.im.v1.message.create(request, None).await {
+            Ok(_) => Ok(Ok(())),
+            Err(e) => Ok(Err(FeishuError::SendFailed(e.to_string()))),
+        }
+    }
+
+    #[instrument(skip_all)]
+    async fn reply_message(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        message_id: String,
+        content: String,
+    ) -> wasmtime::Result<Result<(), FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let msg = open_lark::service::im::v1::message::MessageText::new(&content);
+        let request =
+            open_lark::service::im::v1::message::CreateMessageRequest::with_msg("", msg, "");
+        match h.client.im.v1.message.reply(&message_id, request, None).await {
+            Ok(_) => Ok(Ok(())),
+            Err(e) => Ok(Err(FeishuError::SendFailed(e.to_string()))),
+        }
+    }
+
+    #[instrument(skip_all)]
+    async fn get_access_token(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        Ok(token_from_handle(h).await)
+    }
+
+    // -- Contact --
+
+    #[instrument(skip_all)]
+    async fn get_user(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        user_id: String,
+        user_id_type: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let req = open_lark::service::contact::v3::user::GetUserRequest {
+            user_id_type: Some(user_id_type),
+            ..Default::default()
+        };
+        match h.client.contact.v3.user.get(&user_id, &req).await {
+            Ok(resp) => Ok(serde_json::to_string(&resp)
+                .map_err(|e| FeishuError::Internal(e.to_string()))),
+            Err(e) => Ok(Err(FeishuError::Internal(e.to_string()))),
+        }
+    }
+
+    #[instrument(skip_all)]
+    async fn batch_get_users(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        request_json: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let req: open_lark::service::contact::v3::user::BatchGetUsersRequest =
+            match serde_json::from_str(&request_json) {
+                Ok(r) => r,
+                Err(e) => return Ok(Err(FeishuError::Internal(e.to_string()))),
+            };
+        match h.client.contact.v3.user.batch(&req).await {
+            Ok(resp) => Ok(serde_json::to_string(&resp)
+                .map_err(|e| FeishuError::Internal(e.to_string()))),
+            Err(e) => Ok(Err(FeishuError::Internal(e.to_string()))),
+        }
+    }
+
+    #[instrument(skip_all)]
+    async fn search_users(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        request_json: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let req: open_lark::service::contact::v3::user::SearchUsersRequest =
+            match serde_json::from_str(&request_json) {
+                Ok(r) => r,
+                Err(e) => return Ok(Err(FeishuError::Internal(e.to_string()))),
+            };
+        match h.client.contact.v3.user.search(&req).await {
+            Ok(resp) => Ok(serde_json::to_string(&resp)
+                .map_err(|e| FeishuError::Internal(e.to_string()))),
+            Err(e) => Ok(Err(FeishuError::Internal(e.to_string()))),
+        }
+    }
+
+    #[instrument(skip_all)]
+    async fn list_department_users(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        request_json: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let req: open_lark::service::contact::v3::user::FindUsersByDepartmentRequest =
+            match serde_json::from_str(&request_json) {
+                Ok(r) => r,
+                Err(e) => return Ok(Err(FeishuError::Internal(e.to_string()))),
+            };
+        match h.client.contact.v3.user.find_by_department(&req).await {
+            Ok(resp) => Ok(serde_json::to_string(&resp)
+                .map_err(|e| FeishuError::Internal(e.to_string()))),
+            Err(e) => Ok(Err(FeishuError::Internal(e.to_string()))),
+        }
+    }
+
+    #[instrument(skip_all)]
+    async fn get_department(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        department_id: String,
+        department_id_type: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let req = open_lark::service::contact::v3::department::GetDepartmentRequest {
+            user_id_type: Some("open_id".to_string()),
+            department_id_type: Some(department_id_type),
+        };
+        match h.client.contact.v3.department.get(&department_id, &req).await {
+            Ok(resp) => Ok(serde_json::to_string(&resp)
+                .map_err(|e| FeishuError::Internal(e.to_string()))),
+            Err(e) => Ok(Err(FeishuError::Internal(e.to_string()))),
+        }
+    }
+
+    #[instrument(skip_all)]
+    async fn list_sub_departments(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        request_json: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let req: open_lark::service::contact::v3::department::GetChildrenDepartmentsRequest =
+            match serde_json::from_str(&request_json) {
+                Ok(r) => r,
+                Err(e) => return Ok(Err(FeishuError::Internal(e.to_string()))),
+            };
+        match h.client.contact.v3.department.children(&req).await {
+            Ok(resp) => Ok(serde_json::to_string(&resp)
+                .map_err(|e| FeishuError::Internal(e.to_string()))),
+            Err(e) => Ok(Err(FeishuError::Internal(e.to_string()))),
+        }
+    }
+
+    // -- Group --
+
+    #[instrument(skip_all)]
+    async fn create_group(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        request_json: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let token = match token_from_handle(h).await {
+            Ok(t) => t,
+            Err(e) => return Ok(Err(e)),
+        };
+        Ok(http::feishu_post(
+            &token,
+            "https://open.feishu.cn/open-apis/im/v1/chats",
+            request_json,
+        )
+        .await)
+    }
+
+    #[instrument(skip_all)]
+    async fn get_group(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        chat_id: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let token = match token_from_handle(h).await {
+            Ok(t) => t,
+            Err(e) => return Ok(Err(e)),
+        };
+        Ok(http::feishu_get(
+            &token,
+            &format!("https://open.feishu.cn/open-apis/im/v1/chats/{chat_id}"),
+        )
+        .await)
+    }
+
+    #[instrument(skip_all)]
+    async fn update_group(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        chat_id: String,
+        request_json: String,
+    ) -> wasmtime::Result<Result<(), FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let token = match token_from_handle(h).await {
+            Ok(t) => t,
+            Err(e) => return Ok(Err(e)),
+        };
+        Ok(http::feishu_put(
+            &token,
+            &format!("https://open.feishu.cn/open-apis/im/v1/chats/{chat_id}"),
+            request_json,
+        )
+        .await)
+    }
+
+    #[instrument(skip_all)]
+    async fn add_group_members(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        chat_id: String,
+        request_json: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let token = match token_from_handle(h).await {
+            Ok(t) => t,
+            Err(e) => return Ok(Err(e)),
+        };
+        Ok(http::feishu_post(
+            &token,
+            &format!("https://open.feishu.cn/open-apis/im/v1/chats/{chat_id}/members"),
+            request_json,
+        )
+        .await)
+    }
+
+    #[instrument(skip_all)]
+    async fn remove_group_members(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        chat_id: String,
+        request_json: String,
+    ) -> wasmtime::Result<Result<(), FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let token = match token_from_handle(h).await {
+            Ok(t) => t,
+            Err(e) => return Ok(Err(e)),
+        };
+        Ok(http::feishu_delete(
+            &token,
+            &format!("https://open.feishu.cn/open-apis/im/v1/chats/{chat_id}/members"),
+            Some(request_json),
+        )
+        .await)
+    }
+
+    #[instrument(skip_all)]
+    async fn list_group_members(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        chat_id: String,
+        request_json: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let token = match token_from_handle(h).await {
+            Ok(t) => t,
+            Err(e) => return Ok(Err(e)),
+        };
+        let params: serde_json::Value = serde_json::from_str(&request_json)
+            .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+        let query = build_query_string(&params);
+        let url = if query.is_empty() {
+            format!("https://open.feishu.cn/open-apis/im/v1/chats/{chat_id}/members")
+        } else {
+            format!("https://open.feishu.cn/open-apis/im/v1/chats/{chat_id}/members?{query}")
+        };
+        Ok(http::feishu_get(&token, &url).await)
+    }
+
+    // -- AI --
+
+    #[instrument(skip_all)]
+    async fn recognize_text(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        request_json: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let token = match token_from_handle(h).await {
+            Ok(t) => t,
+            Err(e) => return Ok(Err(e)),
+        };
+        Ok(http::feishu_post(
+            &token,
+            "https://open.feishu.cn/open-apis/optical_char_recognition/v1/image/basic_recognize",
+            request_json,
+        )
+        .await)
+    }
+
+    #[instrument(skip_all)]
+    async fn translate(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        request_json: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let token = match token_from_handle(h).await {
+            Ok(t) => t,
+            Err(e) => return Ok(Err(e)),
+        };
+        Ok(http::feishu_post(
+            &token,
+            "https://open.feishu.cn/open-apis/translation/v1/text/translate",
+            request_json,
+        )
+        .await)
+    }
+
+    // -- Calendar --
+
+    #[instrument(skip_all)]
+    async fn list_calendars(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        request_json: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let token = match token_from_handle(h).await {
+            Ok(t) => t,
+            Err(e) => return Ok(Err(e)),
+        };
+        let params: serde_json::Value = serde_json::from_str(&request_json)
+            .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+        let query = build_query_string(&params);
+        let url = format!(
+            "https://open.feishu.cn/open-apis/calendar/v4/calendars{}",
+            if query.is_empty() {
+                String::new()
+            } else {
+                format!("?{query}")
+            }
+        );
+        Ok(http::feishu_get(&token, &url).await)
+    }
+
+    #[instrument(skip_all)]
+    async fn create_calendar_event(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        calendar_id: String,
+        request_json: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let token = match token_from_handle(h).await {
+            Ok(t) => t,
+            Err(e) => return Ok(Err(e)),
+        };
+        Ok(http::feishu_post(
+            &token,
+            &format!("https://open.feishu.cn/open-apis/calendar/v4/calendars/{calendar_id}/events"),
+            request_json,
+        )
+        .await)
+    }
+
+    #[instrument(skip_all)]
+    async fn list_calendar_events(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        calendar_id: String,
+        request_json: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let token = match token_from_handle(h).await {
+            Ok(t) => t,
+            Err(e) => return Ok(Err(e)),
+        };
+        let params: serde_json::Value = serde_json::from_str(&request_json)
+            .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+        let query = build_query_string(&params);
+        let url = format!(
+            "https://open.feishu.cn/open-apis/calendar/v4/calendars/{calendar_id}/events{}",
+            if query.is_empty() {
+                String::new()
+            } else {
+                format!("?{query}")
+            }
+        );
+        Ok(http::feishu_get(&token, &url).await)
+    }
+
+    #[instrument(skip_all)]
+    async fn get_calendar_event(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        calendar_id: String,
+        event_id: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let token = match token_from_handle(h).await {
+            Ok(t) => t,
+            Err(e) => return Ok(Err(e)),
+        };
+        Ok(http::feishu_get(
+            &token,
+            &format!(
+                "https://open.feishu.cn/open-apis/calendar/v4/calendars/{calendar_id}/events/{event_id}"
+            ),
+        )
+        .await)
+    }
+
+    #[instrument(skip_all)]
+    async fn delete_calendar_event(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        calendar_id: String,
+        event_id: String,
+    ) -> wasmtime::Result<Result<(), FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let token = match token_from_handle(h).await {
+            Ok(t) => t,
+            Err(e) => return Ok(Err(e)),
+        };
+        Ok(http::feishu_delete(
+            &token,
+            &format!(
+                "https://open.feishu.cn/open-apis/calendar/v4/calendars/{calendar_id}/events/{event_id}"
+            ),
+            None,
+        )
+        .await)
+    }
+
+    // -- CardKit --
+
+    #[instrument(skip_all)]
+    async fn create_card(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        request_json: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let token = match token_from_handle(h).await {
+            Ok(t) => t,
+            Err(e) => return Ok(Err(e)),
+        };
+        Ok(http::feishu_post(
+            &token,
+            "https://open.feishu.cn/open-apis/cardkit/v1/cards",
+            request_json,
+        )
+        .await)
+    }
+
+    #[instrument(skip_all)]
+    async fn update_card(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        card_id: String,
+        request_json: String,
+    ) -> wasmtime::Result<Result<(), FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let token = match token_from_handle(h).await {
+            Ok(t) => t,
+            Err(e) => return Ok(Err(e)),
+        };
+        Ok(http::feishu_patch(
+            &token,
+            &format!("https://open.feishu.cn/open-apis/cardkit/v1/cards/{card_id}"),
+            request_json,
+        )
+        .await
+        .map(|_| ()))
+    }
+
+    // -- Mail --
+
+    #[instrument(skip_all)]
+    async fn send_mail(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        user_mailbox_id: String,
+        request_json: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let token = match token_from_handle(h).await {
+            Ok(t) => t,
+            Err(e) => return Ok(Err(e)),
+        };
+        Ok(http::feishu_post(
+            &token,
+            &format!(
+                "https://open.feishu.cn/open-apis/mail/v1/user_mailboxes/{user_mailbox_id}/messages"
+            ),
+            request_json,
+        )
+        .await)
+    }
+
+    #[instrument(skip_all)]
+    async fn list_mails(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        user_mailbox_id: String,
+        request_json: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let token = match token_from_handle(h).await {
+            Ok(t) => t,
+            Err(e) => return Ok(Err(e)),
+        };
+        let params: serde_json::Value = serde_json::from_str(&request_json)
+            .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+        let query = build_query_string(&params);
+        let url = format!(
+            "https://open.feishu.cn/open-apis/mail/v1/user_mailboxes/{user_mailbox_id}/messages{}",
+            if query.is_empty() {
+                String::new()
+            } else {
+                format!("?{query}")
+            }
+        );
+        Ok(http::feishu_get(&token, &url).await)
+    }
+
+    #[instrument(skip_all)]
+    async fn get_mail(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        user_mailbox_id: String,
+        message_id: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let token = match token_from_handle(h).await {
+            Ok(t) => t,
+            Err(e) => return Ok(Err(e)),
+        };
+        Ok(http::feishu_get(
+            &token,
+            &format!(
+                "https://open.feishu.cn/open-apis/mail/v1/user_mailboxes/{user_mailbox_id}/messages/{message_id}"
+            ),
+        )
+        .await)
+    }
+
+    // -- Task --
+
+    #[instrument(skip_all)]
+    async fn create_task(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        request_json: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let req: open_lark::service::task::v2::task::CreateTaskRequest =
+            match serde_json::from_str(&request_json) {
+                Ok(r) => r,
+                Err(e) => return Ok(Err(FeishuError::Internal(e.to_string()))),
+            };
+        match h.client.task.task.create(req, None, None).await {
+            Ok(resp) => match serde_json::to_string(&resp.data) {
+                Ok(json) => Ok(Ok(json)),
+                Err(e) => Ok(Err(FeishuError::Internal(e.to_string()))),
+            },
+            Err(e) => Ok(Err(FeishuError::Internal(e.to_string()))),
+        }
+    }
+
+    #[instrument(skip_all)]
+    async fn get_task(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        task_guid: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        match h.client.task.task.get(&task_guid, None, None).await {
+            Ok(resp) => match serde_json::to_string(&resp.data) {
+                Ok(json) => Ok(Ok(json)),
+                Err(e) => Ok(Err(FeishuError::Internal(e.to_string()))),
+            },
+            Err(e) => Ok(Err(FeishuError::Internal(e.to_string()))),
+        }
+    }
+
+    #[instrument(skip_all)]
+    async fn update_task(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        task_guid: String,
+        request_json: String,
+    ) -> wasmtime::Result<Result<(), FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let req: open_lark::service::task::v2::task::UpdateTaskRequest =
+            match serde_json::from_str(&request_json) {
+                Ok(r) => r,
+                Err(e) => return Ok(Err(FeishuError::Internal(e.to_string()))),
+            };
+        match h.client.task.task.patch(&task_guid, req, None, None).await {
+            Ok(_) => Ok(Ok(())),
+            Err(e) => Ok(Err(FeishuError::Internal(e.to_string()))),
+        }
+    }
+
+    #[instrument(skip_all)]
+    async fn delete_task(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        task_guid: String,
+    ) -> wasmtime::Result<Result<(), FeishuError>> {
+        let h = self.table.get(&handle)?;
+        match h.client.task.task.delete(&task_guid, None, None).await {
+            Ok(_) => Ok(Ok(())),
+            Err(e) => Ok(Err(FeishuError::Internal(e.to_string()))),
+        }
+    }
+
+    #[instrument(skip_all)]
+    async fn list_tasks(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        request_json: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let params: serde_json::Value = match serde_json::from_str(&request_json) {
+            Ok(p) => p,
+            Err(e) => return Ok(Err(FeishuError::Internal(e.to_string()))),
+        };
+        let page_size = params
+            .get("page_size")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32);
+        let page_token = params
+            .get("page_token")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        match h
+            .client
+            .task
+            .task
+            .list(page_size, page_token.as_deref(), None, None, None, None, None, None, None, None, None)
+            .await
+        {
+            Ok(resp) => match serde_json::to_string(&resp.data) {
+                Ok(json) => Ok(Ok(json)),
+                Err(e) => Ok(Err(FeishuError::Internal(e.to_string()))),
+            },
+            Err(e) => Ok(Err(FeishuError::Internal(e.to_string()))),
+        }
+    }
+
+    #[instrument(skip_all)]
+    async fn create_tasklist(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        request_json: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let req: open_lark::service::task::v2::tasklist::CreateTasklistRequest =
+            match serde_json::from_str(&request_json) {
+                Ok(r) => r,
+                Err(e) => return Ok(Err(FeishuError::Internal(e.to_string()))),
+            };
+        match h.client.task.tasklist.create(req, None, None).await {
+            Ok(resp) => match serde_json::to_string(&resp.data) {
+                Ok(json) => Ok(Ok(json)),
+                Err(e) => Ok(Err(FeishuError::Internal(e.to_string()))),
+            },
+            Err(e) => Ok(Err(FeishuError::Internal(e.to_string()))),
+        }
+    }
+
+    #[instrument(skip_all)]
+    async fn list_tasklists(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        request_json: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let params: serde_json::Value = match serde_json::from_str(&request_json) {
+            Ok(p) => p,
+            Err(e) => return Ok(Err(FeishuError::Internal(e.to_string()))),
+        };
+        let page_size = params
+            .get("page_size")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32);
+        let page_token = params
+            .get("page_token")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        match h
+            .client
+            .task
+            .tasklist
+            .list(page_size, page_token.as_deref(), None, None)
+            .await
+        {
+            Ok(resp) => match serde_json::to_string(&resp.data) {
+                Ok(json) => Ok(Ok(json)),
+                Err(e) => Ok(Err(FeishuError::Internal(e.to_string()))),
+            },
+            Err(e) => Ok(Err(FeishuError::Internal(e.to_string()))),
+        }
+    }
+
+    // -- Bot --
+
+    #[instrument(skip_all)]
+    async fn get_bot_info(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        match h.client.bot.v3.info.get(None).await {
+            Ok(resp) => match serde_json::to_string(&resp.data) {
+                Ok(json) => Ok(Ok(json)),
+                Err(e) => Ok(Err(FeishuError::Internal(e.to_string()))),
+            },
+            Err(e) => Ok(Err(FeishuError::Internal(e.to_string()))),
+        }
+    }
+
+    // -- Docs --
+
+    #[instrument(skip_all)]
+    async fn create_document(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        request_json: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let token = match token_from_handle(h).await {
+            Ok(t) => t,
+            Err(e) => return Ok(Err(e)),
+        };
+        Ok(http::feishu_post(
+            &token,
+            "https://open.feishu.cn/open-apis/docx/v1/documents",
+            request_json,
+        )
+        .await)
+    }
+
+    #[instrument(skip_all)]
+    async fn get_document(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        document_id: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let token = match token_from_handle(h).await {
+            Ok(t) => t,
+            Err(e) => return Ok(Err(e)),
+        };
+        Ok(http::feishu_get(
+            &token,
+            &format!("https://open.feishu.cn/open-apis/docx/v1/documents/{document_id}"),
+        )
+        .await)
+    }
+
+    #[instrument(skip_all)]
+    async fn create_spreadsheet(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        request_json: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let token = match token_from_handle(h).await {
+            Ok(t) => t,
+            Err(e) => return Ok(Err(e)),
+        };
+        Ok(http::feishu_post(
+            &token,
+            "https://open.feishu.cn/open-apis/sheets/v3/spreadsheets",
+            request_json,
+        )
+        .await)
+    }
+
+    #[instrument(skip_all)]
+    async fn get_spreadsheet(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        spreadsheet_token: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let token = match token_from_handle(h).await {
+            Ok(t) => t,
+            Err(e) => return Ok(Err(e)),
+        };
+        Ok(http::feishu_get(
+            &token,
+            &format!("https://open.feishu.cn/open-apis/sheets/v3/spreadsheets/{spreadsheet_token}"),
+        )
+        .await)
+    }
+
+    #[instrument(skip_all)]
+    async fn create_bitable(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        request_json: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let token = match token_from_handle(h).await {
+            Ok(t) => t,
+            Err(e) => return Ok(Err(e)),
+        };
+        Ok(http::feishu_post(
+            &token,
+            "https://open.feishu.cn/open-apis/bitable/v1/apps",
+            request_json,
+        )
+        .await)
+    }
+
+    #[instrument(skip_all)]
+    async fn list_bitable_tables(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        app_token: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let token = match token_from_handle(h).await {
+            Ok(t) => t,
+            Err(e) => return Ok(Err(e)),
+        };
+        Ok(http::feishu_get(
+            &token,
+            &format!("https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables"),
+        )
+        .await)
+    }
+
+    #[instrument(skip_all)]
+    async fn list_bitable_records(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+        app_token: String,
+        table_id: String,
+        request_json: String,
+    ) -> wasmtime::Result<Result<String, FeishuError>> {
+        let h = self.table.get(&handle)?;
+        let token = match token_from_handle(h).await {
+            Ok(t) => t,
+            Err(e) => return Ok(Err(e)),
+        };
+        Ok(http::feishu_post(
+            &token,
+            &format!(
+                "https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/search"
+            ),
+            request_json,
+        )
+        .await)
+    }
+
+    // -- Lifecycle --
+
+    async fn stop(
+        &mut self,
+        handle: Resource<FeishuClientHandle>,
+    ) -> wasmtime::Result<Result<(), FeishuError>> {
+        let h = self.table.get(&handle)?;
+        h.cancel_token.cancel();
+        debug!("Feishu client stopped via stop()");
+        Ok(Ok(()))
+    }
+
+    async fn drop(
+        &mut self,
+        rep: Resource<FeishuClientHandle>,
+    ) -> wasmtime::Result<()> {
+        if let Ok(handle) = self.table.delete(rep) {
+            handle.cancel_token.cancel();
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
 // HostPlugin implementation
 // ---------------------------------------------------------------------------
 
-#[async_trait::async_trait]
+#[async_trait]
 impl HostPlugin for Feishu {
     fn id(&self) -> &'static str {
         PLUGIN_ID
@@ -339,16 +1289,14 @@ impl HostPlugin for Feishu {
 
     fn world(&self) -> WitWorld {
         WitWorld {
-            imports: HashSet::from([WitInterface::from(
-                "custom:feishu/sender,types,contact-sender,group-sender,ai-sender,calendar-sender,cardkit-sender,mail-sender,task-sender,bot-sender,docs-sender@0.1.0",
-            )]),
-            ..Default::default()
+            imports: HashSet::from([WitInterface::from("custom:feishu/handler@0.1.0")]),
+            exports: HashSet::from([WitInterface::from("custom:feishu/sender@0.1.0")]),
         }
     }
 
     async fn on_workload_item_bind<'a>(
         &self,
-        item: &mut WorkloadItem<'a>,
+        item: &mut wash_runtime::engine::workload::WorkloadItem<'a>,
         interfaces: HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
         let Some(interface) = interfaces
@@ -358,42 +1306,30 @@ impl HostPlugin for Feishu {
             return Ok(());
         };
 
-        let config = match extract_config(&interface.config) {
-            Some(c) => c,
-            None => {
-                warn!("Missing app-id or app-secret in feishu interface config");
-                return Ok(());
-            }
-        };
+        let interface_config = interface.config.clone();
 
-        add_all_feishu_linkers!(item.linker(), extract_active_ctx);
+        bindings::custom::feishu::types::add_to_linker::<_, SharedCtx>(
+            item.linker(),
+            extract_active_ctx,
+        )?;
+        bindings::custom::feishu::sender::add_to_linker::<_, SharedCtx>(
+            item.linker(),
+            extract_active_ctx,
+        )?;
 
-        let WorkloadItem::Component(component_handle) = item else {
+        let wash_runtime::engine::workload::WorkloadItem::Component(component_handle) = item else {
             return Ok(());
         };
 
-        // let has_handler = component_handle
-        //     .world()
-        //     .exports
-        //     .iter()
-        //     .any(|i| i.namespace == "custom" && i.package == "feishu");
-
-        // if has_handler {
-        debug!(
-            component_id = component_handle.id(),
-            "Tracking component for Feishu IM callbacks"
-        );
+        debug!(component_id = component_handle.id(), "Feishu plugin bound to component");
 
         self.tracker.write().await.add_component(
             component_handle,
             ComponentData {
-                cancel_token: tokio_util::sync::CancellationToken::new(),
+                interface_config,
                 workload: None,
-                client: None,
-                config,
             },
         );
-        // }
 
         Ok(())
     }
@@ -403,41 +1339,10 @@ impl HostPlugin for Feishu {
         workload: &ResolvedWorkload,
         component_id: &str,
     ) -> anyhow::Result<()> {
-        let (cancel_token, config) = {
-            let mut lock = self.tracker.write().await;
-            match lock.get_component_data_mut(component_id) {
-                Some(data) => {
-                    data.workload = Some(workload.clone());
-                    (data.cancel_token.clone(), data.config.clone())
-                }
-                None => return Ok(()),
-            }
-        };
-
-        let instance_pre = workload.instantiate_pre(component_id).await?;
-        let _pre = bindings::FeishuPre::new(instance_pre)
-            .map_err(anyhow::Error::from)
-            .context("failed to instantiate feishu pre")?;
-
-        let client = spawn_feishu_ws(
-            workload.clone(),
-            component_id.to_string(),
-            config,
-            cancel_token,
-        );
-
-        {
-            let mut lock = self.tracker.write().await;
-            if let Some(data) = lock.get_component_data_mut(component_id) {
-                data.client = Some(client);
-            }
+        let mut lock = self.tracker.write().await;
+        if let Some(data) = lock.get_component_data_mut(component_id) {
+            data.workload = Some(workload.clone());
         }
-
-        debug!(
-            component_id = %component_id,
-            "Feishu plugin resolved and WebSocket client started"
-        );
-
         Ok(())
     }
 
@@ -446,17 +1351,12 @@ impl HostPlugin for Feishu {
         workload_id: &str,
         _interfaces: HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
-        let workload_cleanup = |_| async {};
-        let component_cleanup = |component_data: ComponentData| async move {
-            component_data.cancel_token.cancel();
-        };
-
         self.tracker
             .write()
             .await
-            .remove_workload_with_cleanup(workload_id, workload_cleanup, component_cleanup)
+            .remove_workload_with_cleanup(workload_id, |_| async {}, |_| async {})
             .await;
-
+        debug!(workload_id = %workload_id, "Feishu plugin unbound");
         Ok(())
     }
 }
@@ -500,23 +1400,16 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_config() {
-        let mut config = HashMap::new();
-        config.insert("app-id".to_string(), "cli_test".to_string());
-        config.insert("app-secret".to_string(), "secret_test".to_string());
-
-        let pc = extract_config(&config).unwrap();
-        assert_eq!(pc.app_id, "cli_test");
-        assert_eq!(pc.app_secret, "secret_test");
+    fn test_build_query_string() {
+        let params: serde_json::Value = serde_json::json!({"page_size": "10", "page_token": "abc"});
+        let query = build_query_string(&params);
+        assert!(query.contains("page_size=10"));
+        assert!(query.contains("page_token=abc"));
     }
 
     #[test]
-    fn test_extract_config_missing() {
-        let config = HashMap::new();
-        assert!(extract_config(&config).is_none());
-
-        let mut config = HashMap::new();
-        config.insert("app-id".to_string(), "test_id".to_string());
-        assert!(extract_config(&config).is_none());
+    fn test_build_query_string_empty() {
+        let params: serde_json::Value = serde_json::json!({});
+        assert!(build_query_string(&params).is_empty());
     }
 }

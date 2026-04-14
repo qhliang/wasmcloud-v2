@@ -1,14 +1,15 @@
 package custom:feishu@0.1.0;
 
-// =====================================================================
-// Shared types
-// =====================================================================
-
 interface types {
     variant feishu-error {
         internal(string),
         auth-failed(string),
         send-failed(string),
+    }
+
+    record feishu-config {
+        app-id: string,
+        app-secret: string,
     }
 
     record im-message {
@@ -23,253 +24,88 @@ interface types {
     }
 }
 
-// =====================================================================
-// IM — messaging (existing)
-// =====================================================================
-
-/// Host-provided API for guest to send messages via Feishu.
 interface sender {
-    use types.{feishu-error};
+    use types.{feishu-error, feishu-config};
 
-    /// Send a text message to a chat.
-    send-text: func(chat-id: string, content: string) -> result<_, feishu-error>;
+    resource feishu-client {
+        constructor(config: option<feishu-config>);
 
-    /// Send a text message to a user (receive-id is open_id, user_id, or email).
-    send-text-to-user: func(receive-id: string, receive-id-type: string, content: string) -> result<_, feishu-error>;
+        // IM
+        send-text: func(chat-id: string, content: string) -> result<_, feishu-error>;
+        send-text-to-user: func(receive-id: string, receive-id-type: string, content: string) -> result<_, feishu-error>;
+        reply-message: func(message-id: string, content: string) -> result<_, feishu-error>;
+        get-access-token: func() -> result<string, feishu-error>;
 
-    /// Reply to an existing message with text.
-    reply-message: func(message-id: string, content: string) -> result<_, feishu-error>;
+        // Contact
+        get-user: func(user-id: string, user-id-type: string) -> result<string, feishu-error>;
+        batch-get-users: func(request-json: string) -> result<string, feishu-error>;
+        search-users: func(request-json: string) -> result<string, feishu-error>;
+        list-department-users: func(request-json: string) -> result<string, feishu-error>;
+        get-department: func(department-id: string, department-id-type: string) -> result<string, feishu-error>;
+        list-sub-departments: func(request-json: string) -> result<string, feishu-error>;
 
-    /// Get tenant access token.
-    get-access-token: func() -> result<string, feishu-error>;
+        // Group
+        create-group: func(request-json: string) -> result<string, feishu-error>;
+        get-group: func(chat-id: string) -> result<string, feishu-error>;
+        update-group: func(chat-id: string, request-json: string) -> result<_, feishu-error>;
+        add-group-members: func(chat-id: string, request-json: string) -> result<string, feishu-error>;
+        remove-group-members: func(chat-id: string, request-json: string) -> result<_, feishu-error>;
+        list-group-members: func(chat-id: string, request-json: string) -> result<string, feishu-error>;
+
+        // AI
+        recognize-text: func(request-json: string) -> result<string, feishu-error>;
+        translate: func(request-json: string) -> result<string, feishu-error>;
+
+        // Calendar
+        list-calendars: func(request-json: string) -> result<string, feishu-error>;
+        create-calendar-event: func(calendar-id: string, request-json: string) -> result<string, feishu-error>;
+        list-calendar-events: func(calendar-id: string, request-json: string) -> result<string, feishu-error>;
+        get-calendar-event: func(calendar-id: string, event-id: string) -> result<string, feishu-error>;
+        delete-calendar-event: func(calendar-id: string, event-id: string) -> result<_, feishu-error>;
+
+        // CardKit
+        create-card: func(request-json: string) -> result<string, feishu-error>;
+        update-card: func(card-id: string, request-json: string) -> result<_, feishu-error>;
+
+        // Mail
+        send-mail: func(user-mailbox-id: string, request-json: string) -> result<string, feishu-error>;
+        list-mails: func(user-mailbox-id: string, request-json: string) -> result<string, feishu-error>;
+        get-mail: func(user-mailbox-id: string, message-id: string) -> result<string, feishu-error>;
+
+        // Task
+        create-task: func(request-json: string) -> result<string, feishu-error>;
+        get-task: func(task-guid: string) -> result<string, feishu-error>;
+        update-task: func(task-guid: string, request-json: string) -> result<_, feishu-error>;
+        delete-task: func(task-guid: string) -> result<_, feishu-error>;
+        list-tasks: func(request-json: string) -> result<string, feishu-error>;
+        create-tasklist: func(request-json: string) -> result<string, feishu-error>;
+        list-tasklists: func(request-json: string) -> result<string, feishu-error>;
+
+        // Bot
+        get-bot-info: func() -> result<string, feishu-error>;
+
+        // Docs
+        create-document: func(request-json: string) -> result<string, feishu-error>;
+        get-document: func(document-id: string) -> result<string, feishu-error>;
+        create-spreadsheet: func(request-json: string) -> result<string, feishu-error>;
+        get-spreadsheet: func(spreadsheet-token: string) -> result<string, feishu-error>;
+        create-bitable: func(request-json: string) -> result<string, feishu-error>;
+        list-bitable-tables: func(app-token: string) -> result<string, feishu-error>;
+        list-bitable-records: func(app-token: string, table-id: string, request-json: string) -> result<string, feishu-error>;
+
+        // Lifecycle
+        stop: func() -> result<_, feishu-error>;
+    }
 }
 
-// =====================================================================
-// Contact — user / department lookup
-// =====================================================================
-
-/// Host-provided API for Feishu contact / user operations.
-/// Complex request/response bodies are JSON strings.
-interface contact-sender {
-    use types.{feishu-error};
-
-    /// Get a single user by ID. Returns JSON user object.
-    get-user: func(user-id: string, user-id-type: string) -> result<string, feishu-error>;
-
-    /// Batch get users by IDs. Request body is JSON, returns JSON.
-    batch-get-users: func(request-json: string) -> result<string, feishu-error>;
-
-    /// Search users. Request body is JSON, returns JSON.
-    search-users: func(request-json: string) -> result<string, feishu-error>;
-
-    /// List department direct users. Request body is JSON, returns JSON.
-    list-department-users: func(request-json: string) -> result<string, feishu-error>;
-
-    /// Get department info by ID. Returns JSON department object.
-    get-department: func(department-id: string, department-id-type: string) -> result<string, feishu-error>;
-
-    /// List sub-departments. Request body is JSON, returns JSON.
-    list-sub-departments: func(request-json: string) -> result<string, feishu-error>;
-}
-
-// =====================================================================
-// Group — group chat management
-// =====================================================================
-
-/// Host-provided API for Feishu group/chat management.
-interface group-sender {
-    use types.{feishu-error};
-
-    /// Create a group. Request body is JSON, returns JSON with chat-id.
-    create-group: func(request-json: string) -> result<string, feishu-error>;
-
-    /// Get group info. Returns JSON group object.
-    get-group: func(chat-id: string) -> result<string, feishu-error>;
-
-    /// Update group info. Request body is JSON.
-    update-group: func(chat-id: string, request-json: string) -> result<_, feishu-error>;
-
-    /// Add members to a group. Request body is JSON.
-    add-group-members: func(chat-id: string, request-json: string) -> result<string, feishu-error>;
-
-    /// Remove members from a group. Request body is JSON.
-    remove-group-members: func(chat-id: string, request-json: string) -> result<_, feishu-error>;
-
-    /// List group members. Request body is JSON (pagination params).
-    list-group-members: func(chat-id: string, request-json: string) -> result<string, feishu-error>;
-}
-
-// =====================================================================
-// AI — OCR, translation
-// =====================================================================
-
-/// Host-provided API for Feishu AI capabilities.
-interface ai-sender {
-    use types.{feishu-error};
-
-    /// Recognize text in an image (OCR). Request body is JSON, returns JSON.
-    recognize-text: func(request-json: string) -> result<string, feishu-error>;
-
-    /// Translate text. Request body is JSON, returns JSON.
-    translate: func(request-json: string) -> result<string, feishu-error>;
-}
-
-// =====================================================================
-// Calendar
-// =====================================================================
-
-/// Host-provided API for Feishu calendar operations.
-interface calendar-sender {
-    use types.{feishu-error};
-
-    /// List calendars. Request body is JSON, returns JSON.
-    list-calendars: func(request-json: string) -> result<string, feishu-error>;
-
-    /// Create a calendar event. Request body is JSON, returns JSON.
-    create-calendar-event: func(calendar-id: string, request-json: string) -> result<string, feishu-error>;
-
-    /// List calendar events. Request body is JSON, returns JSON.
-    list-calendar-events: func(calendar-id: string, request-json: string) -> result<string, feishu-error>;
-
-    /// Get a calendar event. Returns JSON event object.
-    get-calendar-event: func(calendar-id: string, event-id: string) -> result<string, feishu-error>;
-
-    /// Delete a calendar event.
-    delete-calendar-event: func(calendar-id: string, event-id: string) -> result<_, feishu-error>;
-}
-
-// =====================================================================
-// CardKit — interactive cards
-// =====================================================================
-
-/// Host-provided API for Feishu CardKit.
-interface cardkit-sender {
-    use types.{feishu-error};
-
-    /// Create a card. Request body is JSON, returns JSON.
-    create-card: func(request-json: string) -> result<string, feishu-error>;
-
-    /// Update a card. Request body is JSON.
-    update-card: func(card-id: string, request-json: string) -> result<_, feishu-error>;
-}
-
-// =====================================================================
-// Mail
-// =====================================================================
-
-/// Host-provided API for Feishu mail operations.
-interface mail-sender {
-    use types.{feishu-error};
-
-    /// Send an email. Request body is JSON, returns JSON.
-    send-mail: func(user-mailbox-id: string, request-json: string) -> result<string, feishu-error>;
-
-    /// List emails. Request body is JSON (pagination), returns JSON.
-    list-mails: func(user-mailbox-id: string, request-json: string) -> result<string, feishu-error>;
-
-    /// Get email detail. Returns JSON email object.
-    get-mail: func(user-mailbox-id: string, message-id: string) -> result<string, feishu-error>;
-}
-
-// =====================================================================
-// Task
-// =====================================================================
-
-/// Host-provided API for Feishu task operations.
-interface task-sender {
-    use types.{feishu-error};
-
-    /// Create a task. Request body is JSON, returns JSON.
-    create-task: func(request-json: string) -> result<string, feishu-error>;
-
-    /// Get a task. Returns JSON task object.
-    get-task: func(task-guid: string) -> result<string, feishu-error>;
-
-    /// Update a task. Request body is JSON.
-    update-task: func(task-guid: string, request-json: string) -> result<_, feishu-error>;
-
-    /// Delete a task.
-    delete-task: func(task-guid: string) -> result<_, feishu-error>;
-
-    /// List tasks. Request body is JSON, returns JSON.
-    list-tasks: func(request-json: string) -> result<string, feishu-error>;
-
-    /// Create a tasklist. Request body is JSON, returns JSON.
-    create-tasklist: func(request-json: string) -> result<string, feishu-error>;
-
-    /// List tasklists. Request body is JSON, returns JSON.
-    list-tasklists: func(request-json: string) -> result<string, feishu-error>;
-}
-
-// =====================================================================
-// Bot
-// =====================================================================
-
-/// Host-provided API for Feishu bot info.
-interface bot-sender {
-    use types.{feishu-error};
-
-    /// Get bot info. Returns JSON bot object.
-    get-bot-info: func() -> result<string, feishu-error>;
-}
-
-// =====================================================================
-// Docs — cloud documents
-// =====================================================================
-
-/// Host-provided API for Feishu cloud document operations.
-interface docs-sender {
-    use types.{feishu-error};
-
-    /// Create a document. Request body is JSON, returns JSON.
-    create-document: func(request-json: string) -> result<string, feishu-error>;
-
-    /// Get document raw content. Returns JSON.
-    get-document: func(document-id: string) -> result<string, feishu-error>;
-
-    /// Create a spreadsheet. Request body is JSON, returns JSON.
-    create-spreadsheet: func(request-json: string) -> result<string, feishu-error>;
-
-    /// Get spreadsheet info. Returns JSON.
-    get-spreadsheet: func(spreadsheet-token: string) -> result<string, feishu-error>;
-
-    /// Create a bitable (multidimensional table). Request body is JSON, returns JSON.
-    create-bitable: func(request-json: string) -> result<string, feishu-error>;
-
-    /// List bitable tables. Returns JSON.
-    list-bitable-tables: func(app-token: string) -> result<string, feishu-error>;
-
-    /// List bitable records. Request body is JSON, returns JSON.
-    list-bitable-records: func(app-token: string, table-id: string, request-json: string) -> result<string, feishu-error>;
-}
-
-// =====================================================================
-// Handler (guest export)
-// =====================================================================
-
-/// Interface that the guest component must export.
-/// The host calls `on-message` when a Feishu IM message event arrives.
 interface handler {
     use types.{im-message};
+    use sender.{feishu-client};
 
-    /// Called by the host when a Feishu IM message is received.
-    on-message: func(msg: im-message) -> result<_, string>;
+    on-message: func(client: borrow<feishu-client>, msg: im-message) -> result<_, string>;
 }
-
-// =====================================================================
-// World
-// =====================================================================
 
 world feishu {
     import sender;
-    import contact-sender;
-    import group-sender;
-    import ai-sender;
-    import calendar-sender;
-    import cardkit-sender;
-    import mail-sender;
-    import task-sender;
-    import bot-sender;
-    import docs-sender;
     export handler;
 }
