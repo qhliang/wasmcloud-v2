@@ -359,8 +359,8 @@ impl HostPlugin for Telegram {
 
     fn world(&self) -> WitWorld {
         WitWorld {
-            imports: HashSet::from([WitInterface::from("custom:telegram/sender@0.1.0")]),
-            exports: HashSet::from([WitInterface::from("custom:telegram/handler@0.1.0")]),
+            imports: HashSet::from([WitInterface::from("custom:telegram/handler@0.1.0")]),
+            exports: HashSet::from([WitInterface::from("custom:telegram/sender@0.1.0")]),
         }
     }
 

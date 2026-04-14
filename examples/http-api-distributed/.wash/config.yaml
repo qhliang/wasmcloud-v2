@@ -136,6 +136,13 @@ dev:
         - handler
       config:
         token: "aa1ab8847715@im.bot:060000dc2c2206b685e00be56d7342c340855f"
+    - namespace: custom
+      package: telegram
+      interfaces:
+        - sender
+        - handler
+      config:
+        bot_token: "invalid.token"
 
 new:
   command: cargo fetch
