@@ -206,6 +206,10 @@ impl CliCommand for DevCommand {
         host_builder = host_builder.with_plugin(Arc::new(custom_plugin_wechat::Wechat::new()))?;
         debug!("WeChat plugin enabled");
 
+        // Enable telegram plugin
+        host_builder = host_builder.with_plugin(Arc::new(custom_plugin_telegram::Telegram::new()))?;
+        debug!("Telegram plugin enabled");
+
         // Enable mail plugin
         host_builder = host_builder.with_plugin(Arc::new(custom_plugin_mail::Mail::new()))?;
         debug!("Mail plugin enabled");

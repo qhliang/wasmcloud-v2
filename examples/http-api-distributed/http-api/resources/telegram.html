@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Telegram</title>
+        <style>
+            {BASE_CSS}
+        </style>
+    </head>
+    <body>
+        <h1>Telegram</h1>
+        {NAV}
+
+        <div class="section">
+            <h2>Send Text Message</h2>
+            <label for="sendTextChatId">Chat ID *</label>
+            <input type="text" id="sendTextChatId" placeholder="e.g. 123456789" />
+            <label for="sendTextContent">Content *</label>
+            <textarea id="sendTextContent" rows="3" placeholder="Hello from wasmCloud!"></textarea>
+            <button onclick="sendText()">Send Text</button>
+            <div id="sendTextResult" class="result"></div>
+        </div>
+
+        <div class="section">
+            <h2>Send Media</h2>
+            <label for="sendMediaChatId">Chat ID *</label>
+            <input type="text" id="sendMediaChatId" placeholder="e.g. 123456789" />
+            <label for="sendMediaPath">File Path *</label>
+            <input type="text" id="sendMediaPath" placeholder="/tmp/document.pdf" />
+            <label for="sendMediaCaption">Caption</label>
+            <input type="text" id="sendMediaCaption" placeholder="Optional caption" />
+            <button onclick="sendMedia()">Send Media</button>
+            <div id="sendMediaResult" class="result"></div>
+        </div>
+
+        <script>
+            {
+                BASE_JS;
+            }
+
+            async function sendText() {
+                const chat_id = document.getElementById("sendTextChatId").value.trim();
+                const text = document.getElementById("sendTextContent").value.trim();
+                if (!chat_id || !text) {
+                    showResult("sendTextResult", "Chat ID and Content are required", true);
+                    return;
+                }
+                try {
+                    const resp = await fetch("/telegram/send-text", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ chat_id, text }),
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok) {
+                        showResult("sendTextResult", "Error: " + (data.error || JSON.stringify(data, null, 2)), true);
+                    } else {
+                        showResult("sendTextResult", "Message sent successfully", false);
+                    }
+                } catch (e) {
+                    showResult("sendTextResult", "Error: " + e.message, true);
+                }
+            }
+
+            async function sendMedia() {
+                const chat_id = document.getElementById("sendMediaChatId").value.trim();
+                const file_path = document.getElementById("sendMediaPath").value.trim();
+                const caption = document.getElementById("sendMediaCaption").value.trim();
+                if (!chat_id || !file_path) {
+                    showResult("sendMediaResult", "Chat ID and File Path are required", true);
+                    return;
+                }
+                try {
+                    const body = { chat_id, file_path };
+                    if (caption) body.caption = caption;
+                    const resp = await fetch("/telegram/send-media", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(body),
+                    });
+                    const data = await resp.json();
+                    if (!resp.ok) {
+                        showResult("sendMediaResult", "Error: " + (data.error || JSON.stringify(data, null, 2)), true);
+                    } else {
+                        showResult("sendMediaResult", "Media sent successfully", false);
+                    }
+                } catch (e) {
+                    showResult("sendMediaResult", "Error: " + e.message, true);
+                }
+            }
+        </script>
+    </body>
+</html>

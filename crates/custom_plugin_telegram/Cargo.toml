@@ -1,0 +1,26 @@
+[package]
+name = "custom_plugin_telegram"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+description = "Custom host plugin for Telegram Bot messaging"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+wasmtime = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+teloxide = { version = "0.15", default-features = false, features = ["native-tls"] }
+futures = { workspace = true }
+wash-runtime = { path = "../wash-runtime" }

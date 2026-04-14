@@ -238,6 +238,11 @@ impl CliCommand for HostCommand {
             cluster_host_builder.with_plugin(Arc::new(custom_plugin_wechat::Wechat::new()))?;
         tracing::info!("WeChat plugin enabled");
 
+        // Enable telegram plugin
+        cluster_host_builder =
+            cluster_host_builder.with_plugin(Arc::new(custom_plugin_telegram::Telegram::new()))?;
+        tracing::info!("Telegram plugin enabled");
+
         if let Some(postgres_url) = &self.postgres_url {
             cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(
                 plugin::wasmcloud_postgres::WasmcloudPostgres::new(postgres_url)

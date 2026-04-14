@@ -1,0 +1,6 @@
+package my:telegram;
+
+world telegram {
+    import custom:telegram/sender@0.1.0;
+    export custom:telegram/handler@0.1.0;
+}

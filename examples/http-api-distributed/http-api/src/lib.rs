@@ -22,6 +22,7 @@ mod mail;
 mod r2;
 mod task;
 mod templates;
+mod telegram;
 mod wechat;
 
 use bindings::wasi::logging::logging::{Level, log};
@@ -66,6 +67,19 @@ impl bindings::exports::custom::dingtalk_stream::handler::Guest for CustomHandle
             Level::Info,
             LOG_CTX,
             &format!("Received DingTalk message: {:?}", msg),
+        );
+        Ok(())
+    }
+}
+
+impl bindings::exports::custom::telegram::handler::Guest for CustomHandler {
+    fn on_message(
+        msg: bindings::exports::custom::telegram::handler::TelegramMessage,
+    ) -> Result<(), String> {
+        log(
+            Level::Info,
+            LOG_CTX,
+            &format!("Received Telegram message: {:?}", msg),
         );
         Ok(())
     }
@@ -221,6 +235,9 @@ async fn main(req: Request<Body>) -> anyhow::Result<Response<Body>> {
         "/wechat/send-media" => wechat::send_media(req).await,
         "/wechat/qr-start" => wechat::qr_start(req).await,
         "/wechat/qr-poll-status" => wechat::qr_poll_status(req).await,
+        "/telegram" | "/telegram/" => telegram::home(req).await,
+        "/telegram/send-text" => telegram::send_text(req).await,
+        "/telegram/send-media" => telegram::send_media(req).await,
         _ => {
             log(Level::Debug, LOG_CTX, &format!("Not found: {}", path));
 

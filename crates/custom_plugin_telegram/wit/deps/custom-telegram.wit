@@ -1,0 +1,35 @@
+package custom:telegram@0.1.0;
+
+interface types {
+    variant telegram-error {
+        internal(string),
+        send-failed(string),
+        not-ready(string),
+    }
+
+    record telegram-message {
+        message-id: string,
+        chat-id: string,
+        sender-id: string,
+        sender-username: option<string>,
+        text-content: option<string>,
+        timestamp: s64,
+    }
+}
+
+interface sender {
+    use types.{telegram-error};
+
+    /// Send a text message to a chat.
+    send-text: func(chat-id: string, text: string) -> result<_, telegram-error>;
+
+    /// Send a media file to a chat.
+    send-media: func(chat-id: string, file-path: string, caption: option<string>) -> result<_, telegram-error>;
+}
+
+interface handler {
+    use types.{telegram-message};
+
+    /// Called by the host when a Telegram message is received.
+    on-message: func(msg: telegram-message) -> result<_, string>;
+}
