@@ -36,7 +36,7 @@
 //! //     system_prompts: '[{"role":"system","content":"You are a helpful assistant"}]'  // Optional, JSON array
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -52,7 +52,7 @@ use wasmtime::component::Resource;
 
 use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use wash_runtime::engine::workload::WorkloadItem;
-use wash_runtime::plugin::HostPlugin;
+use wash_runtime::plugin::{HostPlugin, WorkloadTracker};
 use wash_runtime::wit::{WitInterface, WitWorld};
 
 mod bindings {
@@ -125,13 +125,19 @@ pub struct LlmGatewayConfig {
     pub system_prompts: Vec<PresetPrompt>,
 }
 
+/// Per-component data.
+struct ComponentData {
+    /// LLM Gateway config (parsed from interface config)
+    config: Option<LlmGatewayConfig>,
+    /// Cached genai client
+    client: Option<Client>,
+}
+
 /// LLM Gateway plugin backed by the genai multi-provider library
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct LlmGateway {
-    /// Mapping from workload_id to workload-specific config
-    configs: Arc<RwLock<HashMap<String, LlmGatewayConfig>>>,
-    /// genai clients per workload
-    clients: Arc<RwLock<HashMap<String, Client>>>,
+    /// Per-component state tracker
+    tracker: Arc<RwLock<WorkloadTracker<(), ComponentData>>>,
     /// Metrics
     metrics: Arc<LlmGatewayMetrics>,
 }
@@ -159,14 +165,19 @@ impl LlmGatewayMetrics {
     }
 }
 
+impl Default for LlmGateway {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LlmGateway {
     /// Create a new LLM Gateway plugin.
     /// Configuration is provided per-workload via interface config.
     pub fn new() -> Self {
         let metrics = LlmGatewayMetrics::new();
         Self {
-            configs: Arc::new(RwLock::new(HashMap::new())),
-            clients: Arc::new(RwLock::new(HashMap::new())),
+            tracker: Arc::new(RwLock::new(WorkloadTracker::default())),
             metrics: Arc::new(metrics),
         }
     }
@@ -176,21 +187,35 @@ impl LlmGateway {
         self.metrics.chat_requests_total.add(1, &attributes);
     }
 
-    async fn get_or_create_client(&self, workload_id: &str) -> anyhow::Result<Client> {
+    async fn get_or_create_client(&self, component_id: &str) -> anyhow::Result<Client> {
         // Check if client already exists
         {
-            let clients = self.clients.read().await;
-            if let Some(client) = clients.get(workload_id) {
+            let lock = self.tracker.read().await;
+            if let Some(data) = lock.get_component_data(component_id)
+                && let Some(ref client) = data.client
+            {
                 return Ok(client.clone());
             }
         }
 
-        // Get config for this workload
+        // Get config for this component
         let config = {
-            let configs = self.configs.read().await;
-            configs.get(workload_id).cloned().ok_or_else(|| {
-                anyhow::anyhow!("No LLM Gateway config found for workload '{}'", workload_id)
-            })?
+            let lock = self.tracker.read().await;
+            let data = lock.get_component_data(component_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No LLM Gateway config found for component '{}'",
+                    component_id
+                )
+            })?;
+            data.config
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "LLM Gateway config not set for component '{}'",
+                        component_id
+                    )
+                })?
+                .clone()
         };
 
         // Build genai client with custom auth resolver and service target resolver
@@ -226,8 +251,10 @@ impl LlmGateway {
 
         // Cache the client
         {
-            let mut clients = self.clients.write().await;
-            clients.insert(workload_id.to_string(), client.clone());
+            let mut lock = self.tracker.write().await;
+            if let Some(data) = lock.get_component_data_mut(component_id) {
+                data.client = Some(client.clone());
+            }
         }
         Ok(client)
     }
@@ -483,16 +510,25 @@ impl<'a> bindings::custom::llm_gateway::chat::Host for ActiveCtx<'a> {
         }
 
         let workload_id = self.workload_id.as_ref().to_string();
+        let component_id: Arc<str> = self.component_id.clone();
 
-        // Get config for this workload
+        // Get config for this component
         let interface_config = {
-            let configs = plugin.configs.read().await;
-            match configs.get(&workload_id).cloned() {
-                Some(c) => c,
+            let lock = plugin.tracker.read().await;
+            match lock.get_component_data(&component_id) {
+                Some(data) => match data.config.clone() {
+                    Some(c) => c,
+                    None => {
+                        return Ok(Err(LlmError::Unexpected(format!(
+                            "LLM Gateway config not set for component '{}'",
+                            component_id
+                        ))));
+                    }
+                },
                 None => {
                     return Ok(Err(LlmError::Unexpected(format!(
-                        "No LLM Gateway config found for workload '{}'",
-                        workload_id
+                        "No LLM Gateway config found for component '{}'",
+                        component_id
                     ))));
                 }
             }
@@ -533,7 +569,7 @@ impl<'a> bindings::custom::llm_gateway::chat::Host for ActiveCtx<'a> {
                 }
             }
         } else {
-            match plugin.get_or_create_client(&workload_id).await {
+            match plugin.get_or_create_client(&component_id).await {
                 Ok(c) => c,
                 Err(e) => {
                     return Ok(Err(LlmError::Unexpected(format!(
@@ -641,16 +677,25 @@ impl<'a> bindings::custom::llm_gateway::chat_streaming::Host for ActiveCtx<'a> {
         }
 
         let workload_id = self.workload_id.as_ref().to_string();
+        let component_id: Arc<str> = self.component_id.clone();
 
-        // Get config for this workload
+        // Get config for this component
         let interface_config = {
-            let configs = plugin.configs.read().await;
-            match configs.get(&workload_id).cloned() {
-                Some(c) => c,
+            let lock = plugin.tracker.read().await;
+            match lock.get_component_data(&component_id) {
+                Some(data) => match data.config.clone() {
+                    Some(c) => c,
+                    None => {
+                        return Ok(Err(LlmError::Unexpected(format!(
+                            "LLM Gateway config not set for component '{}'",
+                            component_id
+                        ))));
+                    }
+                },
                 None => {
                     return Ok(Err(LlmError::Unexpected(format!(
-                        "No LLM Gateway config found for workload '{}'",
-                        workload_id
+                        "No LLM Gateway config found for component '{}'",
+                        component_id
                     ))));
                 }
             }
@@ -691,7 +736,7 @@ impl<'a> bindings::custom::llm_gateway::chat_streaming::Host for ActiveCtx<'a> {
                 }
             }
         } else {
-            match plugin.get_or_create_client(&workload_id).await {
+            match plugin.get_or_create_client(&component_id).await {
                 Ok(c) => c,
                 Err(e) => {
                     return Ok(Err(LlmError::Unexpected(format!(
@@ -849,7 +894,7 @@ impl HostPlugin for LlmGateway {
 
     async fn on_workload_item_bind<'a>(
         &self,
-        component_handle: &mut WorkloadItem<'a>,
+        item: &mut WorkloadItem<'a>,
         interfaces: HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
         // Find the llm-gateway interface
@@ -865,23 +910,17 @@ impl HostPlugin for LlmGateway {
             return Ok(());
         };
 
-        let workload_id = component_handle.workload_id().to_string();
-
         // Extract and validate all config
-        let config = match extract_config(interface, &workload_id) {
+        let config = match extract_config(interface, "") {
             Ok(c) => c,
             Err(e) => {
-                tracing::error!(
-                    workload_id = %workload_id,
-                    "LLM Gateway config validation failed: {}", e
-                );
+                tracing::error!("LLM Gateway config validation failed: {}", e);
                 // Still return Ok to not block other interfaces, but log the error
                 return Ok(());
             }
         };
 
         debug!(
-            workload_id = %workload_id,
             provider = ?config.provider,
             model = %config.model_name,
             temperature = config.temperature,
@@ -890,18 +929,7 @@ impl HostPlugin for LlmGateway {
             "Configuring LLM Gateway for workload"
         );
 
-        // Save the config for this workload
-        {
-            let mut configs = self.configs.write().await;
-            configs.insert(workload_id.clone(), config);
-        }
-
-        debug!(
-            workload_id = %workload_id,
-            "Adding LLM Gateway chat interface to linker for workload"
-        );
-
-        let linker = component_handle.linker();
+        let linker = item.linker();
         bindings::custom::llm_gateway::chat::add_to_linker::<_, SharedCtx>(
             linker,
             extract_active_ctx,
@@ -911,7 +939,23 @@ impl HostPlugin for LlmGateway {
             extract_active_ctx,
         )?;
 
-        debug!("LlmGateway plugin bound to workload '{workload_id}'");
+        let WorkloadItem::Component(component_handle) = item else {
+            return Ok(());
+        };
+
+        debug!(
+            component_id = component_handle.id(),
+            "LlmGateway plugin bound to component"
+        );
+
+        self.tracker.write().await.add_component(
+            component_handle,
+            ComponentData {
+                config: Some(config),
+                client: None,
+            },
+        );
+
         Ok(())
     }
 
@@ -920,22 +964,20 @@ impl HostPlugin for LlmGateway {
         workload_id: &str,
         _interfaces: HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
-        // Clean up the config and client for this workload
-        {
-            let mut configs = self.configs.write().await;
-            configs.remove(workload_id);
-        }
-        {
-            let mut clients = self.clients.write().await;
-            clients.remove(workload_id);
-        }
-        debug!("LlmGateway plugin unbound from workload '{workload_id}'");
+        self.tracker
+            .write()
+            .await
+            .remove_workload_with_cleanup(workload_id, |_| async {}, |_| async {})
+            .await;
+        debug!(workload_id = %workload_id, "LlmGateway plugin unbound");
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     #[test]
@@ -945,12 +987,12 @@ mod tests {
     }
 
     #[test]
-    fn test_world_imports() {
+    fn test_world_exports() {
         let plugin = LlmGateway::new();
         let world = plugin.world();
         assert!(
             world
-                .imports
+                .exports
                 .iter()
                 .any(|i| i.namespace == "custom" && i.package == "llm-gateway")
         );

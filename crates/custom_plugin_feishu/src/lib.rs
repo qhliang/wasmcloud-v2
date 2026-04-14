@@ -159,6 +159,16 @@ fn spawn_feishu_ws(
             let workload = workload.clone();
             let cid = cid.clone();
             move |event: open_lark::service::im::v1::p2_im_message_receive_v1::P2ImMessageReceiveV1| {
+                // Record metrics via global meter
+                {
+                    let meter = opentelemetry::global::meter("feishu");
+                    let counter = meter
+                        .u64_counter("feishu_messages_total")
+                        .with_description("Total number of Feishu messages processed")
+                        .build();
+                    counter.add(1, &[opentelemetry::KeyValue::new("direction", "inbound")]);
+                }
+
                 let msg = &event.event.message;
                 let sender = &event.event.sender;
 

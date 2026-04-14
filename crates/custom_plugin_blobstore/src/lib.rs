@@ -26,7 +26,7 @@ use wasmtime_wasi::p2::{
 
 use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use wash_runtime::engine::workload::WorkloadItem;
-use wash_runtime::plugin::HostPlugin;
+use wash_runtime::plugin::{HostPlugin, WorkloadTracker};
 use wash_runtime::wit::{WitInterface, WitWorld};
 
 const PLUGIN_ID: &str = "wasi-blobstore-multi-backend";
@@ -70,38 +70,19 @@ pub struct OutgoingValueHandle {
     pub object_name: Option<String>,
 }
 
-/// Extract blobstore config from interface config.
-/// The `backend` key defaults to "memory" if not specified.
-/// All other keys are passed directly to OpenDAL as backend-specific config.
-fn extract_config(interface: &WitInterface) -> anyhow::Result<Operator> {
-    let backend = interface
-        .config
-        .get("backend")
-        .cloned()
-        .unwrap_or_else(|| "memory".to_string());
-
-    let scheme = Scheme::from_str(&backend)
-        .map_err(|e| anyhow::anyhow!("unknown backend '{backend}': {e}"))?;
-
-    let iter = interface
-        .config
-        .iter()
-        .filter(|(k, _)| k.as_str() != "backend")
-        .map(|(k, v)| (k.clone(), v.clone()));
-
-    let op = Operator::via_iter(scheme, iter).map_err(|e| {
-        anyhow::anyhow!("failed to create OpenDAL operator for backend '{backend}': {e}")
-    })?;
-
-    debug!(backend = backend, "Created OpenDAL operator");
-    Ok(op)
+/// Per-component data.
+struct ComponentData {
+    /// Static interface config from wasmcloud config
+    interface_config: HashMap<String, String>,
+    /// Cached OpenDAL operator
+    operator: Option<Operator>,
 }
 
 /// Multi-backend blobstore plugin
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct CustomBlobstore {
-    /// Per-workload OpenDAL operators
-    operators: Arc<RwLock<HashMap<String, Operator>>>,
+    /// Per-component state tracker
+    tracker: Arc<RwLock<WorkloadTracker<(), ComponentData>>>,
     metrics: Arc<BlobstoreMetrics>,
 }
 
@@ -126,13 +107,19 @@ impl BlobstoreMetrics {
     }
 }
 
+impl Default for CustomBlobstore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CustomBlobstore {
     /// Create a new blobstore plugin.
     /// Backend is configured per-workload via interface config.
     pub fn new() -> Self {
         let metrics = BlobstoreMetrics::new();
         Self {
-            operators: Arc::new(RwLock::new(HashMap::new())),
+            tracker: Arc::new(RwLock::new(WorkloadTracker::default())),
             metrics: Arc::new(metrics),
         }
     }
@@ -145,37 +132,58 @@ impl CustomBlobstore {
         self.metrics.operations_total.add(1, &attributes);
     }
 
-    async fn get_or_create_operator(
-        &self,
-        workload_id: &str,
-        interface: &WitInterface,
-    ) -> anyhow::Result<Operator> {
-        // Check if operator already exists
+    /// Get an existing operator for a component, creating one if needed.
+    async fn get_operator(&self, component_id: &str) -> anyhow::Result<Operator> {
+        // Check if operator already cached
         {
-            let operators = self.operators.read().await;
-            if let Some(op) = operators.get(workload_id) {
+            let lock = self.tracker.read().await;
+            if let Some(data) = lock.get_component_data(component_id)
+                && let Some(ref op) = data.operator
+            {
                 return Ok(op.clone());
             }
         }
 
-        let op = extract_config(interface)?;
+        // Need to create operator from interface config
+        let interface_config = {
+            let lock = self.tracker.read().await;
+            match lock.get_component_data(component_id) {
+                Some(data) => data.interface_config.clone(),
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "No blobstore config found for component '{}'",
+                        component_id
+                    ));
+                }
+            }
+        };
+
+        let backend = interface_config
+            .get("backend")
+            .cloned()
+            .unwrap_or_else(|| "memory".to_string());
+
+        let scheme =
+            Scheme::from_str(&backend).map_err(|e| anyhow::anyhow!("unknown backend: {e}"))?;
+
+        let iter = interface_config
+            .iter()
+            .filter(|(k, _)| k.as_str() != "backend")
+            .map(|(k, v)| (k.clone(), v.clone()));
+
+        let op = Operator::via_iter(scheme, iter).map_err(|e| {
+            anyhow::anyhow!("failed to create OpenDAL operator for backend '{backend}': {e}")
+        })?;
 
         // Cache the operator
         {
-            let mut operators = self.operators.write().await;
-            operators.insert(workload_id.to_string(), op.clone());
+            let mut lock = self.tracker.write().await;
+            if let Some(data) = lock.get_component_data_mut(component_id) {
+                data.operator = Some(op.clone());
+            }
         }
 
         Ok(op)
-    }
-
-    /// Get an existing operator for a workload
-    async fn get_operator(&self, workload_id: &str) -> anyhow::Result<Operator> {
-        let operators = self.operators.read().await;
-        operators
-            .get(workload_id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("No operator found for workload '{}'", workload_id))
     }
 }
 
@@ -196,7 +204,7 @@ impl HostPlugin for CustomBlobstore {
 
     async fn on_workload_item_bind<'a>(
         &self,
-        component_handle: &mut WorkloadItem<'a>,
+        item: &mut WorkloadItem<'a>,
         interfaces: HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
         let blobstore_interface = interfaces
@@ -211,36 +219,9 @@ impl HostPlugin for CustomBlobstore {
             return Ok(());
         };
 
-        let workload_id = component_handle.workload_id().to_string();
+        let interface_config = interface.config.clone();
 
-        // Validate config by creating operator
-        let backend = interface
-            .config
-            .get("backend")
-            .cloned()
-            .unwrap_or_else(|| "memory".to_string());
-
-        match self.get_or_create_operator(&workload_id, interface).await {
-            Ok(_) => {
-                debug!(
-                    workload_id = %workload_id,
-                    backend = backend,
-                    "Configured blobstore backend for workload"
-                );
-            }
-            Err(e) => {
-                tracing::error!(
-                    workload_id = %workload_id,
-                    backend = backend,
-                    error = %e,
-                    "Failed to configure blobstore backend"
-                );
-                return Ok(());
-            }
-        }
-
-        let linker = component_handle.linker();
-
+        let linker = item.linker();
         bindings::wasi::blobstore::blobstore::add_to_linker::<_, SharedCtx>(
             linker,
             extract_active_ctx,
@@ -254,7 +235,22 @@ impl HostPlugin for CustomBlobstore {
             extract_active_ctx,
         )?;
 
-        debug!("Blobstore plugin bound to workload '{workload_id}'");
+        let WorkloadItem::Component(component_handle) = item else {
+            return Ok(());
+        };
+
+        debug!(
+            component_id = component_handle.id(),
+            "Blobstore plugin bound to component"
+        );
+
+        self.tracker.write().await.add_component(
+            component_handle,
+            ComponentData {
+                interface_config,
+                operator: None,
+            },
+        );
 
         Ok(())
     }
@@ -264,12 +260,12 @@ impl HostPlugin for CustomBlobstore {
         workload_id: &str,
         _interfaces: HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
-        {
-            let mut operators = self.operators.write().await;
-            operators.remove(workload_id);
-        }
-
-        debug!("Blobstore plugin unbound from workload '{workload_id}'");
+        self.tracker
+            .write()
+            .await
+            .remove_workload_with_cleanup(workload_id, |_| async {}, |_| async {})
+            .await;
+        debug!(workload_id = %workload_id, "Blobstore plugin unbound");
         Ok(())
     }
 }
@@ -294,7 +290,7 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
             "Creating container"
         );
 
-        let op = match plugin.get_operator(self.workload_id.as_ref()).await {
+        let op = match plugin.get_operator(&self.component_id).await {
             Ok(o) => o,
             Err(e) => return Ok(Err(format!("failed to get operator: {e}"))),
         };
@@ -332,7 +328,7 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         };
         plugin.record_operation("container_exists");
 
-        let op = match plugin.get_operator(self.workload_id.as_ref()).await {
+        let op = match plugin.get_operator(&self.component_id).await {
             Ok(o) => o,
             Err(e) => return Ok(Err(format!("failed to get operator: {e}"))),
         };
@@ -359,7 +355,7 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
             "Deleting container"
         );
 
-        let op = match plugin.get_operator(self.workload_id.as_ref()).await {
+        let op = match plugin.get_operator(&self.component_id).await {
             Ok(o) => o,
             Err(e) => return Ok(Err(format!("failed to get operator: {e}"))),
         };
@@ -383,7 +379,7 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         };
         plugin.record_operation("copy_object");
 
-        let op = match plugin.get_operator(self.workload_id.as_ref()).await {
+        let op = match plugin.get_operator(&self.component_id).await {
             Ok(o) => o,
             Err(e) => return Ok(Err(format!("failed to get operator: {e}"))),
         };
@@ -408,7 +404,7 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         };
         plugin.record_operation("move_object");
 
-        let op = match plugin.get_operator(self.workload_id.as_ref()).await {
+        let op = match plugin.get_operator(&self.component_id).await {
             Ok(o) => o,
             Err(e) => return Ok(Err(format!("failed to get operator: {e}"))),
         };
@@ -470,7 +466,7 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
             return Ok(Err("Blobstore plugin not available".to_string()));
         };
 
-        let op = match plugin.get_operator(self.workload_id.as_ref()).await {
+        let op = match plugin.get_operator(&self.component_id).await {
             Ok(o) => o,
             Err(e) => return Ok(Err(format!("failed to get operator: {e}"))),
         };
@@ -546,7 +542,7 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
             return Ok(Err("Blobstore plugin not available".to_string()));
         };
 
-        let op = match plugin.get_operator(self.workload_id.as_ref()).await {
+        let op = match plugin.get_operator(&self.component_id).await {
             Ok(o) => o,
             Err(e) => return Ok(Err(format!("failed to get operator: {e}"))),
         };
@@ -593,7 +589,7 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
             return Ok(Err("Blobstore plugin not available".to_string()));
         };
 
-        let op = match plugin.get_operator(self.workload_id.as_ref()).await {
+        let op = match plugin.get_operator(&self.component_id).await {
             Ok(o) => o,
             Err(e) => return Ok(Err(format!("failed to get operator: {e}"))),
         };
@@ -617,7 +613,7 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
             return Ok(Err("Blobstore plugin not available".to_string()));
         };
 
-        let op = match plugin.get_operator(self.workload_id.as_ref()).await {
+        let op = match plugin.get_operator(&self.component_id).await {
             Ok(o) => o,
             Err(e) => return Ok(Err(format!("failed to get operator: {e}"))),
         };
@@ -643,7 +639,7 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
             return Ok(Err("Blobstore plugin not available".to_string()));
         };
 
-        let op = match plugin.get_operator(self.workload_id.as_ref()).await {
+        let op = match plugin.get_operator(&self.component_id).await {
             Ok(o) => o,
             Err(e) => return Ok(Err(format!("failed to get operator: {e}"))),
         };
@@ -666,7 +662,7 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
             return Ok(Err("Blobstore plugin not available".to_string()));
         };
 
-        let op = match plugin.get_operator(self.workload_id.as_ref()).await {
+        let op = match plugin.get_operator(&self.component_id).await {
             Ok(o) => o,
             Err(e) => return Ok(Err(format!("failed to get operator: {e}"))),
         };
@@ -695,7 +691,7 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
             return Ok(Err("Blobstore plugin not available".to_string()));
         };
 
-        let op = match plugin.get_operator(self.workload_id.as_ref()).await {
+        let op = match plugin.get_operator(&self.component_id).await {
             Ok(o) => o,
             Err(e) => return Ok(Err(format!("failed to get operator: {e}"))),
         };
@@ -887,7 +883,7 @@ impl<'a> bindings::wasi::blobstore::types::HostOutgoingValue for ActiveCtx<'a> {
                 "Retrieved data from pipe in finish()"
             );
 
-            let op = match plugin.get_operator(self.workload_id.as_ref()).await {
+            let op = match plugin.get_operator(&self.component_id).await {
                 Ok(o) => o,
                 Err(e) => return Ok(Err(format!("failed to get operator: {e}"))),
             };

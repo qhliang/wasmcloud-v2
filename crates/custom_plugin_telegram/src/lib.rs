@@ -264,6 +264,16 @@ async fn handle_telegram_message(
     bot: &Arc<Bot>,
     message: &teloxide::types::Message,
 ) {
+    // Record metrics via global meter
+    {
+        let meter = opentelemetry::global::meter("telegram");
+        let counter = meter
+            .u64_counter("telegram_messages_total")
+            .with_description("Total number of Telegram messages processed")
+            .build();
+        counter.add(1, &[opentelemetry::KeyValue::new("direction", "inbound")]);
+    }
+
     let text_content = message.text().map(|s| s.to_string());
     let sender_username = message.from.as_ref().and_then(|u| u.username.clone());
     let chat_id = message.chat.id.0.to_string();

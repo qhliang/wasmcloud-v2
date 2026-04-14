@@ -45,7 +45,7 @@ use wasmtime::component::Resource;
 
 use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use wash_runtime::engine::workload::WorkloadItem;
-use wash_runtime::plugin::HostPlugin;
+use wash_runtime::plugin::{HostPlugin, WorkloadTracker};
 use wash_runtime::wit::{WitInterface, WitWorld};
 
 const PLUGIN_KEYVALUE_ID: &str = "wasi-keyvalue-cf-kv";
@@ -64,15 +64,10 @@ mod bindings {
 
 use bindings::wasi::keyvalue::store::{Error as StoreError, KeyResponse};
 
-/// Configuration for Cloudflare KV (per-workload)
-#[derive(Clone, Debug)]
-pub struct CloudflareWorkloadConfig {
-    /// Cloudflare account ID
-    pub account_id: String,
-    /// Cloudflare API token with KV permissions
-    pub api_token: String,
-    /// KV namespace ID
-    pub namespace: String,
+/// Per-component data.
+struct ComponentData {
+    /// Static interface config from wasmcloud config
+    interface_config: HashMap<String, String>,
 }
 
 /// Resource handle for a Cloudflare KV bucket
@@ -85,12 +80,18 @@ pub struct BucketHandle {
 }
 
 /// Cloudflare KV-based keyvalue plugin
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct CloudflareKeyValue {
-    /// Mapping from workload_id to workload-specific config
-    configs: Arc<RwLock<HashMap<String, CloudflareWorkloadConfig>>>,
+    /// Per-component state tracker
+    tracker: Arc<RwLock<WorkloadTracker<(), ComponentData>>>,
     /// Metrics
     metrics: Arc<CloudflareKvMetrics>,
+}
+
+impl Default for CloudflareKeyValue {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 struct CloudflareKvMetrics {
@@ -120,7 +121,7 @@ impl CloudflareKeyValue {
     pub fn new() -> Self {
         let metrics = CloudflareKvMetrics::new();
         Self {
-            configs: Arc::new(RwLock::new(HashMap::new())),
+            tracker: Arc::new(RwLock::new(WorkloadTracker::default())),
             metrics: Arc::new(metrics),
         }
     }
@@ -153,34 +154,64 @@ impl<'a> bindings::wasi::keyvalue::store::Host for ActiveCtx<'a> {
         plugin.record_operation("open");
 
         let workload_id = self.workload_id.as_ref().to_string();
+        let component_id: Arc<str> = self.component_id.clone();
 
-        // Get the config for this workload
-        let configs = plugin.configs.read().await;
-        let config = match configs.get(&workload_id) {
-            Some(cfg) => cfg.clone(),
-            None => {
-                return Ok(Err(StoreError::Other(format!(
-                    "No Cloudflare KV config found for workload '{}'. \
-                     Please configure account_id, api_token, and namespace in interface config.",
-                    workload_id
-                ))));
+        // Get the config for this component
+        let lock = plugin.tracker.read().await;
+        let Some(data) = lock.get_component_data(&component_id) else {
+            return Ok(Err(StoreError::Other(format!(
+                "No Cloudflare KV config found for component '{}'. \
+                 Please configure account_id, api_token, and namespace in interface config.",
+                component_id
+            ))));
+        };
+
+        let account_id = match data.interface_config.get("account_id").cloned() {
+            Some(v) if !v.is_empty() => v,
+            _ => {
+                return Ok(Err(StoreError::Other(
+                    "missing account_id: configure in interface config".to_string(),
+                )));
             }
         };
-        drop(configs);
+        let api_token = match data.interface_config.get("api_token").cloned() {
+            Some(v) if !v.is_empty() => v,
+            _ => {
+                return Ok(Err(StoreError::Other(
+                    "missing api_token: configure in interface config".to_string(),
+                )));
+            }
+        };
+        let namespace = match data.interface_config.get("namespace_id").cloned() {
+            Some(v) if !v.is_empty() => v,
+            _ => {
+                return Ok(Err(StoreError::Other(
+                    "missing namespace_id: configure in interface config".to_string(),
+                )));
+            }
+        };
+
+        drop(lock);
 
         debug!(
            workload_id = %workload_id,
-           namespace = %config.namespace,
+           namespace = %namespace,
             identifier = %identifier,
             "Opening Cloudflare KV bucket"
         );
 
-        // Create client with the workload-specific config
-        let client =
-            KvNamespaceClient::new(&config.account_id, &config.api_token, &config.namespace);
+        // When identifier is empty, fall back to namespace from interface config
+        let bucket_id = if identifier.is_empty() {
+            namespace.clone()
+        } else {
+            identifier.clone()
+        };
+
+        // Create client with the component-specific config
+        let client = KvNamespaceClient::new(&account_id, &api_token, &namespace);
         let bucket = BucketHandle {
             client,
-            identifier: identifier.clone(),
+            identifier: bucket_id,
         };
 
         let resource = self.table.push(bucket)?;
@@ -622,7 +653,7 @@ impl HostPlugin for CloudflareKeyValue {
 
     async fn on_workload_item_bind<'a>(
         &self,
-        component_handle: &mut WorkloadItem<'a>,
+        item: &mut WorkloadItem<'a>,
         interfaces: std::collections::HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
         // Find the wasi:keyvalue interface
@@ -638,79 +669,9 @@ impl HostPlugin for CloudflareKeyValue {
             return Ok(());
         };
 
-        let workload_id = component_handle.workload_id().to_string();
+        let interface_config = interface.config.clone();
 
-        // Extract config from interface
-        let account_id = interface
-            .config
-            .get("account_id")
-            .cloned()
-            .unwrap_or_else(|| {
-                tracing::error!(
-                    workload_id = %workload_id,
-                    "No 'account_id' configured for wasi:keyvalue interface"
-                );
-                String::new()
-            });
-
-        let api_token = interface
-            .config
-            .get("api_token")
-            .cloned()
-            .unwrap_or_else(|| {
-                tracing::error!(
-                    workload_id = %workload_id,
-                    "No 'api_token' configured for wasi:keyvalue interface"
-                );
-                String::new()
-            });
-
-        let namespace = interface
-            .config
-            .get("namespace_id")
-            .cloned()
-            .unwrap_or_else(|| {
-                tracing::error!(
-                    workload_id = %workload_id,
-                    "No 'namespace_id' configured for wasi:keyvalue interface"
-                );
-                String::new()
-            });
-
-        if account_id.is_empty() || api_token.is_empty() || namespace.is_empty() {
-            tracing::error!(
-                workload_id = %workload_id,
-                "Cloudflare KV plugin bound with incomplete config. \
-                 Required: account_id, api_token, namespace"
-            );
-        }
-
-        debug!(
-            workload_id = %workload_id,
-            account_id = %account_id,
-            namespace = %namespace,
-            "Configuring Cloudflare KV for workload"
-        );
-
-        // Save the config for this workload
-        {
-            let mut configs = self.configs.write().await;
-            configs.insert(
-                workload_id.clone(),
-                CloudflareWorkloadConfig {
-                    account_id,
-                    api_token,
-                    namespace,
-                },
-            );
-        }
-
-        debug!(
-           workload_id = %workload_id,
-            "Adding Cloudflare KV keyvalue interfaces to linker for workload"
-        );
-        let linker = component_handle.linker();
-
+        let linker = item.linker();
         bindings::wasi::keyvalue::store::add_to_linker::<_, SharedCtx>(linker, extract_active_ctx)?;
         bindings::wasi::keyvalue::atomics::add_to_linker::<_, SharedCtx>(
             linker,
@@ -718,12 +679,19 @@ impl HostPlugin for CloudflareKeyValue {
         )?;
         bindings::wasi::keyvalue::batch::add_to_linker::<_, SharedCtx>(linker, extract_active_ctx)?;
 
+        let WorkloadItem::Component(component_handle) = item else {
+            return Ok(());
+        };
+
         debug!(
-           workload_id = %workload_id,
-            "Successfully added Cloudflare KV keyvalue interfaces to linker for workload"
+            component_id = component_handle.id(),
+            "CloudflareKeyValue plugin bound to component"
         );
 
-        debug!("CloudflareKeyValue plugin bound to workload '{workload_id}'");
+        self.tracker
+            .write()
+            .await
+            .add_component(component_handle, ComponentData { interface_config });
 
         Ok(())
     }
@@ -733,12 +701,12 @@ impl HostPlugin for CloudflareKeyValue {
         workload_id: &str,
         _interfaces: std::collections::HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
-        // Clean up the config for this workload
-        {
-            let mut configs = self.configs.write().await;
-            configs.remove(workload_id);
-        }
-        debug!("CloudflareKeyValue plugin unbound from workload '{workload_id}'");
+        self.tracker
+            .write()
+            .await
+            .remove_workload_with_cleanup(workload_id, |_| async {}, |_| async {})
+            .await;
+        debug!(workload_id = %workload_id, "CloudflareKeyValue plugin unbound");
         Ok(())
     }
 }
@@ -750,17 +718,17 @@ mod tests {
     #[test]
     fn test_plugin_id() {
         let plugin = CloudflareKeyValue::new();
-        assert_eq!(plugin.id(), "wasi-keyvalue-cf");
+        assert_eq!(plugin.id(), PLUGIN_KEYVALUE_ID);
     }
 
     #[test]
-    fn test_world_imports() {
+    fn test_world_exports() {
         let plugin = CloudflareKeyValue::new();
         let world = plugin.world();
 
         assert!(
             world
-                .imports
+                .exports
                 .iter()
                 .any(|i| i.namespace == "wasi" && i.package == "keyvalue")
         );
@@ -769,6 +737,6 @@ mod tests {
     #[test]
     fn test_default() {
         let plugin = CloudflareKeyValue::default();
-        assert_eq!(plugin.id(), "wasi-keyvalue-cf");
+        assert_eq!(plugin.id(), PLUGIN_KEYVALUE_ID);
     }
 }

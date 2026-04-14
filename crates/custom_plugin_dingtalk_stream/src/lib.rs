@@ -273,6 +273,16 @@ struct GuestCallbackBridge {
 #[async_trait]
 impl dingtalk_stream::CallbackHandler for GuestCallbackBridge {
     async fn process(&self, callback_message: &dingtalk_stream::MessageBody) -> (u16, String) {
+        // Record metrics via global meter
+        {
+            let meter = opentelemetry::global::meter("dingtalk-stream");
+            let counter = meter
+                .u64_counter("dingtalk_stream_messages_total")
+                .with_description("Total number of DingTalk messages processed")
+                .build();
+            counter.add(1, &[opentelemetry::KeyValue::new("direction", "inbound")]);
+        }
+
         let data: serde_json::Value = match serde_json::from_str(&callback_message.data) {
             Ok(v) => v,
             Err(e) => {

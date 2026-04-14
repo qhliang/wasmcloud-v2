@@ -288,6 +288,16 @@ fn spawn_weixin_client(
     #[async_trait::async_trait]
     impl MessageHandler for WasmMessageHandler {
         async fn on_message(&self, ctx: &MessageContext) -> weixin_agent::Result<()> {
+            // Record metrics via global meter
+            {
+                let meter = opentelemetry::global::meter("wechat");
+                let counter = meter
+                    .u64_counter("wechat_messages_total")
+                    .with_description("Total number of WeChat messages processed")
+                    .build();
+                counter.add(1, &[opentelemetry::KeyValue::new("direction", "inbound")]);
+            }
+
             let media_type = ctx.media.as_ref().map(|_| "media").unwrap_or("text");
 
             let wx_msg = WechatMessage {
