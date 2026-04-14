@@ -7,48 +7,27 @@ interface types {
         invalid-address(string),
         internal(string),
     }
+
+    record mail-config {
+        smtp-host: string,
+        smtp-port: option<u16>,
+        username: string,
+        password: string,
+        default-from: string,
+        imap-host: option<string>,
+    }
 }
 
-/// Host-provided API for guest to send emails via SMTP and read emails via IMAP.
 interface sender {
-    use types.{mail-error};
+    use types.{mail-error, mail-config};
 
-    /// Send an email message.
-    ///
-    /// - to: comma-separated recipient addresses
-    /// - subject: email subject line
-    /// - body-text: plain text body (optional)
-    /// - body-html: HTML body (optional)
-    /// - cc: comma-separated CC addresses (optional)
-    /// - bcc: comma-separated BCC addresses (optional)
-    send-mail: func(
-        to: string,
-        subject: string,
-        body-text: option<string>,
-        body-html: option<string>,
-        cc: option<string>,
-        bcc: option<string>,
-    ) -> result<_, mail-error>;
-
-    /// List emails in a mailbox, returns JSON string with message summaries.
-    ///
-    /// - mailbox: mailbox name (optional, defaults to "INBOX")
-    /// - search-criteria: IMAP search criteria (optional, defaults to "ALL")
-    /// - limit: maximum number of results (optional, defaults to 20)
-    list-mails: func(
-        mailbox: option<string>,
-        search-criteria: option<string>,
-        limit: option<u32>,
-    ) -> result<string, mail-error>;
-
-    /// Get a single email's full content by message ID, returns JSON string.
-    ///
-    /// - message-id: the UID of the message to fetch
-    /// - mailbox: mailbox name (optional, defaults to "INBOX")
-    get-mail: func(
-        message-id: string,
-        mailbox: option<string>,
-    ) -> result<string, mail-error>;
+    resource mail-client {
+        constructor(config: option<mail-config>);
+        send-mail: func(to: string, subject: string, body-text: option<string>, body-html: option<string>, cc: option<string>, bcc: option<string>) -> result<_, mail-error>;
+        list-mails: func(mailbox: option<string>, search-criteria: option<string>, limit: option<u32>) -> result<string, mail-error>;
+        get-mail: func(message-id: string, mailbox: option<string>) -> result<string, mail-error>;
+        stop: func() -> result<_, mail-error>;
+    }
 }
 
 world mail {

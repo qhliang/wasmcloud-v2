@@ -1,8 +1,11 @@
-//! # Mail Host Plugin
+//! # Mail Host Plugin (Resource-based)
 //!
-//! This module implements a wasmCloud host plugin that provides
-//! `custom:mail/sender@0.1.0` interface for sending emails via SMTP
+//! Provides `custom:mail/sender@0.1.0` interface for sending emails via SMTP
 //! and reading emails via IMAP.
+//!
+//! Two config sources with priority:
+//! 1. Wasm dynamic config (passed via resource constructor)
+//! 2. Static interface config (fallback from wasmcloud config)
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -16,8 +19,10 @@ use tokio::sync::RwLock;
 use tracing::debug;
 use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use wash_runtime::engine::workload::WorkloadItem;
+use wash_runtime::plugin::config::{resolve_field, resolve_optional_field};
 use wash_runtime::plugin::HostPlugin;
 use wash_runtime::wit::{WitInterface, WitWorld};
+use wasmtime::component::Resource;
 
 mod bindings {
     wasmtime::component::bindgen!({
@@ -25,12 +30,24 @@ mod bindings {
         imports: {
             default: async | trappable | tracing,
         },
+        with: {
+            "custom:mail/sender.mail-client": super::MailClientHandle,
+        },
     });
 }
 
-use bindings::custom::mail::types::MailError;
+use bindings::custom::mail::types::{MailConfig, MailError};
 
 const PLUGIN_ID: &str = "plugin-mail";
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/// Host-side state for a mail-client resource instance.
+pub struct MailClientHandle {
+    config: PluginConfig,
+}
 
 /// SMTP + IMAP configuration for a workload
 #[derive(Clone, Debug)]
@@ -44,147 +61,173 @@ struct PluginConfig {
     imap_port: u16,
 }
 
-/// Extract and validate config from interface config.
-fn extract_config(interface: &WitInterface) -> Result<PluginConfig, String> {
-    let smtp_host = interface
-        .config
-        .get("smtp-host")
-        .cloned()
-        .unwrap_or_default();
-    if smtp_host.is_empty() {
-        return Err("missing required config: 'smtp-host'".to_string());
-    }
-
-    let smtp_port: u16 = interface
-        .config
-        .get("smtp-port")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(465);
-
-    let username = interface
-        .config
-        .get("username")
-        .cloned()
-        .unwrap_or_default();
-    if username.is_empty() {
-        return Err("missing required config: 'username'".to_string());
-    }
-
-    let password = interface
-        .config
-        .get("password")
-        .cloned()
-        .unwrap_or_default();
-    if password.is_empty() {
-        return Err("missing required config: 'password'".to_string());
-    }
-
-    let default_from = interface
-        .config
-        .get("default-from")
-        .cloned()
-        .unwrap_or_default();
-    if default_from.is_empty() {
-        return Err("missing required config: 'default-from'".to_string());
-    }
-
-    let imap_host = interface.config.get("imap-host").cloned();
-    let imap_port: u16 = interface
-        .config
-        .get("imap-port")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(993);
-
-    Ok(PluginConfig {
-        smtp_host,
-        smtp_port,
-        username,
-        password,
-        default_from,
-        imap_host,
-        imap_port,
-    })
+/// Per-component data.
+struct ComponentData {
+    /// Static interface config from wasmcloud config (fallback source)
+    interface_config: HashMap<String, String>,
 }
 
-/// Parse comma-separated email addresses into a Vec of Mailbox.
-fn parse_addresses(addrs: &str) -> Result<Vec<Mailbox>, String> {
-    let mut result = Vec::new();
-    for addr in addrs.split(',') {
-        let addr = addr.trim();
-        if addr.is_empty() {
-            continue;
-        }
-        let mailbox: Mailbox = addr.parse().map_err(|e: lettre::address::AddressError| {
-            format!("invalid address '{}': {}", addr, e)
-        })?;
-        result.push(mailbox);
-    }
-    if result.is_empty() {
-        return Err("no valid addresses provided".to_string());
-    }
-    Ok(result)
-}
+// ---------------------------------------------------------------------------
+// Plugin struct
+// ---------------------------------------------------------------------------
 
-/// Connect to an IMAP server via TLS and authenticate.
-async fn connect_imap(
-    config: &PluginConfig,
-) -> Result<async_imap::Session<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>, String> {
-    let imap_host = match &config.imap_host {
-        Some(h) => h.clone(),
-        None => return Err("IMAP host not configured".to_string()),
-    };
-
-    let addr = format!("{imap_host}:{}", config.imap_port);
-    let tcp_stream = tokio::net::TcpStream::connect(&addr)
-        .await
-        .map_err(|e| format!("failed to connect to IMAP server '{addr}': {e}"))?;
-
-    let root_cert_store =
-        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let client_config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_cert_store)
-        .with_no_client_auth();
-    let config_ref = Arc::new(client_config);
-    let server_name = rustls_pki_types::ServerName::try_from(imap_host.clone())
-        .map_err(|e| format!("invalid IMAP server name '{imap_host}': {e}"))?;
-    let connector = tokio_rustls::TlsConnector::from(config_ref);
-    let tls_stream = connector
-        .connect(server_name, tcp_stream)
-        .await
-        .map_err(|e| format!("TLS handshake failed for IMAP: {e}"))?;
-
-    let client = async_imap::Client::new(tls_stream);
-    let session = client
-        .login(&config.username, &config.password)
-        .await
-        .map_err(|(e, _)| format!("IMAP login failed: {e}"))?;
-
-    Ok(session)
-}
-
-/// Mail host plugin for sending emails via SMTP and reading via IMAP.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Mail {
-    configs: Arc<RwLock<HashMap<String, PluginConfig>>>,
+    tracker: Arc<RwLock<HashMap<String, ComponentData>>>,
+}
+
+impl Default for Mail {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Mail {
-    /// Create a new Mail plugin.
-    /// Configuration is provided per-workload via interface config.
     pub fn new() -> Self {
         Self {
-            configs: Arc::new(RwLock::new(HashMap::new())),
+            tracker: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
 
-// ============================================================================
-// Sender Interface Implementation
-// ============================================================================
+// ---------------------------------------------------------------------------
+// WIT types::Host
+// ---------------------------------------------------------------------------
 
-impl<'a> bindings::custom::mail::sender::Host for ActiveCtx<'a> {
+impl<'a> bindings::custom::mail::types::Host for ActiveCtx<'a> {}
+
+// ---------------------------------------------------------------------------
+// WIT sender::Host — empty (resource lives in HostMailClient)
+// ---------------------------------------------------------------------------
+
+impl<'a> bindings::custom::mail::sender::Host for ActiveCtx<'a> {}
+
+// ---------------------------------------------------------------------------
+// WIT sender::HostMailClient — resource constructor + methods
+// ---------------------------------------------------------------------------
+
+impl<'a> bindings::custom::mail::sender::HostMailClient for ActiveCtx<'a> {
+    async fn new(
+        &mut self,
+        config: Option<MailConfig>,
+    ) -> wasmtime::Result<Resource<MailClientHandle>> {
+        let Some(plugin) = self.get_plugin::<Mail>(PLUGIN_ID) else {
+            return Err(wasmtime::Error::msg("mail plugin not available"));
+        };
+
+        let component_id: Arc<str> = self.component_id.clone();
+        let lock = plugin.tracker.read().await;
+        let Some(data) = lock.get(component_id.as_ref()) else {
+            return Err(wasmtime::Error::msg("component not tracked"));
+        };
+
+        // Resolve required fields: smtp-host, username, password, default-from
+        let smtp_host = match resolve_field(
+            config.as_ref().map(|c| c.smtp_host.clone()),
+            &data.interface_config,
+            "smtp-host",
+        ) {
+            Ok(v) => v,
+            Err(_) => {
+                return Err(wasmtime::Error::msg(
+                    "missing smtp-host: provide via constructor or interface config",
+                ));
+            }
+        };
+
+        let username = match resolve_field(
+            config.as_ref().map(|c| c.username.clone()),
+            &data.interface_config,
+            "username",
+        ) {
+            Ok(v) => v,
+            Err(_) => {
+                return Err(wasmtime::Error::msg(
+                    "missing username: provide via constructor or interface config",
+                ));
+            }
+        };
+
+        let password = match resolve_field(
+            config.as_ref().map(|c| c.password.clone()),
+            &data.interface_config,
+            "password",
+        ) {
+            Ok(v) => v,
+            Err(_) => {
+                return Err(wasmtime::Error::msg(
+                    "missing password: provide via constructor or interface config",
+                ));
+            }
+        };
+
+        let default_from = match resolve_field(
+            config.as_ref().map(|c| c.default_from.clone()),
+            &data.interface_config,
+            "default-from",
+        ) {
+            Ok(v) => v,
+            Err(_) => {
+                return Err(wasmtime::Error::msg(
+                    "missing default-from: provide via constructor or interface config",
+                ));
+            }
+        };
+
+        // Resolve optional fields: smtp-port, imap-host
+        let smtp_port: u16 = resolve_optional_field(
+            config.as_ref().and_then(|c| c.smtp_port.map(|p| p.to_string())),
+            &data.interface_config,
+            "smtp-port",
+        )
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(465);
+
+        let imap_host = resolve_optional_field(
+            config.as_ref().and_then(|c| c.imap_host.clone()),
+            &data.interface_config,
+            "imap-host",
+        );
+
+        let imap_port: u16 = resolve_optional_field(
+            None,
+            &data.interface_config,
+            "imap-port",
+        )
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(993);
+
+        drop(lock);
+
+        let plugin_config = PluginConfig {
+            smtp_host,
+            smtp_port,
+            username,
+            password,
+            default_from,
+            imap_host,
+            imap_port,
+        };
+
+        debug!(
+            smtp_host = %plugin_config.smtp_host,
+            smtp_port = plugin_config.smtp_port,
+            imap_host = ?plugin_config.imap_host,
+            default_from = %plugin_config.default_from,
+            "Mail client resource created"
+        );
+
+        let handle = MailClientHandle {
+            config: plugin_config,
+        };
+
+        let resource = self.table.push(handle)?;
+        Ok(resource)
+    }
+
     async fn send_mail(
         &mut self,
+        client: Resource<MailClientHandle>,
         to: String,
         subject: String,
         body_text: Option<String>,
@@ -192,34 +235,15 @@ impl<'a> bindings::custom::mail::sender::Host for ActiveCtx<'a> {
         cc: Option<String>,
         bcc: Option<String>,
     ) -> wasmtime::Result<Result<(), MailError>> {
-        let Some(plugin) = self.get_plugin::<Mail>(PLUGIN_ID) else {
-            return Ok(Err(MailError::Internal(
-                "Mail plugin not available".to_string(),
-            )));
-        };
-
-        let workload_id = self.workload_id.as_ref().to_string();
-
-        let config = {
-            let configs = plugin.configs.read().await;
-            match configs.get(&workload_id).cloned() {
-                Some(c) => c,
-                None => {
-                    return Ok(Err(MailError::ConfigError(format!(
-                        "no mail config found for workload '{}'",
-                        workload_id
-                    ))));
-                }
-            }
-        };
+        let handle = self.table.get(&client)?;
 
         // Parse from address
-        let from_mailbox: Mailbox = match config.default_from.parse() {
+        let from_mailbox: Mailbox = match handle.config.default_from.parse() {
             Ok(m) => m,
             Err(e) => {
                 return Ok(Err(MailError::InvalidAddress(format!(
                     "invalid from address '{}': {}",
-                    config.default_from, e
+                    handle.config.default_from, e
                 ))));
             }
         };
@@ -298,19 +322,18 @@ impl<'a> bindings::custom::mail::sender::Host for ActiveCtx<'a> {
         };
 
         debug!(
-            workload_id = %workload_id,
             to = %to,
             subject = %subject,
             "Sending email via SMTP"
         );
 
         // Build SMTP transport
-        let creds = Credentials::new(config.username.clone(), config.password.clone());
+        let creds = Credentials::new(handle.config.username.clone(), handle.config.password.clone());
 
         let mailer =
-            match AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&config.smtp_host) {
+            match AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&handle.config.smtp_host) {
                 Ok(m) => m,
-                Err(_) => match AsyncSmtpTransport::<Tokio1Executor>::relay(&config.smtp_host) {
+                Err(_) => match AsyncSmtpTransport::<Tokio1Executor>::relay(&handle.config.smtp_host) {
                     Ok(m) => m,
                     Err(e) => {
                         return Ok(Err(MailError::Internal(format!(
@@ -319,16 +342,13 @@ impl<'a> bindings::custom::mail::sender::Host for ActiveCtx<'a> {
                     }
                 },
             }
-            .port(config.smtp_port)
+            .port(handle.config.smtp_port)
             .credentials(creds)
             .build();
 
         match mailer.send(email).await {
             Ok(_) => {
-                debug!(
-                    workload_id = %workload_id,
-                    "Email sent successfully"
-                );
+                debug!("Email sent successfully");
                 Ok(Ok(()))
             }
             Err(e) => {
@@ -343,32 +363,14 @@ impl<'a> bindings::custom::mail::sender::Host for ActiveCtx<'a> {
 
     async fn list_mails(
         &mut self,
+        client: Resource<MailClientHandle>,
         mailbox: Option<String>,
         search_criteria: Option<String>,
         limit: Option<u32>,
     ) -> wasmtime::Result<Result<String, MailError>> {
-        let Some(plugin) = self.get_plugin::<Mail>(PLUGIN_ID) else {
-            return Ok(Err(MailError::Internal(
-                "Mail plugin not available".to_string(),
-            )));
-        };
+        let handle = self.table.get(&client)?;
 
-        let workload_id = self.workload_id.as_ref().to_string();
-
-        let config = {
-            let configs = plugin.configs.read().await;
-            match configs.get(&workload_id).cloned() {
-                Some(c) => c,
-                None => {
-                    return Ok(Err(MailError::ConfigError(format!(
-                        "no mail config found for workload '{}'",
-                        workload_id
-                    ))));
-                }
-            }
-        };
-
-        let mut session = match connect_imap(&config).await {
+        let mut session = match connect_imap(&handle.config).await {
             Ok(s) => s,
             Err(e) => return Ok(Err(MailError::Internal(e))),
         };
@@ -466,31 +468,13 @@ impl<'a> bindings::custom::mail::sender::Host for ActiveCtx<'a> {
 
     async fn get_mail(
         &mut self,
+        client: Resource<MailClientHandle>,
         message_id: String,
         mailbox: Option<String>,
     ) -> wasmtime::Result<Result<String, MailError>> {
-        let Some(plugin) = self.get_plugin::<Mail>(PLUGIN_ID) else {
-            return Ok(Err(MailError::Internal(
-                "Mail plugin not available".to_string(),
-            )));
-        };
+        let handle = self.table.get(&client)?;
 
-        let workload_id = self.workload_id.as_ref().to_string();
-
-        let config = {
-            let configs = plugin.configs.read().await;
-            match configs.get(&workload_id).cloned() {
-                Some(c) => c,
-                None => {
-                    return Ok(Err(MailError::ConfigError(format!(
-                        "no mail config found for workload '{}'",
-                        workload_id
-                    ))));
-                }
-            }
-        };
-
-        let mut session = match connect_imap(&config).await {
+        let mut session = match connect_imap(&handle.config).await {
             Ok(s) => s,
             Err(e) => return Ok(Err(MailError::Internal(e))),
         };
@@ -571,6 +555,85 @@ impl<'a> bindings::custom::mail::sender::Host for ActiveCtx<'a> {
             )))),
         }
     }
+
+    async fn stop(
+        &mut self,
+        _client: Resource<MailClientHandle>,
+    ) -> wasmtime::Result<Result<(), MailError>> {
+        // No background tasks to stop; no-op
+        debug!("Mail client stop() called (no-op)");
+        Ok(Ok(()))
+    }
+
+    async fn drop(
+        &mut self,
+        rep: Resource<MailClientHandle>,
+    ) -> wasmtime::Result<()> {
+        if let Ok(_handle) = self.table.delete(rep) {
+            debug!("Mail client resource dropped");
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Parse comma-separated email addresses into a Vec of Mailbox.
+fn parse_addresses(addrs: &str) -> Result<Vec<Mailbox>, String> {
+    let mut result = Vec::new();
+    for addr in addrs.split(',') {
+        let addr = addr.trim();
+        if addr.is_empty() {
+            continue;
+        }
+        let mailbox: Mailbox = addr.parse().map_err(|e: lettre::address::AddressError| {
+            format!("invalid address '{}': {}", addr, e)
+        })?;
+        result.push(mailbox);
+    }
+    if result.is_empty() {
+        return Err("no valid addresses provided".to_string());
+    }
+    Ok(result)
+}
+
+/// Connect to an IMAP server via TLS and authenticate.
+async fn connect_imap(
+    config: &PluginConfig,
+) -> Result<async_imap::Session<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>, String> {
+    let imap_host = match &config.imap_host {
+        Some(h) => h.clone(),
+        None => return Err("IMAP host not configured".to_string()),
+    };
+
+    let addr = format!("{imap_host}:{}", config.imap_port);
+    let tcp_stream = tokio::net::TcpStream::connect(&addr)
+        .await
+        .map_err(|e| format!("failed to connect to IMAP server '{addr}': {e}"))?;
+
+    let root_cert_store =
+        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let client_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_cert_store)
+        .with_no_client_auth();
+    let config_ref = Arc::new(client_config);
+    let server_name = rustls_pki_types::ServerName::try_from(imap_host.clone())
+        .map_err(|e| format!("invalid IMAP server name '{imap_host}': {e}"))?;
+    let connector = tokio_rustls::TlsConnector::from(config_ref);
+    let tls_stream = connector
+        .connect(server_name, tcp_stream)
+        .await
+        .map_err(|e| format!("TLS handshake failed for IMAP: {e}"))?;
+
+    let client = async_imap::Client::new(tls_stream);
+    let session = client
+        .login(&config.username, &config.password)
+        .await
+        .map_err(|(e, _)| format!("IMAP login failed: {e}"))?;
+
+    Ok(session)
 }
 
 /// Recursively extract text and HTML bodies from a parsed email.
@@ -603,9 +666,9 @@ fn extract_bodies(
     }
 }
 
-// ============================================================================
+// ---------------------------------------------------------------------------
 // HostPlugin Implementation
-// ============================================================================
+// ---------------------------------------------------------------------------
 
 #[async_trait]
 impl HostPlugin for Mail {
@@ -625,45 +688,36 @@ impl HostPlugin for Mail {
         component_handle: &mut WorkloadItem<'a>,
         interfaces: HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
-        let mail_interface = interfaces
+        let Some(interface) = interfaces
             .iter()
-            .find(|i| i.namespace == "custom" && i.package == "mail");
-
-        let Some(interface) = mail_interface else {
+            .find(|i| i.namespace == "custom" && i.package == "mail")
+        else {
             return Ok(());
         };
 
-        let workload_id = component_handle.workload_id().to_string();
+        let interface_config = interface.config.clone();
 
-        let config = match extract_config(interface) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(
-                    workload_id = %workload_id,
-                    "Mail plugin config validation failed: {}", e
-                );
-                return Ok(());
-            }
+        bindings::custom::mail::types::add_to_linker::<_, SharedCtx>(
+            component_handle.linker(),
+            extract_active_ctx,
+        )?;
+        bindings::custom::mail::sender::add_to_linker::<_, SharedCtx>(
+            component_handle.linker(),
+            extract_active_ctx,
+        )?;
+
+        let WorkloadItem::Component(ch) = component_handle else {
+            return Ok(());
         };
 
-        debug!(
-            workload_id = %workload_id,
-            smtp_host = %config.smtp_host,
-            smtp_port = config.smtp_port,
-            imap_host = ?config.imap_host,
-            default_from = %config.default_from,
-            "Configuring Mail plugin for workload"
+        let component_id = ch.id().to_string();
+        debug!(component_id = %component_id, "Mail plugin bound to component");
+
+        self.tracker.write().await.insert(
+            component_id,
+            ComponentData { interface_config },
         );
 
-        {
-            let mut configs = self.configs.write().await;
-            configs.insert(workload_id.clone(), config);
-        }
-
-        let linker = component_handle.linker();
-        bindings::custom::mail::sender::add_to_linker::<_, SharedCtx>(linker, extract_active_ctx)?;
-
-        debug!("Mail plugin bound to workload '{workload_id}'");
         Ok(())
     }
 
@@ -672,11 +726,8 @@ impl HostPlugin for Mail {
         workload_id: &str,
         _interfaces: HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
-        {
-            let mut configs = self.configs.write().await;
-            configs.remove(workload_id);
-        }
-        debug!("Mail plugin unbound from workload '{workload_id}'");
+        self.tracker.write().await.remove(workload_id);
+        debug!(workload_id = %workload_id, "Mail plugin unbound");
         Ok(())
     }
 }
@@ -695,96 +746,6 @@ mod tests {
     fn test_default() {
         let plugin = Mail::default();
         assert_eq!(plugin.id(), PLUGIN_ID);
-    }
-
-    #[test]
-    fn test_extract_config_valid() {
-        let mut config = HashMap::new();
-        config.insert("smtp-host".to_string(), "smtp.example.com".to_string());
-        config.insert("smtp-port".to_string(), "587".to_string());
-        config.insert("username".to_string(), "user@example.com".to_string());
-        config.insert("password".to_string(), "secret".to_string());
-        config.insert(
-            "default-from".to_string(),
-            "noreply@example.com".to_string(),
-        );
-
-        let interface = WitInterface {
-            namespace: "custom".to_string(),
-            package: "plugin-mail".to_string(),
-            interfaces: HashSet::new(),
-            version: None,
-            config,
-            name: None,
-        };
-
-        let cfg = extract_config(&interface).unwrap();
-        assert_eq!(cfg.smtp_host, "smtp.example.com");
-        assert_eq!(cfg.smtp_port, 587);
-        assert_eq!(cfg.username, "user@example.com");
-        assert!(cfg.imap_host.is_none());
-        assert_eq!(cfg.imap_port, 993);
-    }
-
-    #[test]
-    fn test_extract_config_with_imap() {
-        let mut config = HashMap::new();
-        config.insert("smtp-host".to_string(), "smtp.example.com".to_string());
-        config.insert("username".to_string(), "user".to_string());
-        config.insert("password".to_string(), "pass".to_string());
-        config.insert("default-from".to_string(), "from@example.com".to_string());
-        config.insert("imap-host".to_string(), "imap.example.com".to_string());
-        config.insert("imap-port".to_string(), "993".to_string());
-
-        let interface = WitInterface {
-            namespace: "custom".to_string(),
-            package: "plugin-mail".to_string(),
-            interfaces: HashSet::new(),
-            version: None,
-            config,
-            name: None,
-        };
-
-        let cfg = extract_config(&interface).unwrap();
-        assert_eq!(cfg.imap_host.as_deref(), Some("imap.example.com"));
-        assert_eq!(cfg.imap_port, 993);
-    }
-
-    #[test]
-    fn test_extract_config_default_port() {
-        let mut config = HashMap::new();
-        config.insert("smtp-host".to_string(), "smtp.example.com".to_string());
-        config.insert("username".to_string(), "user".to_string());
-        config.insert("password".to_string(), "pass".to_string());
-        config.insert("default-from".to_string(), "from@example.com".to_string());
-
-        let interface = WitInterface {
-            namespace: "custom".to_string(),
-            package: "plugin-mail".to_string(),
-            interfaces: HashSet::new(),
-            version: None,
-            config,
-            name: None,
-        };
-
-        let cfg = extract_config(&interface).unwrap();
-        assert_eq!(cfg.smtp_port, 465);
-    }
-
-    #[test]
-    fn test_extract_config_missing_host() {
-        let interface = WitInterface {
-            namespace: "custom".to_string(),
-            package: "plugin-mail".to_string(),
-            interfaces: HashSet::new(),
-            version: None,
-            config: HashMap::new(),
-            name: None,
-        };
-
-        let result = extract_config(&interface);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("smtp-host"));
     }
 
     #[test]
