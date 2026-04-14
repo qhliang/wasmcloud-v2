@@ -51,6 +51,7 @@ mod bindings {
         imports: {
             default: async | trappable | tracing,
         },
+        exports: { default: async | tracing },
         with: {
             "custom:dingtalk-stream/sender.dingtalk-client": super::DingtalkClientHandle,
         },
@@ -66,10 +67,10 @@ const PLUGIN_ID: &str = "dingtalk-stream";
 // ---------------------------------------------------------------------------
 
 /// Host-side state for a dingtalk-client resource instance.
+/// The stream listener has its own cancel token stored in ComponentData.
 pub struct DingtalkClientHandle {
     replier: ChatbotReplier,
     credential: Credential,
-    cancel_token: tokio_util::sync::CancellationToken,
 }
 
 /// Per-component data.
@@ -78,6 +79,12 @@ struct ComponentData {
     interface_config: HashMap<String, String>,
     /// Resolved workload
     workload: Option<ResolvedWorkload>,
+    /// Shared replier for sending messages
+    replier: Option<ChatbotReplier>,
+    /// Shared credential for access tokens
+    credential: Option<Credential>,
+    /// Cancellation token for the stream listener
+    stream_cancel_token: Option<tokio_util::sync::CancellationToken>,
 }
 
 // ---------------------------------------------------------------------------
@@ -122,7 +129,7 @@ impl<'a> bindings::custom::dingtalk_stream::sender::Host for ActiveCtx<'a> {}
 impl<'a> bindings::custom::dingtalk_stream::sender::HostDingtalkClient for ActiveCtx<'a> {
     async fn new(
         &mut self,
-        config: Option<DingtalkConfig>,
+        _config: Option<DingtalkConfig>,
     ) -> wasmtime::Result<Resource<DingtalkClientHandle>> {
         let Some(plugin) = self.get_plugin::<DingTalk>(PLUGIN_ID) else {
             return Err(wasmtime::Error::msg("dingtalk-stream plugin not available"));
@@ -134,62 +141,22 @@ impl<'a> bindings::custom::dingtalk_stream::sender::HostDingtalkClient for Activ
             return Err(wasmtime::Error::msg("component not tracked"));
         };
 
-        // Resolve client-id and client-secret with priority:
-        // Wasm dynamic config > static interface config
-        let client_id = match resolve_field(
-            config.as_ref().map(|c| c.client_id.clone()),
-            &data.interface_config,
-            "client-id",
-        ) {
-            Ok(id) => id,
-            Err(_) => {
-                return Err(wasmtime::Error::msg(
-                    "missing client-id: provide via constructor or interface config",
-                ));
-            }
+        let Some(replier) = data.replier.clone() else {
+            return Err(wasmtime::Error::msg(
+                "dingtalk stream not started — listener should be running from on_workload_resolved",
+            ));
         };
 
-        let client_secret = match resolve_field(
-            config.as_ref().map(|c| c.client_secret.clone()),
-            &data.interface_config,
-            "client-secret",
-        ) {
-            Ok(secret) => secret,
-            Err(_) => {
-                return Err(wasmtime::Error::msg(
-                    "missing client-secret: provide via constructor or interface config",
-                ));
-            }
-        };
-
-        let Some(workload) = &data.workload else {
-            return Err(wasmtime::Error::msg("workload not resolved yet"));
-        };
-
-        let workload = workload.clone();
+        let credential = data
+            .credential
+            .clone()
+            .ok_or_else(|| wasmtime::Error::msg("dingtalk credential not available"))?;
 
         drop(lock);
-
-        let cancel_token = tokio_util::sync::CancellationToken::new();
-        let credential = Credential::new(&client_id, &client_secret);
-
-        // Build a temporary client to get a ChatbotReplier
-        let temp_client = DingTalkStreamClient::builder(credential.clone()).build();
-        let replier = temp_client.chatbot_replier();
-
-        // Spawn the background stream client
-        spawn_dingtalk_stream(
-            workload,
-            component_id.to_string(),
-            replier.clone(),
-            credential.clone(),
-            cancel_token.clone(),
-        );
 
         let handle = DingtalkClientHandle {
             replier,
             credential,
-            cancel_token,
         };
 
         let resource = self.table.push(handle)?;
@@ -278,18 +245,14 @@ impl<'a> bindings::custom::dingtalk_stream::sender::HostDingtalkClient for Activ
 
     async fn stop(
         &mut self,
-        client: Resource<DingtalkClientHandle>,
+        _client: Resource<DingtalkClientHandle>,
     ) -> wasmtime::Result<Result<(), DingtalkError>> {
-        let handle = self.table.get(&client)?;
-        handle.cancel_token.cancel();
-        debug!("DingTalk stream client stopped via stop()");
+        debug!("DingTalk client resource stop() — stream listener unaffected");
         Ok(Ok(()))
     }
 
     async fn drop(&mut self, rep: Resource<DingtalkClientHandle>) -> wasmtime::Result<()> {
-        if let Ok(handle) = self.table.delete(rep) {
-            handle.cancel_token.cancel();
-        }
+        let _ = self.table.delete(rep);
         Ok(())
     }
 }
@@ -305,7 +268,6 @@ struct GuestCallbackBridge {
     component_id: String,
     replier: ChatbotReplier,
     credential: Credential,
-    cancel_token: tokio_util::sync::CancellationToken,
 }
 
 #[async_trait]
@@ -356,7 +318,6 @@ impl dingtalk_stream::CallbackHandler for GuestCallbackBridge {
         let cid = self.component_id.clone();
         let replier = self.replier.clone();
         let credential = self.credential.clone();
-        let cancel_token = self.cancel_token.clone();
 
         tokio::spawn(async move {
             let mut store = match workload.new_store(&cid).await {
@@ -375,7 +336,6 @@ impl dingtalk_stream::CallbackHandler for GuestCallbackBridge {
             let temp_handle = DingtalkClientHandle {
                 replier,
                 credential,
-                cancel_token,
             };
             let client_resource = match store.data_mut().table.push(temp_handle) {
                 Ok(r) => r,
@@ -425,11 +385,11 @@ impl dingtalk_stream::CallbackHandler for GuestCallbackBridge {
                 }
             };
 
-            match proxy.custom_dingtalk_stream_handler().call_on_message(
-                &mut store,
-                client_resource,
-                &wit_msg,
-            ) {
+            match proxy
+                .custom_dingtalk_stream_handler()
+                .call_on_message(&mut store, client_resource, &wit_msg)
+                .await
+            {
                 Ok(Ok(())) => {
                     debug!(
                         component_id = %cid,
@@ -473,7 +433,6 @@ fn spawn_dingtalk_stream(
         component_id: component_id.clone(),
         replier: replier.clone(),
         credential: credential.clone(),
-        cancel_token: cancel_token.clone(),
     };
 
     let mut client = DingTalkStreamClient::builder(credential)
@@ -586,6 +545,9 @@ impl HostPlugin for DingTalk {
             ComponentData {
                 interface_config,
                 workload: None,
+                replier: None,
+                credential: None,
+                stream_cancel_token: None,
             },
         );
 
@@ -600,6 +562,54 @@ impl HostPlugin for DingTalk {
         let mut lock = self.tracker.write().await;
         if let Some(data) = lock.get_component_data_mut(component_id) {
             data.workload = Some(workload.clone());
+
+            if data.replier.is_none() {
+                let client_id = match resolve_field(None, &data.interface_config, "client-id") {
+                    Ok(id) => id,
+                    Err(e) => {
+                        warn!(
+                            component_id,
+                            error = %e,
+                            "dingtalk: no client-id configured, skipping stream start"
+                        );
+                        return Ok(());
+                    }
+                };
+                let client_secret =
+                    match resolve_field(None, &data.interface_config, "client-secret") {
+                        Ok(secret) => secret,
+                        Err(e) => {
+                            warn!(
+                                component_id,
+                                error = %e,
+                                "dingtalk: no client-secret configured, skipping stream start"
+                            );
+                            return Ok(());
+                        }
+                    };
+
+                let cancel_token = tokio_util::sync::CancellationToken::new();
+                let credential = Credential::new(&client_id, &client_secret);
+
+                let temp_client = DingTalkStreamClient::builder(credential.clone()).build();
+                let replier = temp_client.chatbot_replier();
+
+                spawn_dingtalk_stream(
+                    workload.clone(),
+                    component_id.to_string(),
+                    replier.clone(),
+                    credential.clone(),
+                    cancel_token.clone(),
+                );
+
+                debug!(
+                    component_id,
+                    "DingTalk stream started from on_workload_resolved"
+                );
+                data.replier = Some(replier);
+                data.credential = Some(credential);
+                data.stream_cancel_token = Some(cancel_token);
+            }
         }
         Ok(())
     }
@@ -612,7 +622,16 @@ impl HostPlugin for DingTalk {
         self.tracker
             .write()
             .await
-            .remove_workload_with_cleanup(workload_id, |_| async {}, |_| async {})
+            .remove_workload_with_cleanup(
+                workload_id,
+                |_| async {},
+                |data| async move {
+                    if let Some(token) = data.stream_cancel_token.as_ref() {
+                        token.cancel();
+                        debug!(workload_id, "DingTalk stream cancelled on unbind");
+                    }
+                },
+            )
             .await;
         debug!(workload_id = %workload_id, "DingTalk stream plugin unbound");
         Ok(())

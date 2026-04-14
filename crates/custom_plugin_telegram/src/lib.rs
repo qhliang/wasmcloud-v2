@@ -24,6 +24,7 @@ mod bindings {
         imports: {
             default: async | trappable | tracing,
         },
+        exports: { default: async | tracing },
         with: {
             "custom:telegram/sender.telegram-bot": super::TelegramBotHandle,
         },
@@ -39,9 +40,9 @@ const PLUGIN_ID: &str = "telegram";
 // ---------------------------------------------------------------------------
 
 /// Host-side state for a telegram-bot resource instance.
+/// The polling loop has its own cancel token stored in ComponentData.
 pub struct TelegramBotHandle {
     bot: Arc<Bot>,
-    cancel_token: tokio_util::sync::CancellationToken,
 }
 
 /// Per-component data.
@@ -50,6 +51,10 @@ struct ComponentData {
     interface_config: HashMap<String, String>,
     /// Resolved workload
     workload: Option<ResolvedWorkload>,
+    /// Shared Bot instance (created in on_workload_resolved)
+    bot: Option<Arc<Bot>>,
+    /// Cancellation token for the polling loop
+    poll_cancel_token: Option<tokio_util::sync::CancellationToken>,
 }
 
 // ---------------------------------------------------------------------------
@@ -94,7 +99,7 @@ impl<'a> bindings::custom::telegram::sender::Host for ActiveCtx<'a> {}
 impl<'a> bindings::custom::telegram::sender::HostTelegramBot for ActiveCtx<'a> {
     async fn new(
         &mut self,
-        config: Option<TelegramConfig>,
+        _config: Option<TelegramConfig>,
     ) -> wasmtime::Result<Resource<TelegramBotHandle>> {
         let Some(plugin) = self.get_plugin::<Telegram>(PLUGIN_ID) else {
             return Err(wasmtime::Error::msg("telegram plugin not available"));
@@ -106,38 +111,15 @@ impl<'a> bindings::custom::telegram::sender::HostTelegramBot for ActiveCtx<'a> {
             return Err(wasmtime::Error::msg("component not tracked"));
         };
 
-        let bot_token = match resolve_field(
-            config.as_ref().map(|c| c.bot_token.clone()),
-            &data.interface_config,
-            "bot_token",
-        ) {
-            Ok(token) => token,
-            Err(_) => {
-                return Err(wasmtime::Error::msg(
-                    "missing bot_token: provide via constructor or interface config",
-                ));
-            }
+        let Some(bot) = data.bot.clone() else {
+            return Err(wasmtime::Error::msg(
+                "telegram bot not started — polling should be running from on_workload_resolved",
+            ));
         };
-
-        let Some(workload) = &data.workload else {
-            return Err(wasmtime::Error::msg("workload not resolved yet"));
-        };
-
-        let workload = workload.clone();
 
         drop(lock);
 
-        let cancel_token = tokio_util::sync::CancellationToken::new();
-        let bot = Arc::new(Bot::new(&bot_token));
-
-        spawn_telegram_bot(
-            workload,
-            component_id.to_string(),
-            bot.clone(),
-            cancel_token.clone(),
-        );
-
-        let handle = TelegramBotHandle { bot, cancel_token };
+        let handle = TelegramBotHandle { bot };
 
         let resource = self.table.push(handle)?;
         Ok(resource)
@@ -209,18 +191,14 @@ impl<'a> bindings::custom::telegram::sender::HostTelegramBot for ActiveCtx<'a> {
 
     async fn stop(
         &mut self,
-        bot: Resource<TelegramBotHandle>,
+        _bot: Resource<TelegramBotHandle>,
     ) -> wasmtime::Result<Result<(), TelegramError>> {
-        let handle = self.table.get(&bot)?;
-        handle.cancel_token.cancel();
-        debug!("Telegram bot stopped via stop()");
+        debug!("Telegram bot resource stop() — polling loop unaffected");
         Ok(Ok(()))
     }
 
     async fn drop(&mut self, rep: Resource<TelegramBotHandle>) -> wasmtime::Result<()> {
-        if let Ok(handle) = self.table.delete(rep) {
-            handle.cancel_token.cancel();
-        }
+        let _ = self.table.delete(rep);
         Ok(())
     }
 }
@@ -320,10 +298,7 @@ async fn handle_telegram_message(
         };
 
         // Temporary bot handle for the callback — guest can call methods on it
-        let temp_handle = TelegramBotHandle {
-            bot: bot_clone,
-            cancel_token: tokio_util::sync::CancellationToken::new(),
-        };
+        let temp_handle = TelegramBotHandle { bot: bot_clone };
         let bot_resource = match store.data_mut().table.push(temp_handle) {
             Ok(r) => r,
             Err(e) => {
@@ -359,6 +334,7 @@ async fn handle_telegram_message(
         match proxy
             .custom_telegram_handler()
             .call_on_message(&mut store, bot_resource, &tg_msg)
+            .await
         {
             Ok(Ok(())) => {
                 debug!(component_id = %cid, "Guest Telegram on-message handled successfully");
@@ -427,6 +403,8 @@ impl HostPlugin for Telegram {
             ComponentData {
                 interface_config,
                 workload: None,
+                bot: None,
+                poll_cancel_token: None,
             },
         );
 
@@ -441,6 +419,37 @@ impl HostPlugin for Telegram {
         let mut lock = self.tracker.write().await;
         if let Some(data) = lock.get_component_data_mut(component_id) {
             data.workload = Some(workload.clone());
+
+            if data.bot.is_none() {
+                let bot_token = match resolve_field(None, &data.interface_config, "bot_token") {
+                    Ok(token) => token,
+                    Err(e) => {
+                        warn!(
+                            component_id,
+                            error = %e,
+                            "telegram: no bot_token configured, skipping polling start"
+                        );
+                        return Ok(());
+                    }
+                };
+
+                let cancel_token = tokio_util::sync::CancellationToken::new();
+                let bot = Arc::new(Bot::new(&bot_token));
+
+                spawn_telegram_bot(
+                    workload.clone(),
+                    component_id.to_string(),
+                    bot.clone(),
+                    cancel_token.clone(),
+                );
+
+                debug!(
+                    component_id,
+                    "Telegram polling started from on_workload_resolved"
+                );
+                data.bot = Some(bot);
+                data.poll_cancel_token = Some(cancel_token);
+            }
         }
         Ok(())
     }
@@ -453,7 +462,16 @@ impl HostPlugin for Telegram {
         self.tracker
             .write()
             .await
-            .remove_workload_with_cleanup(workload_id, |_| async {}, |_| async {})
+            .remove_workload_with_cleanup(
+                workload_id,
+                |_| async {},
+                |data| async move {
+                    if let Some(token) = data.poll_cancel_token.as_ref() {
+                        token.cancel();
+                        debug!(workload_id, "Telegram polling cancelled on unbind");
+                    }
+                },
+            )
             .await;
         debug!(workload_id = %workload_id, "Telegram plugin unbound");
         Ok(())

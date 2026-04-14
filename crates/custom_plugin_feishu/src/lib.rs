@@ -24,6 +24,7 @@ mod bindings {
         imports: {
             default: async | trappable | tracing,
         },
+        exports: { default: async | tracing },
         with: {
             "custom:feishu/sender.feishu-client": super::FeishuClientHandle,
         },
@@ -39,9 +40,9 @@ pub(crate) const PLUGIN_ID: &str = "feishu";
 // ---------------------------------------------------------------------------
 
 /// Host-side state for a feishu-client resource instance.
+/// The WebSocket loop has its own cancel token stored in ComponentData.
 pub struct FeishuClientHandle {
     pub client: Arc<open_lark::prelude::LarkClient>,
-    pub cancel_token: tokio_util::sync::CancellationToken,
 }
 
 /// Per-component data.
@@ -50,6 +51,10 @@ struct ComponentData {
     interface_config: HashMap<String, String>,
     /// Resolved workload
     workload: Option<ResolvedWorkload>,
+    /// Shared LarkClient (created in on_workload_resolved)
+    client: Option<Arc<open_lark::prelude::LarkClient>>,
+    /// Cancellation token for the WebSocket listener
+    ws_cancel_token: Option<tokio_util::sync::CancellationToken>,
 }
 
 // ---------------------------------------------------------------------------
@@ -203,7 +208,6 @@ fn spawn_feishu_ws(
                     // Temporary client handle for the callback — guest can call methods on it
                     let temp_handle = FeishuClientHandle {
                         client,
-                        cancel_token: tokio_util::sync::CancellationToken::new(),
                     };
                     let client_resource = match store.data_mut().table.push(temp_handle) {
                         Ok(r) => r,
@@ -237,7 +241,7 @@ fn spawn_feishu_ws(
                         }
                     };
 
-                    match proxy.custom_feishu_handler().call_on_message(&mut store, client_resource, &im_msg) {
+                    match proxy.custom_feishu_handler().call_on_message(&mut store, client_resource, &im_msg).await {
                         Ok(Ok(())) => {
                             debug!(component_id = %cid, "Guest on-message handled successfully");
                         }
@@ -292,7 +296,7 @@ fn spawn_feishu_ws(
 impl<'a> bindings::custom::feishu::sender::HostFeishuClient for ActiveCtx<'a> {
     async fn new(
         &mut self,
-        config: Option<FeishuConfig>,
+        _config: Option<FeishuConfig>,
     ) -> wasmtime::Result<Resource<FeishuClientHandle>> {
         let Some(plugin) = self.get_plugin::<Feishu>(PLUGIN_ID) else {
             return Err(wasmtime::Error::msg("feishu plugin not available"));
@@ -304,60 +308,15 @@ impl<'a> bindings::custom::feishu::sender::HostFeishuClient for ActiveCtx<'a> {
             return Err(wasmtime::Error::msg("component not tracked"));
         };
 
-        let app_id = match resolve_field(
-            config.as_ref().map(|c| c.app_id.clone()),
-            &data.interface_config,
-            "app-id",
-        ) {
-            Ok(v) => v,
-            Err(_) => {
-                return Err(wasmtime::Error::msg(
-                    "missing app-id: provide via constructor or interface config",
-                ));
-            }
+        let Some(client) = data.client.clone() else {
+            return Err(wasmtime::Error::msg(
+                "feishu client not started — WebSocket should be running from on_workload_resolved",
+            ));
         };
 
-        let app_secret = match resolve_field(
-            config.as_ref().map(|c| c.app_secret.clone()),
-            &data.interface_config,
-            "app-secret",
-        ) {
-            Ok(v) => v,
-            Err(_) => {
-                return Err(wasmtime::Error::msg(
-                    "missing app-secret: provide via constructor or interface config",
-                ));
-            }
-        };
-
-        let Some(workload) = &data.workload else {
-            return Err(wasmtime::Error::msg("workload not resolved yet"));
-        };
-
-        let workload = workload.clone();
         drop(lock);
 
-        use open_lark::prelude::*;
-
-        let cancel_token = tokio_util::sync::CancellationToken::new();
-        let client = Arc::new(
-            LarkClient::builder(&app_id, &app_secret)
-                .with_app_type(AppType::SelfBuild)
-                .with_enable_token_cache(true)
-                .build(),
-        );
-
-        spawn_feishu_ws(
-            workload,
-            component_id.to_string(),
-            client.clone(),
-            cancel_token.clone(),
-        );
-
-        let handle = FeishuClientHandle {
-            client,
-            cancel_token,
-        };
+        let handle = FeishuClientHandle { client };
 
         let resource = self.table.push(handle)?;
         Ok(resource)
@@ -1286,18 +1245,14 @@ impl<'a> bindings::custom::feishu::sender::HostFeishuClient for ActiveCtx<'a> {
 
     async fn stop(
         &mut self,
-        handle: Resource<FeishuClientHandle>,
+        _handle: Resource<FeishuClientHandle>,
     ) -> wasmtime::Result<Result<(), FeishuError>> {
-        let h = self.table.get(&handle)?;
-        h.cancel_token.cancel();
-        debug!("Feishu client stopped via stop()");
+        debug!("Feishu client resource stop() — WebSocket listener unaffected");
         Ok(Ok(()))
     }
 
     async fn drop(&mut self, rep: Resource<FeishuClientHandle>) -> wasmtime::Result<()> {
-        if let Ok(handle) = self.table.delete(rep) {
-            handle.cancel_token.cancel();
-        }
+        let _ = self.table.delete(rep);
         Ok(())
     }
 }
@@ -1356,6 +1311,8 @@ impl HostPlugin for Feishu {
             ComponentData {
                 interface_config,
                 workload: None,
+                client: None,
+                ws_cancel_token: None,
             },
         );
 
@@ -1370,6 +1327,55 @@ impl HostPlugin for Feishu {
         let mut lock = self.tracker.write().await;
         if let Some(data) = lock.get_component_data_mut(component_id) {
             data.workload = Some(workload.clone());
+
+            if data.client.is_none() {
+                let app_id = match resolve_field(None, &data.interface_config, "app-id") {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(
+                            component_id,
+                            error = %e,
+                            "feishu: no app-id configured, skipping WebSocket start"
+                        );
+                        return Ok(());
+                    }
+                };
+                let app_secret = match resolve_field(None, &data.interface_config, "app-secret") {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(
+                            component_id,
+                            error = %e,
+                            "feishu: no app-secret configured, skipping WebSocket start"
+                        );
+                        return Ok(());
+                    }
+                };
+
+                use open_lark::prelude::*;
+
+                let cancel_token = tokio_util::sync::CancellationToken::new();
+                let client = Arc::new(
+                    LarkClient::builder(&app_id, &app_secret)
+                        .with_app_type(AppType::SelfBuild)
+                        .with_enable_token_cache(true)
+                        .build(),
+                );
+
+                spawn_feishu_ws(
+                    workload.clone(),
+                    component_id.to_string(),
+                    client.clone(),
+                    cancel_token.clone(),
+                );
+
+                debug!(
+                    component_id,
+                    "Feishu WebSocket started from on_workload_resolved"
+                );
+                data.client = Some(client);
+                data.ws_cancel_token = Some(cancel_token);
+            }
         }
         Ok(())
     }
@@ -1382,7 +1388,16 @@ impl HostPlugin for Feishu {
         self.tracker
             .write()
             .await
-            .remove_workload_with_cleanup(workload_id, |_| async {}, |_| async {})
+            .remove_workload_with_cleanup(
+                workload_id,
+                |_| async {},
+                |data| async move {
+                    if let Some(token) = data.ws_cancel_token.as_ref() {
+                        token.cancel();
+                        debug!(workload_id, "Feishu WebSocket cancelled on unbind");
+                    }
+                },
+            )
             .await;
         debug!(workload_id = %workload_id, "Feishu plugin unbound");
         Ok(())

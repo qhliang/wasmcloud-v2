@@ -24,6 +24,7 @@ mod bindings {
         imports: {
             default: async | trappable | tracing,
         },
+        exports: { default: async | tracing },
         with: {
             "custom:wechat/sender.wechat-client": super::WechatClientHandle,
         },
@@ -39,9 +40,10 @@ const PLUGIN_ID: &str = "wechat";
 // ---------------------------------------------------------------------------
 
 /// Host-side state for a wechat-client resource instance.
+/// The cancel_token here is per-resource only; the long-poll loop has its own
+/// token stored in ComponentData.
 pub struct WechatClientHandle {
     client: Arc<weixin_agent::WeixinClient>,
-    cancel_token: tokio_util::sync::CancellationToken,
 }
 
 /// Per-component data.
@@ -50,6 +52,10 @@ struct ComponentData {
     interface_config: HashMap<String, String>,
     /// Resolved workload
     workload: Option<ResolvedWorkload>,
+    /// Shared WeixinClient (started in on_workload_resolved, independent of resource lifetime)
+    client: Option<Arc<weixin_agent::WeixinClient>>,
+    /// Cancellation token for the long-poll loop
+    poll_cancel_token: Option<tokio_util::sync::CancellationToken>,
 }
 
 // ---------------------------------------------------------------------------
@@ -94,7 +100,7 @@ impl<'a> bindings::custom::wechat::sender::Host for ActiveCtx<'a> {}
 impl<'a> bindings::custom::wechat::sender::HostWechatClient for ActiveCtx<'a> {
     async fn new(
         &mut self,
-        config: Option<WechatConfig>,
+        _config: Option<WechatConfig>,
     ) -> wasmtime::Result<Resource<WechatClientHandle>> {
         let Some(plugin) = self.get_plugin::<Wechat>(PLUGIN_ID) else {
             return Err(wasmtime::Error::msg("wechat plugin not available"));
@@ -106,41 +112,15 @@ impl<'a> bindings::custom::wechat::sender::HostWechatClient for ActiveCtx<'a> {
             return Err(wasmtime::Error::msg("component not tracked"));
         };
 
-        let token = match resolve_field(
-            config.as_ref().map(|c| c.token.clone()),
-            &data.interface_config,
-            "token",
-        ) {
-            Ok(t) => t,
-            Err(_) => {
-                return Err(wasmtime::Error::msg(
-                    "missing token: provide via constructor or interface config",
-                ));
-            }
+        let Some(client) = data.client.clone() else {
+            return Err(wasmtime::Error::msg(
+                "wechat client not started — long-poll loop should be running from on_workload_resolved",
+            ));
         };
-
-        let Some(workload) = &data.workload else {
-            return Err(wasmtime::Error::msg("workload not resolved yet"));
-        };
-
-        let workload = workload.clone();
 
         drop(lock);
 
-        let cancel_token = tokio_util::sync::CancellationToken::new();
-
-        let client = spawn_weixin_client(
-            workload,
-            component_id.to_string(),
-            token,
-            cancel_token.clone(),
-        )
-        .ok_or_else(|| wasmtime::Error::msg("failed to create wechat client"))?;
-
-        let handle = WechatClientHandle {
-            client,
-            cancel_token,
-        };
+        let handle = WechatClientHandle { client };
 
         let resource = self.table.push(handle)?;
         Ok(resource)
@@ -273,18 +253,14 @@ impl<'a> bindings::custom::wechat::sender::HostWechatClient for ActiveCtx<'a> {
 
     async fn stop(
         &mut self,
-        client: Resource<WechatClientHandle>,
+        _client: Resource<WechatClientHandle>,
     ) -> wasmtime::Result<Result<(), WechatError>> {
-        let handle = self.table.get(&client)?;
-        handle.cancel_token.cancel();
-        debug!("WeChat client stopped via stop()");
+        debug!("WeChat client resource stop() — long-poll loop unaffected");
         Ok(Ok(()))
     }
 
     async fn drop(&mut self, rep: Resource<WechatClientHandle>) -> wasmtime::Result<()> {
-        if let Ok(handle) = self.table.delete(rep) {
-            handle.cancel_token.cancel();
-        }
+        let _ = self.table.delete(rep);
         Ok(())
     }
 }
@@ -362,10 +338,7 @@ fn spawn_weixin_client(
                 };
 
                 // Temporary client handle for the callback — guest can call methods on it
-                let temp_handle = WechatClientHandle {
-                    client,
-                    cancel_token: tokio_util::sync::CancellationToken::new(),
-                };
+                let temp_handle = WechatClientHandle { client };
                 let client_resource = match store.data_mut().table.push(temp_handle) {
                     Ok(r) => r,
                     Err(e) => {
@@ -398,11 +371,11 @@ fn spawn_weixin_client(
                     }
                 };
 
-                match proxy.custom_wechat_handler().call_on_message(
-                    &mut store,
-                    client_resource,
-                    &wx_msg,
-                ) {
+                match proxy
+                    .custom_wechat_handler()
+                    .call_on_message(&mut store, client_resource, &wx_msg)
+                    .await
+                {
                     Ok(Ok(())) => {
                         debug!(component_id = %cid, "Guest WeChat on-message handled successfully");
                     }
@@ -552,6 +525,8 @@ impl HostPlugin for Wechat {
             ComponentData {
                 interface_config,
                 workload: None,
+                client: None,
+                poll_cancel_token: None,
             },
         );
 
@@ -566,6 +541,37 @@ impl HostPlugin for Wechat {
         let mut lock = self.tracker.write().await;
         if let Some(data) = lock.get_component_data_mut(component_id) {
             data.workload = Some(workload.clone());
+
+            // Start the long-poll loop once the workload is resolved
+            if data.client.is_none() {
+                let token = match resolve_field(None, &data.interface_config, "token") {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!(
+                            component_id,
+                            error = %e,
+                            "wechat: no token configured, skipping long-poll start"
+                        );
+                        return Ok(());
+                    }
+                };
+
+                let cancel_token = tokio_util::sync::CancellationToken::new();
+
+                if let Some(client) = spawn_weixin_client(
+                    workload.clone(),
+                    component_id.to_string(),
+                    token,
+                    cancel_token.clone(),
+                ) {
+                    debug!(
+                        component_id,
+                        "WeChat long-poll loop started from on_workload_resolved"
+                    );
+                    data.client = Some(client);
+                    data.poll_cancel_token = Some(cancel_token);
+                }
+            }
         }
         Ok(())
     }
@@ -578,7 +584,16 @@ impl HostPlugin for Wechat {
         self.tracker
             .write()
             .await
-            .remove_workload_with_cleanup(workload_id, |_| async {}, |_| async {})
+            .remove_workload_with_cleanup(
+                workload_id,
+                |_| async {},
+                |data| async move {
+                    if let Some(token) = data.poll_cancel_token.as_ref() {
+                        token.cancel();
+                        debug!(workload_id, "WeChat long-poll cancelled on unbind");
+                    }
+                },
+            )
             .await;
         debug!(workload_id = %workload_id, "WeChat plugin unbound");
         Ok(())
