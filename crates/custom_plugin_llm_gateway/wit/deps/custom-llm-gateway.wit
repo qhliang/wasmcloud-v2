@@ -83,11 +83,20 @@ interface types {
         /// An error occurred during streaming
         error(string),
     }
+
+    /// Dynamic configuration for a single chat/streaming request.
+    /// When provided, these values override the interface-level config.
+    record llm-config {
+        /// API key for the LLM provider
+        api-key: string,
+        /// Custom base URL (overrides interface config base_url)
+        base-url: option<string>,
+    }
 }
 
 /// Interface for LLM chat completions
 interface chat {
-    use types.{llm-error, chat-message, chat-response, chat-options};
+    use types.{llm-error, chat-message, chat-response, chat-options, llm-config};
 
     /// Execute a chat completion request.
     ///
@@ -95,12 +104,15 @@ interface chat {
     /// assistant's response. The model name determines which provider is
     /// used (e.g., "gpt-4o-mini" for OpenAI, "claude-3-haiku" for Anthropic,
     /// "gemini-2.0-flash" for Gemini, "deepseek-chat" for DeepSeek).
-    chat: func(model: string, messages: list<chat-message>, options: option<chat-options>) -> result<chat-response, llm-error>;
+    ///
+    /// When `config` is provided, its `api-key` and `base-url` override
+    /// the interface-level configuration for this request.
+    chat: func(model: string, messages: list<chat-message>, options: option<chat-options>, config: option<llm-config>) -> result<chat-response, llm-error>;
 }
 
 /// Interface for streaming LLM chat completions
 interface chat-streaming {
-    use types.{llm-error, chat-message, chat-options, chat-stream-event};
+    use types.{llm-error, chat-message, chat-options, chat-stream-event, llm-config};
 
     /// A resource representing an ongoing streaming chat response.
     /// Call `next()` repeatedly to receive events until the stream ends.
@@ -120,7 +132,10 @@ interface chat-streaming {
     /// Returns a chat-stream resource that can be polled for events.
     /// The stream is consumed by repeatedly calling `next()` on the
     /// returned resource until it reports ended=true.
-    chat-streaming: func(model: string, messages: list<chat-message>, options: option<chat-options>) -> result<chat-stream, llm-error>;
+    ///
+    /// When `config` is provided, its `api-key` and `base-url` override
+    /// the interface-level configuration for this request.
+    chat-streaming: func(model: string, messages: list<chat-message>, options: option<chat-options>, config: option<llm-config>) -> result<chat-stream, llm-error>;
 }
 
 /// World defining the LLM Gateway interface

@@ -68,8 +68,8 @@ mod bindings {
 }
 
 use bindings::custom::llm_gateway::types::{
-    ChatChunk, ChatMessage, ChatOptions as WitChatOptions, ChatResponse, ChatStreamEvent, LlmError,
-    StreamEnd as WitStreamEnd, TokenUsage,
+    ChatChunk, ChatMessage, ChatOptions as WitChatOptions, ChatResponse, ChatStreamEvent,
+    LlmConfig, LlmError, StreamEnd as WitStreamEnd, TokenUsage,
 };
 
 const PLUGIN_ID: &str = "llm-gateway";
@@ -229,6 +229,42 @@ impl LlmGateway {
             let mut clients = self.clients.write().await;
             clients.insert(workload_id.to_string(), client.clone());
         }
+        Ok(client)
+    }
+
+    /// Create a one-off genai client using resolved config values.
+    /// Used when a dynamic `llm-config` overrides the interface-level config.
+    async fn create_client_with_config(
+        &self,
+        provider: AdapterKind,
+        api_key: String,
+        base_url: Option<String>,
+    ) -> anyhow::Result<Client> {
+        let ar = api_key.clone();
+        let auth_resolver = AuthResolver::from_resolver_fn(
+            move |_model_iden: ModelIden| -> Result<Option<AuthData>, genai::resolver::Error> {
+                Ok(Some(AuthData::from_single(ar.clone())))
+            },
+        );
+
+        let target_resolver = ServiceTargetResolver::from_resolver_fn(
+            move |mut service_target: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
+                let model_name = service_target.model.model_name.clone();
+                service_target.model = ModelIden::new(provider, model_name);
+
+                if let Some(ref url) = base_url {
+                    service_target.endpoint = Endpoint::from_owned(url.clone());
+                }
+
+                Ok(service_target)
+            },
+        );
+
+        let client = Client::builder()
+            .with_auth_resolver(auth_resolver)
+            .with_service_target_resolver(target_resolver)
+            .build();
+
         Ok(client)
     }
 }
@@ -431,6 +467,7 @@ impl<'a> bindings::custom::llm_gateway::chat::Host for ActiveCtx<'a> {
         model: String,
         messages: Vec<ChatMessage>,
         options: Option<WitChatOptions>,
+        config: Option<LlmConfig>,
     ) -> wasmtime::Result<Result<ChatResponse, LlmError>> {
         let Some(plugin) = self.get_plugin::<LlmGateway>(PLUGIN_ID) else {
             return Ok(Err(LlmError::Unexpected(
@@ -448,7 +485,7 @@ impl<'a> bindings::custom::llm_gateway::chat::Host for ActiveCtx<'a> {
         let workload_id = self.workload_id.as_ref().to_string();
 
         // Get config for this workload
-        let config = {
+        let interface_config = {
             let configs = plugin.configs.read().await;
             match configs.get(&workload_id).cloned() {
                 Some(c) => c,
@@ -463,20 +500,46 @@ impl<'a> bindings::custom::llm_gateway::chat::Host for ActiveCtx<'a> {
 
         // Use configured model name if the request model is empty, otherwise use request model
         let model = if model.is_empty() {
-            config.model_name.clone()
+            interface_config.model_name.clone()
         } else {
             model
         };
 
         plugin.record_chat_request(&model);
 
-        // Get or create genai client
-        let client = match plugin.get_or_create_client(&workload_id).await {
-            Ok(c) => c,
-            Err(e) => {
-                return Ok(Err(LlmError::Unexpected(format!(
-                    "Failed to create LLM client: {e}"
-                ))));
+        // Resolve api_key and base_url: dynamic config takes priority over interface config
+        let api_key = config
+            .as_ref()
+            .map(|c| c.api_key.clone())
+            .unwrap_or_else(|| interface_config.api_key.clone());
+        let base_url = config
+            .as_ref()
+            .and_then(|c| c.base_url.clone())
+            .or_else(|| interface_config.base_url.clone());
+        let provider = interface_config.provider;
+
+        // Get or create genai client: use dynamic client if config was provided,
+        // otherwise use the cached workload client
+        let client = if config.is_some() {
+            match plugin
+                .create_client_with_config(provider, api_key, base_url)
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    return Ok(Err(LlmError::Unexpected(format!(
+                        "Failed to create LLM client: {e}"
+                    ))));
+                }
+            }
+        } else {
+            match plugin.get_or_create_client(&workload_id).await {
+                Ok(c) => c,
+                Err(e) => {
+                    return Ok(Err(LlmError::Unexpected(format!(
+                        "Failed to create LLM client: {e}"
+                    ))));
+                }
             }
         };
 
@@ -491,7 +554,7 @@ impl<'a> bindings::custom::llm_gateway::chat::Host for ActiveCtx<'a> {
         let mut all_messages = Vec::new();
 
         // Add preset system prompts
-        for prompt in &config.system_prompts {
+        for prompt in &interface_config.system_prompts {
             match to_genai_role(&prompt.role) {
                 genai::chat::ChatRole::System => {
                     all_messages.push(GenaiChatMessage::system(&prompt.content));
@@ -511,7 +574,7 @@ impl<'a> bindings::custom::llm_gateway::chat::Host for ActiveCtx<'a> {
         let chat_req = ChatRequest::new(all_messages);
 
         // Build merged chat options (config defaults + per-request overrides)
-        let chat_options = build_chat_options(&config, options);
+        let chat_options = build_chat_options(&interface_config, options);
 
         // Execute chat
         let chat_res = match client
@@ -562,6 +625,7 @@ impl<'a> bindings::custom::llm_gateway::chat_streaming::Host for ActiveCtx<'a> {
         model: String,
         messages: Vec<ChatMessage>,
         options: Option<WitChatOptions>,
+        config: Option<LlmConfig>,
     ) -> wasmtime::Result<Result<Resource<ChatStreamHandle>, LlmError>> {
         let Some(plugin) = self.get_plugin::<LlmGateway>(PLUGIN_ID) else {
             return Ok(Err(LlmError::Unexpected(
@@ -579,7 +643,7 @@ impl<'a> bindings::custom::llm_gateway::chat_streaming::Host for ActiveCtx<'a> {
         let workload_id = self.workload_id.as_ref().to_string();
 
         // Get config for this workload
-        let config = {
+        let interface_config = {
             let configs = plugin.configs.read().await;
             match configs.get(&workload_id).cloned() {
                 Some(c) => c,
@@ -594,20 +658,46 @@ impl<'a> bindings::custom::llm_gateway::chat_streaming::Host for ActiveCtx<'a> {
 
         // Use configured model name if the request model is empty
         let model = if model.is_empty() {
-            config.model_name.clone()
+            interface_config.model_name.clone()
         } else {
             model
         };
 
         plugin.record_chat_request(&model);
 
-        // Get or create genai client
-        let client = match plugin.get_or_create_client(&workload_id).await {
-            Ok(c) => c,
-            Err(e) => {
-                return Ok(Err(LlmError::Unexpected(format!(
-                    "Failed to create LLM client: {e}"
-                ))));
+        // Resolve api_key and base_url: dynamic config takes priority over interface config
+        let api_key = config
+            .as_ref()
+            .map(|c| c.api_key.clone())
+            .unwrap_or_else(|| interface_config.api_key.clone());
+        let base_url = config
+            .as_ref()
+            .and_then(|c| c.base_url.clone())
+            .or_else(|| interface_config.base_url.clone());
+        let provider = interface_config.provider;
+
+        // Get or create genai client: use dynamic client if config was provided,
+        // otherwise use the cached workload client
+        let client = if config.is_some() {
+            match plugin
+                .create_client_with_config(provider, api_key, base_url)
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    return Ok(Err(LlmError::Unexpected(format!(
+                        "Failed to create LLM client: {e}"
+                    ))));
+                }
+            }
+        } else {
+            match plugin.get_or_create_client(&workload_id).await {
+                Ok(c) => c,
+                Err(e) => {
+                    return Ok(Err(LlmError::Unexpected(format!(
+                        "Failed to create LLM client: {e}"
+                    ))));
+                }
             }
         };
 
@@ -620,7 +710,7 @@ impl<'a> bindings::custom::llm_gateway::chat_streaming::Host for ActiveCtx<'a> {
 
         // Build chat request: prepend preset prompts, then user messages
         let mut all_messages = Vec::new();
-        for prompt in &config.system_prompts {
+        for prompt in &interface_config.system_prompts {
             match to_genai_role(&prompt.role) {
                 genai::chat::ChatRole::System => {
                     all_messages.push(GenaiChatMessage::system(&prompt.content));
@@ -636,7 +726,7 @@ impl<'a> bindings::custom::llm_gateway::chat_streaming::Host for ActiveCtx<'a> {
         all_messages.extend(to_genai_messages(messages));
         let chat_req = ChatRequest::new(all_messages);
 
-        let chat_options = build_chat_options(&config, options);
+        let chat_options = build_chat_options(&interface_config, options);
 
         // Execute streaming chat
         let chat_stream_res = match client
