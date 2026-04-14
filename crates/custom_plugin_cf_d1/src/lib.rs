@@ -224,13 +224,11 @@ fn json_value_to_column_value(value: serde_json::Value) -> ColumnValue {
             }
         }
         serde_json::Value::String(s) => ColumnValue::Text(s),
-        serde_json::Value::Array(arr) => {
-            ColumnValue::Blob(
-                arr.iter()
-                    .filter_map(|v| v.as_u64().map(|n| n as u8))
-                    .collect(),
-            )
-        }
+        serde_json::Value::Array(arr) => ColumnValue::Blob(
+            arr.iter()
+                .filter_map(|v| v.as_u64().map(|n| n as u8))
+                .collect(),
+        ),
         serde_json::Value::Object(_) => ColumnValue::Text(value.to_string()),
     }
 }
@@ -596,10 +594,7 @@ impl<'a> bindings::custom::cf_d1::query::HostD1Client for ActiveCtx<'a> {
         Ok(Ok(()))
     }
 
-    async fn drop(
-        &mut self,
-        rep: Resource<D1ClientHandle>,
-    ) -> wasmtime::Result<()> {
+    async fn drop(&mut self, rep: Resource<D1ClientHandle>) -> wasmtime::Result<()> {
         // Just remove from the table, no cleanup needed
         let _ = self.table.delete(rep);
         Ok(())
@@ -654,12 +649,15 @@ impl HostPlugin for CloudflareD1 {
             return Ok(());
         };
 
-        debug!(component_id = component_handle.id(), "CloudflareD1 plugin bound to component");
-
-        self.tracker.write().await.add_component(
-            component_handle,
-            ComponentData { interface_config },
+        debug!(
+            component_id = component_handle.id(),
+            "CloudflareD1 plugin bound to component"
         );
+
+        self.tracker
+            .write()
+            .await
+            .add_component(component_handle, ComponentData { interface_config });
 
         Ok(())
     }

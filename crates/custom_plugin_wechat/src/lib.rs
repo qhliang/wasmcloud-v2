@@ -281,10 +281,7 @@ impl<'a> bindings::custom::wechat::sender::HostWechatClient for ActiveCtx<'a> {
         Ok(Ok(()))
     }
 
-    async fn drop(
-        &mut self,
-        rep: Resource<WechatClientHandle>,
-    ) -> wasmtime::Result<()> {
+    async fn drop(&mut self, rep: Resource<WechatClientHandle>) -> wasmtime::Result<()> {
         if let Ok(handle) = self.table.delete(rep) {
             handle.cancel_token.cancel();
         }
@@ -401,10 +398,11 @@ fn spawn_weixin_client(
                     }
                 };
 
-                match proxy
-                    .custom_wechat_handler()
-                    .call_on_message(&mut store, client_resource, &wx_msg)
-                {
+                match proxy.custom_wechat_handler().call_on_message(
+                    &mut store,
+                    client_resource,
+                    &wx_msg,
+                ) {
                     Ok(Ok(())) => {
                         debug!(component_id = %cid, "Guest WeChat on-message handled successfully");
                     }
@@ -421,8 +419,7 @@ fn spawn_weixin_client(
         }
     }
 
-    let client_ref: Arc<Mutex<Option<Arc<WeixinClient>>>> =
-        Arc::new(Mutex::new(None));
+    let client_ref: Arc<Mutex<Option<Arc<WeixinClient>>>> = Arc::new(Mutex::new(None));
 
     let wx_config = match WeixinConfig::builder().token(&token).build() {
         Ok(c) => c,
@@ -545,7 +542,10 @@ impl HostPlugin for Wechat {
             return Ok(());
         };
 
-        debug!(component_id = component_handle.id(), "WeChat plugin bound to component");
+        debug!(
+            component_id = component_handle.id(),
+            "WeChat plugin bound to component"
+        );
 
         self.tracker.write().await.add_component(
             component_handle,

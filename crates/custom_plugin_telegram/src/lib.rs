@@ -137,10 +137,7 @@ impl<'a> bindings::custom::telegram::sender::HostTelegramBot for ActiveCtx<'a> {
             cancel_token.clone(),
         );
 
-        let handle = TelegramBotHandle {
-            bot,
-            cancel_token,
-        };
+        let handle = TelegramBotHandle { bot, cancel_token };
 
         let resource = self.table.push(handle)?;
         Ok(resource)
@@ -154,9 +151,9 @@ impl<'a> bindings::custom::telegram::sender::HostTelegramBot for ActiveCtx<'a> {
         text: String,
     ) -> wasmtime::Result<Result<(), TelegramError>> {
         let handle = self.table.get(&bot)?;
-        let chat_id_val = chat_id.parse::<i64>().map_err(|_| {
-            wasmtime::Error::msg(format!("invalid chat_id: {chat_id}"))
-        })?;
+        let chat_id_val = chat_id
+            .parse::<i64>()
+            .map_err(|_| wasmtime::Error::msg(format!("invalid chat_id: {chat_id}")))?;
         let chat_id_val = teloxide::types::ChatId(chat_id_val);
 
         match handle.bot.send_message(chat_id_val, &text).await {
@@ -180,9 +177,9 @@ impl<'a> bindings::custom::telegram::sender::HostTelegramBot for ActiveCtx<'a> {
         caption: Option<String>,
     ) -> wasmtime::Result<Result<(), TelegramError>> {
         let handle = self.table.get(&bot)?;
-        let chat_id_val = chat_id.parse::<i64>().map_err(|_| {
-            wasmtime::Error::msg(format!("invalid chat_id: {chat_id}"))
-        })?;
+        let chat_id_val = chat_id
+            .parse::<i64>()
+            .map_err(|_| wasmtime::Error::msg(format!("invalid chat_id: {chat_id}")))?;
         let chat_id_val = teloxide::types::ChatId(chat_id_val);
 
         let path = std::path::Path::new(&file_path);
@@ -220,10 +217,7 @@ impl<'a> bindings::custom::telegram::sender::HostTelegramBot for ActiveCtx<'a> {
         Ok(Ok(()))
     }
 
-    async fn drop(
-        &mut self,
-        rep: Resource<TelegramBotHandle>,
-    ) -> wasmtime::Result<()> {
+    async fn drop(&mut self, rep: Resource<TelegramBotHandle>) -> wasmtime::Result<()> {
         if let Ok(handle) = self.table.delete(rep) {
             handle.cancel_token.cancel();
         }
@@ -295,7 +289,11 @@ async fn handle_telegram_message(
     let text_content = message.text().map(|s| s.to_string());
     let sender_username = message.from.as_ref().and_then(|u| u.username.clone());
     let chat_id = message.chat.id.0.to_string();
-    let sender_id = message.from.as_ref().map(|u| u.id.0.to_string()).unwrap_or_default();
+    let sender_id = message
+        .from
+        .as_ref()
+        .map(|u| u.id.0.to_string())
+        .unwrap_or_default();
     let message_id = message.id.0.to_string();
     let timestamp = message.date;
 
@@ -419,7 +417,10 @@ impl HostPlugin for Telegram {
             return Ok(());
         };
 
-        debug!(component_id = component_handle.id(), "Telegram plugin bound to component");
+        debug!(
+            component_id = component_handle.id(),
+            "Telegram plugin bound to component"
+        );
 
         self.tracker.write().await.add_component(
             component_handle,

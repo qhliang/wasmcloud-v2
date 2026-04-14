@@ -38,12 +38,11 @@ use tokio::sync::RwLock;
 use tracing::{debug, instrument, warn};
 use wasmtime::component::Resource;
 
-
 use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use wash_runtime::engine::workload::{ResolvedWorkload, WorkloadItem};
-use wash_runtime::plugin::config::resolve_field;
 use wash_runtime::plugin::HostPlugin;
 use wash_runtime::plugin::WorkloadTracker;
+use wash_runtime::plugin::config::resolve_field;
 use wash_runtime::wit::{WitInterface, WitWorld};
 
 mod bindings {
@@ -227,7 +226,11 @@ impl<'a> bindings::custom::dingtalk_stream::sender::HostDingtalkClient for Activ
     ) -> wasmtime::Result<Result<(), DingtalkError>> {
         let handle = self.table.get(&client)?;
         let synthetic = build_synthetic_message(&conversation_id, &sender_id);
-        match handle.replier.reply_markdown(&title, &content, &synthetic).await {
+        match handle
+            .replier
+            .reply_markdown(&title, &content, &synthetic)
+            .await
+        {
             Ok(_) => Ok(Ok(())),
             Err(dingtalk_stream::Error::Auth(e)) => {
                 Ok(Err(DingtalkError::AuthFailed(e.to_string())))
@@ -283,10 +286,7 @@ impl<'a> bindings::custom::dingtalk_stream::sender::HostDingtalkClient for Activ
         Ok(Ok(()))
     }
 
-    async fn drop(
-        &mut self,
-        rep: Resource<DingtalkClientHandle>,
-    ) -> wasmtime::Result<()> {
+    async fn drop(&mut self, rep: Resource<DingtalkClientHandle>) -> wasmtime::Result<()> {
         if let Ok(handle) = self.table.delete(rep) {
             handle.cancel_token.cancel();
         }
@@ -425,10 +425,11 @@ impl dingtalk_stream::CallbackHandler for GuestCallbackBridge {
                 }
             };
 
-            match proxy
-                .custom_dingtalk_stream_handler()
-                .call_on_message(&mut store, client_resource, &wit_msg)
-            {
+            match proxy.custom_dingtalk_stream_handler().call_on_message(
+                &mut store,
+                client_resource,
+                &wit_msg,
+            ) {
                 Ok(Ok(())) => {
                     debug!(
                         component_id = %cid,

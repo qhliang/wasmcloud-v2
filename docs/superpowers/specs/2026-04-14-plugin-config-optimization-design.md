@@ -55,12 +55,17 @@ interface sender {
         constructor(config: option<telegram-config>);
         send-text: func(chat-id: string, text: string) -> result<_, telegram-error>;
         send-media: func(chat-id: string, file-path: string, caption: option<string>) -> result<_, telegram-error>;
+        stop: func() -> result<_, telegram-error>;
     }
 }
 
 interface handler {
     use types.{telegram-message};
-    on-message: func(msg: telegram-message) -> result<_, string>;
+    use sender.{telegram-bot};
+
+    /// Host calls this when a message arrives. Passes the bot instance that received the message
+    /// so the component can distinguish which bot it came from when multiple instances exist.
+    on-message: func(bot: &telegram-bot, msg: telegram-message) -> result<_, string>;
 }
 ```
 
@@ -69,10 +74,22 @@ interface handler {
 In the resource constructor implementation:
 
 1. If Wasm passes `some(config)` — use those values directly
-2. If Wasm passes `none` — fall back to `interface.config` (stored in `ComponentData` during `on_workload_item_bind`)
-3. If neither has the required keys — return error
+2. If Wasm passes `none` — fall back to `interface.config` (stored in `ComponentData`)
+3. If neither has the required keys — return error to Wasm component
+4. If client creation or connection fails — throw error to Wasm component
 
 The interface config is still loaded during `on_workload_item_bind` and stored in `ComponentData` as the fallback source.
+
+### Bind/Resolved Phase Changes
+
+After migration, `on_workload_item_bind` and `on_workload_resolved` only register the Wasm component. They no longer create clients, establish connections, or start background tasks — all of that moves to the resource constructor.
+
+### Resource Lifecycle
+
+- **Creation**: Resource constructor resolves config, creates client, establishes connections, starts background tasks (e.g., message polling)
+- **Active**: Resource instance is used for operations and receives incoming events via handler
+- **Stop**: Wasm component calls `stop()` on the resource to gracefully shut down a single instance
+- **Cleanup**: When the Wasm component unbinds, all resource instances belonging to that component are stopped and cleaned up
 
 ### Wasm-side Usage
 
@@ -86,6 +103,9 @@ let bot = TelegramBot::new(None)?;
 
 // Use the bot instance
 bot.send_text("123456789", "Hello!")?;
+
+// Stop the bot when no longer needed
+bot.stop()?;
 ```
 
 ### Per-plugin Changes

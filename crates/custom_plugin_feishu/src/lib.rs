@@ -93,9 +93,7 @@ impl<'a> bindings::custom::feishu::sender::Host for ActiveCtx<'a> {}
 
 mod http;
 
-async fn get_tenant_token(
-    client: &open_lark::prelude::LarkClient,
-) -> Result<String, FeishuError> {
+async fn get_tenant_token(client: &open_lark::prelude::LarkClient) -> Result<String, FeishuError> {
     let token_manager = client.config.token_manager.lock().await;
     token_manager
         .get_tenant_access_token(&client.config, "", "", &client.config.app_ticket_manager)
@@ -116,9 +114,7 @@ fn build_query_string(params: &serde_json::Value) -> String {
 }
 
 /// Helper: get tenant token from a resource handle.
-async fn token_from_handle(
-    handle: &FeishuClientHandle,
-) -> Result<String, FeishuError> {
+async fn token_from_handle(handle: &FeishuClientHandle) -> Result<String, FeishuError> {
     get_tenant_token(&handle.client).await
 }
 
@@ -419,7 +415,14 @@ impl<'a> bindings::custom::feishu::sender::HostFeishuClient for ActiveCtx<'a> {
         let msg = open_lark::service::im::v1::message::MessageText::new(&content);
         let request =
             open_lark::service::im::v1::message::CreateMessageRequest::with_msg("", msg, "");
-        match h.client.im.v1.message.reply(&message_id, request, None).await {
+        match h
+            .client
+            .im
+            .v1
+            .message
+            .reply(&message_id, request, None)
+            .await
+        {
             Ok(_) => Ok(Ok(())),
             Err(e) => Ok(Err(FeishuError::SendFailed(e.to_string()))),
         }
@@ -449,8 +452,9 @@ impl<'a> bindings::custom::feishu::sender::HostFeishuClient for ActiveCtx<'a> {
             ..Default::default()
         };
         match h.client.contact.v3.user.get(&user_id, &req).await {
-            Ok(resp) => Ok(serde_json::to_string(&resp)
-                .map_err(|e| FeishuError::Internal(e.to_string()))),
+            Ok(resp) => {
+                Ok(serde_json::to_string(&resp).map_err(|e| FeishuError::Internal(e.to_string())))
+            }
             Err(e) => Ok(Err(FeishuError::Internal(e.to_string()))),
         }
     }
@@ -468,8 +472,9 @@ impl<'a> bindings::custom::feishu::sender::HostFeishuClient for ActiveCtx<'a> {
                 Err(e) => return Ok(Err(FeishuError::Internal(e.to_string()))),
             };
         match h.client.contact.v3.user.batch(&req).await {
-            Ok(resp) => Ok(serde_json::to_string(&resp)
-                .map_err(|e| FeishuError::Internal(e.to_string()))),
+            Ok(resp) => {
+                Ok(serde_json::to_string(&resp).map_err(|e| FeishuError::Internal(e.to_string())))
+            }
             Err(e) => Ok(Err(FeishuError::Internal(e.to_string()))),
         }
     }
@@ -487,8 +492,9 @@ impl<'a> bindings::custom::feishu::sender::HostFeishuClient for ActiveCtx<'a> {
                 Err(e) => return Ok(Err(FeishuError::Internal(e.to_string()))),
             };
         match h.client.contact.v3.user.search(&req).await {
-            Ok(resp) => Ok(serde_json::to_string(&resp)
-                .map_err(|e| FeishuError::Internal(e.to_string()))),
+            Ok(resp) => {
+                Ok(serde_json::to_string(&resp).map_err(|e| FeishuError::Internal(e.to_string())))
+            }
             Err(e) => Ok(Err(FeishuError::Internal(e.to_string()))),
         }
     }
@@ -506,8 +512,9 @@ impl<'a> bindings::custom::feishu::sender::HostFeishuClient for ActiveCtx<'a> {
                 Err(e) => return Ok(Err(FeishuError::Internal(e.to_string()))),
             };
         match h.client.contact.v3.user.find_by_department(&req).await {
-            Ok(resp) => Ok(serde_json::to_string(&resp)
-                .map_err(|e| FeishuError::Internal(e.to_string()))),
+            Ok(resp) => {
+                Ok(serde_json::to_string(&resp).map_err(|e| FeishuError::Internal(e.to_string())))
+            }
             Err(e) => Ok(Err(FeishuError::Internal(e.to_string()))),
         }
     }
@@ -524,9 +531,17 @@ impl<'a> bindings::custom::feishu::sender::HostFeishuClient for ActiveCtx<'a> {
             user_id_type: Some("open_id".to_string()),
             department_id_type: Some(department_id_type),
         };
-        match h.client.contact.v3.department.get(&department_id, &req).await {
-            Ok(resp) => Ok(serde_json::to_string(&resp)
-                .map_err(|e| FeishuError::Internal(e.to_string()))),
+        match h
+            .client
+            .contact
+            .v3
+            .department
+            .get(&department_id, &req)
+            .await
+        {
+            Ok(resp) => {
+                Ok(serde_json::to_string(&resp).map_err(|e| FeishuError::Internal(e.to_string())))
+            }
             Err(e) => Ok(Err(FeishuError::Internal(e.to_string()))),
         }
     }
@@ -544,8 +559,9 @@ impl<'a> bindings::custom::feishu::sender::HostFeishuClient for ActiveCtx<'a> {
                 Err(e) => return Ok(Err(FeishuError::Internal(e.to_string()))),
             };
         match h.client.contact.v3.department.children(&req).await {
-            Ok(resp) => Ok(serde_json::to_string(&resp)
-                .map_err(|e| FeishuError::Internal(e.to_string()))),
+            Ok(resp) => {
+                Ok(serde_json::to_string(&resp).map_err(|e| FeishuError::Internal(e.to_string())))
+            }
             Err(e) => Ok(Err(FeishuError::Internal(e.to_string()))),
         }
     }
@@ -661,8 +677,8 @@ impl<'a> bindings::custom::feishu::sender::HostFeishuClient for ActiveCtx<'a> {
             Ok(t) => t,
             Err(e) => return Ok(Err(e)),
         };
-        let params: serde_json::Value = serde_json::from_str(&request_json)
-            .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+        let params: serde_json::Value =
+            serde_json::from_str(&request_json).map_err(|e| wasmtime::Error::msg(e.to_string()))?;
         let query = build_query_string(&params);
         let url = if query.is_empty() {
             format!("https://open.feishu.cn/open-apis/im/v1/chats/{chat_id}/members")
@@ -725,8 +741,8 @@ impl<'a> bindings::custom::feishu::sender::HostFeishuClient for ActiveCtx<'a> {
             Ok(t) => t,
             Err(e) => return Ok(Err(e)),
         };
-        let params: serde_json::Value = serde_json::from_str(&request_json)
-            .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+        let params: serde_json::Value =
+            serde_json::from_str(&request_json).map_err(|e| wasmtime::Error::msg(e.to_string()))?;
         let query = build_query_string(&params);
         let url = format!(
             "https://open.feishu.cn/open-apis/calendar/v4/calendars{}",
@@ -771,8 +787,8 @@ impl<'a> bindings::custom::feishu::sender::HostFeishuClient for ActiveCtx<'a> {
             Ok(t) => t,
             Err(e) => return Ok(Err(e)),
         };
-        let params: serde_json::Value = serde_json::from_str(&request_json)
-            .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+        let params: serde_json::Value =
+            serde_json::from_str(&request_json).map_err(|e| wasmtime::Error::msg(e.to_string()))?;
         let query = build_query_string(&params);
         let url = format!(
             "https://open.feishu.cn/open-apis/calendar/v4/calendars/{calendar_id}/events{}",
@@ -906,8 +922,8 @@ impl<'a> bindings::custom::feishu::sender::HostFeishuClient for ActiveCtx<'a> {
             Ok(t) => t,
             Err(e) => return Ok(Err(e)),
         };
-        let params: serde_json::Value = serde_json::from_str(&request_json)
-            .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+        let params: serde_json::Value =
+            serde_json::from_str(&request_json).map_err(|e| wasmtime::Error::msg(e.to_string()))?;
         let query = build_query_string(&params);
         let url = format!(
             "https://open.feishu.cn/open-apis/mail/v1/user_mailboxes/{user_mailbox_id}/messages{}",
@@ -1035,7 +1051,19 @@ impl<'a> bindings::custom::feishu::sender::HostFeishuClient for ActiveCtx<'a> {
             .client
             .task
             .task
-            .list(page_size, page_token.as_deref(), None, None, None, None, None, None, None, None, None)
+            .list(
+                page_size,
+                page_token.as_deref(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
         {
             Ok(resp) => match serde_json::to_string(&resp.data) {
@@ -1266,10 +1294,7 @@ impl<'a> bindings::custom::feishu::sender::HostFeishuClient for ActiveCtx<'a> {
         Ok(Ok(()))
     }
 
-    async fn drop(
-        &mut self,
-        rep: Resource<FeishuClientHandle>,
-    ) -> wasmtime::Result<()> {
+    async fn drop(&mut self, rep: Resource<FeishuClientHandle>) -> wasmtime::Result<()> {
         if let Ok(handle) = self.table.delete(rep) {
             handle.cancel_token.cancel();
         }
@@ -1321,7 +1346,10 @@ impl HostPlugin for Feishu {
             return Ok(());
         };
 
-        debug!(component_id = component_handle.id(), "Feishu plugin bound to component");
+        debug!(
+            component_id = component_handle.id(),
+            "Feishu plugin bound to component"
+        );
 
         self.tracker.write().await.add_component(
             component_handle,

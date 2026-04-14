@@ -19,8 +19,8 @@ use tokio::sync::RwLock;
 use tracing::debug;
 use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use wash_runtime::engine::workload::WorkloadItem;
-use wash_runtime::plugin::config::{resolve_field, resolve_optional_field};
 use wash_runtime::plugin::HostPlugin;
+use wash_runtime::plugin::config::{resolve_field, resolve_optional_field};
 use wash_runtime::wit::{WitInterface, WitWorld};
 use wasmtime::component::Resource;
 
@@ -176,7 +176,9 @@ impl<'a> bindings::custom::mail::sender::HostMailClient for ActiveCtx<'a> {
 
         // Resolve optional fields: smtp-port, imap-host
         let smtp_port: u16 = resolve_optional_field(
-            config.as_ref().and_then(|c| c.smtp_port.map(|p| p.to_string())),
+            config
+                .as_ref()
+                .and_then(|c| c.smtp_port.map(|p| p.to_string())),
             &data.interface_config,
             "smtp-port",
         )
@@ -189,13 +191,9 @@ impl<'a> bindings::custom::mail::sender::HostMailClient for ActiveCtx<'a> {
             "imap-host",
         );
 
-        let imap_port: u16 = resolve_optional_field(
-            None,
-            &data.interface_config,
-            "imap-port",
-        )
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(993);
+        let imap_port: u16 = resolve_optional_field(None, &data.interface_config, "imap-port")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(993);
 
         drop(lock);
 
@@ -328,19 +326,24 @@ impl<'a> bindings::custom::mail::sender::HostMailClient for ActiveCtx<'a> {
         );
 
         // Build SMTP transport
-        let creds = Credentials::new(handle.config.username.clone(), handle.config.password.clone());
+        let creds = Credentials::new(
+            handle.config.username.clone(),
+            handle.config.password.clone(),
+        );
 
         let mailer =
             match AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&handle.config.smtp_host) {
                 Ok(m) => m,
-                Err(_) => match AsyncSmtpTransport::<Tokio1Executor>::relay(&handle.config.smtp_host) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        return Ok(Err(MailError::Internal(format!(
-                            "failed to create SMTP transport: {e}"
-                        ))));
+                Err(_) => {
+                    match AsyncSmtpTransport::<Tokio1Executor>::relay(&handle.config.smtp_host) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            return Ok(Err(MailError::Internal(format!(
+                                "failed to create SMTP transport: {e}"
+                            ))));
+                        }
                     }
-                },
+                }
             }
             .port(handle.config.smtp_port)
             .credentials(creds)
@@ -565,10 +568,7 @@ impl<'a> bindings::custom::mail::sender::HostMailClient for ActiveCtx<'a> {
         Ok(Ok(()))
     }
 
-    async fn drop(
-        &mut self,
-        rep: Resource<MailClientHandle>,
-    ) -> wasmtime::Result<()> {
+    async fn drop(&mut self, rep: Resource<MailClientHandle>) -> wasmtime::Result<()> {
         if let Ok(_handle) = self.table.delete(rep) {
             debug!("Mail client resource dropped");
         }
@@ -713,10 +713,10 @@ impl HostPlugin for Mail {
         let component_id = ch.id().to_string();
         debug!(component_id = %component_id, "Mail plugin bound to component");
 
-        self.tracker.write().await.insert(
-            component_id,
-            ComponentData { interface_config },
-        );
+        self.tracker
+            .write()
+            .await
+            .insert(component_id, ComponentData { interface_config });
 
         Ok(())
     }
