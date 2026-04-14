@@ -50,7 +50,9 @@ mod bindings {
     });
 }
 
-use bindings::custom::codex::types::{ApprovalRequest, CodexError, CodexEvent, ExecStreamEvent, SessionInfo, TokenUsage};
+use bindings::custom::codex::types::{
+    ApprovalRequest, CodexError, CodexEvent, ExecStreamEvent, SessionInfo, TokenUsage,
+};
 const PLUGIN_ID: &str = "codex";
 
 // ---------------------------------------------------------------------------
@@ -315,10 +317,7 @@ fn convert_event(event: CodexJsonlEvent) -> ExecStreamEvent {
                         .or_else(|| serde_json::to_string(v).ok())
                 })
                 .unwrap_or_default();
-            ExecStreamEvent::ApprovalNeeded(ApprovalRequest {
-                item_id,
-                command,
-            })
+            ExecStreamEvent::ApprovalNeeded(ApprovalRequest { item_id, command })
         }
     }
 }
@@ -377,7 +376,11 @@ async fn create_new_session(
         let lock = plugin.tracker.read().await;
         match lock.get_component_data(component_id) {
             Some(data) => data.config.clone(),
-            None => return Ok(Err(CodexError::Internal("component not tracked".to_string()))),
+            None => {
+                return Ok(Err(CodexError::Internal(
+                    "component not tracked".to_string(),
+                )));
+            }
         }
     };
 
@@ -518,20 +521,24 @@ impl<'a> bindings::custom::codex::executor::Host for ActiveCtx<'a> {
             // Get session_id (codex thread_id) for resume
             let session_id = {
                 let lock = plugin.tracker.read().await;
-                lock.get_component_data(&component_id)
-                    .and_then(|data| {
-                        data.sessions
-                            .get(internal_key)
-                            .and_then(|s| s.session_id.clone())
-                    })
+                lock.get_component_data(&component_id).and_then(|data| {
+                    data.sessions
+                        .get(internal_key)
+                        .and_then(|s| s.session_id.clone())
+                })
             };
 
             if let Some(sid) = session_id {
                 // Resume existing current session
-                let result = bindings::custom::codex::session::Host::resume(self, sid, prompt).await;
+                let result =
+                    bindings::custom::codex::session::Host::resume(self, sid, prompt).await;
                 // Update current_sessions to point to the new internal key created by resume
                 if let Ok(Ok(ref resource)) = result {
-                    let new_key = self.table.get(resource).map(|h| h.session_key.clone()).unwrap_or_default();
+                    let new_key = self
+                        .table
+                        .get(resource)
+                        .map(|h| h.session_key.clone())
+                        .unwrap_or_default();
                     if !new_key.is_empty() {
                         let mut lock = plugin.tracker.write().await;
                         if let Some(data) = lock.get_component_data_mut(&component_id) {
@@ -545,19 +552,12 @@ impl<'a> bindings::custom::codex::executor::Host for ActiveCtx<'a> {
         }
 
         // No current session — create new
-        let (internal_key, resource) = match create_new_session(
-            self,
-            &plugin,
-            &component_id,
-            &context_key,
-            &prompt,
-        )
-        .await
-        {
-            Ok(Ok(pair)) => pair,
-            Ok(Err(e)) => return Ok(Err(e)),
-            Err(e) => return Err(e),
-        };
+        let (internal_key, resource) =
+            match create_new_session(self, &plugin, &component_id, &context_key, &prompt).await {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(e)) => return Ok(Err(e)),
+                Err(e) => return Err(e),
+            };
 
         // Set as current session for this context-key
         {
@@ -764,14 +764,15 @@ impl<'a> bindings::custom::codex::session::Host for ActiveCtx<'a> {
             project_dir: config.project_dir.clone(),
         };
 
-        let (mut child, child_stdin) = match spawn_codex_exec(&spawn_config, &prompt, Some(&session_id)) {
-            Ok(pair) => pair,
-            Err(e) => {
-                return Ok(Err(CodexError::ProcessError(format!(
-                    "failed to spawn codex resume: {e}"
-                ))));
-            }
-        };
+        let (mut child, child_stdin) =
+            match spawn_codex_exec(&spawn_config, &prompt, Some(&session_id)) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    return Ok(Err(CodexError::ProcessError(format!(
+                        "failed to spawn codex resume: {e}"
+                    ))));
+                }
+            };
 
         let stdout = match child.stdout.take() {
             Some(s) => s,
@@ -853,19 +854,12 @@ impl<'a> bindings::custom::codex::session::Host for ActiveCtx<'a> {
 
         let component_id = self.component_id.as_ref().to_string();
 
-        let (internal_key, resource) = match create_new_session(
-            self,
-            &plugin,
-            &component_id,
-            &context_key,
-            &prompt,
-        )
-        .await
-        {
-            Ok(Ok(pair)) => pair,
-            Ok(Err(e)) => return Ok(Err(e)),
-            Err(e) => return Err(e),
-        };
+        let (internal_key, resource) =
+            match create_new_session(self, &plugin, &component_id, &context_key, &prompt).await {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(e)) => return Ok(Err(e)),
+                Err(e) => return Err(e),
+            };
 
         // Set as current session for this context-key
         {
@@ -964,9 +958,7 @@ impl<'a> bindings::custom::codex::session::Host for ActiveCtx<'a> {
     }
 
     #[instrument(skip_all)]
-    async fn list_sessions(
-        &mut self,
-    ) -> wasmtime::Result<Result<Vec<SessionInfo>, CodexError>> {
+    async fn list_sessions(&mut self) -> wasmtime::Result<Result<Vec<SessionInfo>, CodexError>> {
         let Some(plugin) = self.get_plugin::<Codex>(PLUGIN_ID) else {
             return Ok(Err(CodexError::Internal(
                 "codex plugin not available".to_string(),

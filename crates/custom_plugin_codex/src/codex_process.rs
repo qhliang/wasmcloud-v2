@@ -112,7 +112,9 @@ pub fn spawn_codex_exec(
         "Spawning codex exec subprocess (approval mode)"
     );
 
-    let mut child = cmd.spawn().context("failed to spawn codex exec subprocess")?;
+    let mut child = cmd
+        .spawn()
+        .context("failed to spawn codex exec subprocess")?;
 
     let stdin = child.stdin.take().context("codex process has no stdin")?;
 
