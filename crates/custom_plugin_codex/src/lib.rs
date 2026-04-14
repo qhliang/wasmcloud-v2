@@ -30,6 +30,7 @@ use wasmtime::component::Resource;
 use etcetera::base_strategy::BaseStrategy;
 use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use wash_runtime::engine::workload::WorkloadItem;
+use wash_runtime::plugin::config::{resolve_field, resolve_optional_field};
 use wash_runtime::plugin::{HostPlugin, WorkloadTracker};
 use wash_runtime::wit::{WitInterface, WitWorld};
 
@@ -51,7 +52,8 @@ mod bindings {
 }
 
 use bindings::custom::codex::types::{
-    ApprovalRequest, CodexError, CodexEvent, ExecStreamEvent, SessionInfo, TokenUsage,
+    ApprovalRequest, CodexConfig as WitCodexConfig, CodexError, CodexEvent, ExecStreamEvent,
+    SessionInfo, TokenUsage,
 };
 const PLUGIN_ID: &str = "codex";
 
@@ -81,8 +83,8 @@ struct SessionMetadata {
 struct ComponentData {
     /// Token that cancels ALL background tasks for this component
     cancel_token: tokio_util::sync::CancellationToken,
-    /// Codex spawn configuration
-    config: CodexConfig,
+    /// Static interface config from wasmcloud config (fallback source)
+    interface_config: HashMap<String, String>,
     /// Active codex sessions: internal key -> session state
     sessions: HashMap<String, CodexSessionState>,
     /// Reverse map: codex thread_id -> internal session key
@@ -184,6 +186,69 @@ fn extract_config(interface: &WitInterface) -> Result<CodexConfig, String> {
                 .map(|d| d.keep())
                 .unwrap_or_else(|_| std::env::temp_dir())
         });
+
+    Ok(CodexConfig {
+        binary_path,
+        model,
+        api_token,
+        base_url,
+        project_dir,
+    })
+}
+
+/// Resolve a CodexConfig from the dynamic WIT config parameter, falling back
+/// to the stored interface config for any missing fields.
+fn resolve_codex_config(
+    dynamic_config: Option<&WitCodexConfig>,
+    interface_config: &HashMap<String, String>,
+) -> Result<CodexConfig, String> {
+    let api_token = resolve_field(
+        dynamic_config.map(|c| c.api_token.clone()),
+        interface_config,
+        "api_token",
+    )
+    .map_err(|e| e.to_string())?;
+
+    if api_token.is_empty() {
+        return Err("missing required config: 'api_token'".to_string());
+    }
+
+    let model = resolve_field(
+        dynamic_config.map(|c| c.model.clone()),
+        interface_config,
+        "model",
+    )
+    .map_err(|e| e.to_string())?;
+
+    if model.is_empty() {
+        return Err("missing required config: 'model'".to_string());
+    }
+
+    let base_url = resolve_optional_field(
+        dynamic_config.and_then(|c| c.base_url.clone()),
+        interface_config,
+        "base_url",
+    );
+
+    let binary_path = resolve_optional_field(
+        dynamic_config.and_then(|c| c.codex_binary_path.clone()),
+        interface_config,
+        "codex_binary_path",
+    )
+    .map(PathBuf::from)
+    .unwrap_or_else(|| dirs_cache_path().join("codex"));
+
+    let project_dir = resolve_optional_field(
+        dynamic_config.and_then(|c| c.project_dir.clone()),
+        interface_config,
+        "project_dir",
+    )
+    .map(PathBuf::from)
+    .unwrap_or_else(|| {
+        tempfile::tempdir()
+            .map(|d| d.keep())
+            .unwrap_or_else(|_| std::env::temp_dir())
+    });
 
     Ok(CodexConfig {
         binary_path,
@@ -370,12 +435,18 @@ async fn create_new_session(
     component_id: &str,
     context_key: &str,
     prompt: &str,
+    dynamic_config: Option<&WitCodexConfig>,
 ) -> wasmtime::Result<Result<(String, Resource<ExecStreamHandle>), CodexError>> {
-    // Get config
+    // Resolve config from dynamic param or fallback to interface config
     let config = {
         let lock = plugin.tracker.read().await;
         match lock.get_component_data(component_id) {
-            Some(data) => data.config.clone(),
+            Some(data) => match resolve_codex_config(dynamic_config, &data.interface_config) {
+                Ok(c) => c,
+                Err(e) => {
+                    return Ok(Err(CodexError::ConfigError(e)));
+                }
+            },
             None => {
                 return Ok(Err(CodexError::Internal(
                     "component not tracked".to_string(),
@@ -501,6 +572,7 @@ impl<'a> bindings::custom::codex::executor::Host for ActiveCtx<'a> {
         &mut self,
         context_key: String,
         prompt: String,
+        config: Option<WitCodexConfig>,
     ) -> wasmtime::Result<Result<Resource<ExecStreamHandle>, CodexError>> {
         let Some(plugin) = self.get_plugin::<Codex>(PLUGIN_ID) else {
             return Ok(Err(CodexError::Internal(
@@ -531,7 +603,7 @@ impl<'a> bindings::custom::codex::executor::Host for ActiveCtx<'a> {
             if let Some(sid) = session_id {
                 // Resume existing current session
                 let result =
-                    bindings::custom::codex::session::Host::resume(self, sid, prompt).await;
+                    bindings::custom::codex::session::Host::resume(self, sid, prompt, config).await;
                 // Update current_sessions to point to the new internal key created by resume
                 if let Ok(Ok(ref resource)) = result {
                     let new_key = self
@@ -552,12 +624,20 @@ impl<'a> bindings::custom::codex::executor::Host for ActiveCtx<'a> {
         }
 
         // No current session — create new
-        let (internal_key, resource) =
-            match create_new_session(self, &plugin, &component_id, &context_key, &prompt).await {
-                Ok(Ok(pair)) => pair,
-                Ok(Err(e)) => return Ok(Err(e)),
-                Err(e) => return Err(e),
-            };
+        let (internal_key, resource) = match create_new_session(
+            self,
+            &plugin,
+            &component_id,
+            &context_key,
+            &prompt,
+            config.as_ref(),
+        )
+        .await
+        {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(e)) => return Ok(Err(e)),
+            Err(e) => return Err(e),
+        };
 
         // Set as current session for this context-key
         {
@@ -726,6 +806,7 @@ impl<'a> bindings::custom::codex::session::Host for ActiveCtx<'a> {
         &mut self,
         session_id: String,
         prompt: String,
+        config: Option<WitCodexConfig>,
     ) -> wasmtime::Result<Result<Resource<ExecStreamHandle>, CodexError>> {
         let Some(plugin) = self.get_plugin::<Codex>(PLUGIN_ID) else {
             return Ok(Err(CodexError::Internal(
@@ -735,11 +816,16 @@ impl<'a> bindings::custom::codex::session::Host for ActiveCtx<'a> {
 
         let component_id = self.component_id.as_ref().to_string();
 
-        // Get config from tracker
+        // Resolve config from dynamic param or fallback to interface config
         let config = {
             let lock = plugin.tracker.read().await;
             match lock.get_component_data(&component_id) {
-                Some(data) => data.config.clone(),
+                Some(data) => match resolve_codex_config(config.as_ref(), &data.interface_config) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return Ok(Err(CodexError::ConfigError(e)));
+                    }
+                },
                 None => {
                     return Ok(Err(CodexError::Internal(
                         "component not tracked".to_string(),
@@ -845,6 +931,7 @@ impl<'a> bindings::custom::codex::session::Host for ActiveCtx<'a> {
         &mut self,
         context_key: String,
         prompt: String,
+        config: Option<WitCodexConfig>,
     ) -> wasmtime::Result<Result<Resource<ExecStreamHandle>, CodexError>> {
         let Some(plugin) = self.get_plugin::<Codex>(PLUGIN_ID) else {
             return Ok(Err(CodexError::Internal(
@@ -854,12 +941,20 @@ impl<'a> bindings::custom::codex::session::Host for ActiveCtx<'a> {
 
         let component_id = self.component_id.as_ref().to_string();
 
-        let (internal_key, resource) =
-            match create_new_session(self, &plugin, &component_id, &context_key, &prompt).await {
-                Ok(Ok(pair)) => pair,
-                Ok(Err(e)) => return Ok(Err(e)),
-                Err(e) => return Err(e),
-            };
+        let (internal_key, resource) = match create_new_session(
+            self,
+            &plugin,
+            &component_id,
+            &context_key,
+            &prompt,
+            config.as_ref(),
+        )
+        .await
+        {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(e)) => return Ok(Err(e)),
+            Err(e) => return Err(e),
+        };
 
         // Set as current session for this context-key
         {
@@ -1146,7 +1241,8 @@ impl HostPlugin for Codex {
             return Ok(());
         };
 
-        // Extract and validate config
+        // Extract and validate config (keep for validation + binary download)
+        let interface_config = interface.config.clone();
         let config = match extract_config(interface) {
             Ok(c) => c,
             Err(e) => {
@@ -1201,7 +1297,7 @@ impl HostPlugin for Codex {
             component_handle,
             ComponentData {
                 cancel_token: tokio_util::sync::CancellationToken::new(),
-                config,
+                interface_config,
                 sessions: HashMap::new(),
                 session_id_map: HashMap::new(),
                 current_sessions: HashMap::new(),

@@ -44,28 +44,36 @@ interface types {
         created-at: string,
         token-usage: option<token-usage>,
     }
+
+    record codex-config {
+        api-token: string,
+        model: string,
+        base-url: option<string>,
+        codex-binary-path: option<string>,
+        project-dir: option<string>,
+    }
 }
 
 interface executor {
-    use types.{codex-error, exec-stream-event};
+    use types.{codex-error, exec-stream-event, codex-config};
 
     resource exec-stream {
         next: func() -> result<tuple<list<exec-stream-event>, bool>, codex-error>;
     }
 
-    execute: func(context-key: string, prompt: string) -> result<exec-stream, codex-error>;
+    execute: func(context-key: string, prompt: string, config: option<codex-config>) -> result<exec-stream, codex-error>;
 }
 
 interface session {
-    use types.{codex-error, token-usage, exec-stream-event, session-info};
+    use types.{codex-error, token-usage, exec-stream-event, session-info, codex-config};
     use executor.{exec-stream};
 
     // Existing
     get-usage: func(session-id: string) -> result<token-usage, codex-error>;
-    resume: func(session-id: string, prompt: string) -> result<exec-stream, codex-error>;
+    resume: func(session-id: string, prompt: string, config: option<codex-config>) -> result<exec-stream, codex-error>;
 
     // New session management
-    new-session: func(context-key: string, prompt: string) -> result<exec-stream, codex-error>;
+    new-session: func(context-key: string, prompt: string, config: option<codex-config>) -> result<exec-stream, codex-error>;
     change-session: func(context-key: string, session-id: string) -> result<_, codex-error>;
     delete-session: func(session-id: string) -> result<_, codex-error>;
     list-sessions: func() -> result<list<session-info>, codex-error>;
