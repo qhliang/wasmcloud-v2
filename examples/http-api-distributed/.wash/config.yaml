@@ -132,15 +132,12 @@ dev:
       package: wechat
       interfaces:
         - sender
-        - login
-        - handler
       config:
-        token: "aa1ab8847715@im.bot:060000dc2c2206b685e00be56d7342c340855f"
+        token: "9977ac266efd@im.bot:0600002156f49853b9e2676cdac13cb4dc44de"
     - namespace: custom
       package: telegram
       interfaces:
         - sender
-        - handler
       config:
         bot_token: "invalid.token"
 

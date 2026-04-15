@@ -62,7 +62,7 @@ pub async fn chat(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
         top_p: o.top_p,
     });
 
-    match chat::chat(&chat_req.model, &messages, None) {
+    match chat::chat(&chat_req.model, &messages, None, None) {
         Ok(response) => {
             log(
                 Level::Info,

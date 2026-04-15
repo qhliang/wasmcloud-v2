@@ -1,5 +1,4 @@
-use crate::bindings::custom::wechat::login;
-use crate::bindings::custom::wechat::sender;
+use crate::bindings::custom::wechat::sender::WechatClient;
 use crate::bindings::custom::wechat::types::WechatError;
 use crate::bindings::wasi::logging::logging::{Level, log};
 use crate::{LOG_CTX, helpers, templates};
@@ -37,7 +36,8 @@ pub async fn send_text(mut req: Request<Body>) -> anyhow::Result<Response<Body>>
         LOG_CTX,
         &format!("WECHAT SEND TEXT: to={}", body.to),
     );
-    match sender::send_text(&body.to, &body.text) {
+    let client = WechatClient::new(None);
+    match client.send_text(&body.to, &body.text) {
         Ok(()) => {
             log(Level::Info, LOG_CTX, "WECHAT SEND TEXT OK");
             helpers::json_response("{\"ok\":true}")
@@ -59,7 +59,8 @@ pub async fn send_media(mut req: Request<Body>) -> anyhow::Result<Response<Body>
         LOG_CTX,
         &format!("WECHAT SEND MEDIA: to={}", body.to),
     );
-    match sender::send_media(&body.to, &body.file_path) {
+    let client = WechatClient::new(None);
+    match client.send_media(&body.to, &body.file_path) {
         Ok(()) => {
             log(Level::Info, LOG_CTX, "WECHAT SEND MEDIA OK");
             helpers::json_response("{\"ok\":true}")
@@ -72,7 +73,8 @@ pub async fn send_media(mut req: Request<Body>) -> anyhow::Result<Response<Body>
 
 pub async fn qr_start(_req: Request<Body>) -> anyhow::Result<Response<Body>> {
     log(Level::Info, LOG_CTX, "WECHAT QR START");
-    match login::qr_start() {
+    let client = WechatClient::new(None);
+    match client.qr_start() {
         Ok(session_json) => {
             log(Level::Info, LOG_CTX, "WECHAT QR START OK");
             helpers::json_response(session_json)
@@ -89,7 +91,8 @@ struct QrPollRequest {
 pub async fn qr_poll_status(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
     let body: QrPollRequest = helpers::parse_json_body(&mut req).await?;
     log(Level::Info, LOG_CTX, "WECHAT QR POLL STATUS");
-    match login::qr_poll_status(&body.session_json) {
+    let client = WechatClient::new(None);
+    match client.qr_poll_status(&body.session_json) {
         Ok(status_json) => {
             log(Level::Info, LOG_CTX, "WECHAT QR POLL STATUS OK");
             helpers::json_response(status_json)

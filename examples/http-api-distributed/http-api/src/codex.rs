@@ -1,7 +1,7 @@
 use crate::bindings::custom::codex::executor;
 use crate::bindings::custom::codex::session;
 use crate::bindings::custom::codex::types::{ApprovalRequest, CodexEvent, ExecStreamEvent};
-use crate::bindings::custom::wechat::sender;
+use crate::bindings::custom::wechat::sender::WechatClient;
 use crate::bindings::wasi::clocks::monotonic_clock;
 use crate::bindings::wasi::logging::logging::{Level, log};
 use crate::helpers;
@@ -124,7 +124,7 @@ pub async fn execute(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
         ),
     );
 
-    match executor::execute(context_key, &body.prompt) {
+    match executor::execute(context_key, &body.prompt, None) {
         Ok(stream) => {
             let (session_id, all_events, total_input, total_output) = process_stream(stream);
 
@@ -201,7 +201,7 @@ pub async fn resume(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
         ),
     );
 
-    match session::resume(&body.session_id, &body.prompt) {
+    match session::resume(&body.session_id, &body.prompt, None) {
         Ok(stream) => {
             let (session_id, all_events, total_input, total_output) = process_stream(stream);
 
@@ -252,7 +252,7 @@ pub async fn new_session(mut req: Request<Body>) -> anyhow::Result<Response<Body
         ),
     );
 
-    match session::new_session(context_key, &body.prompt) {
+    match session::new_session(context_key, &body.prompt, None) {
         Ok(stream) => {
             let (session_id, all_events, total_input, total_output) = process_stream(stream);
 
@@ -385,7 +385,7 @@ pub fn execute_for_chat(sender_id: &str, prompt: &str) -> Result<String, String>
         ),
     );
 
-    let stream = executor::execute(sender_id, prompt).map_err(|e| format!("{e:?}"))?;
+    let stream = executor::execute(sender_id, prompt, None).map_err(|e| format!("{e:?}"))?;
 
     let start = monotonic_clock::now();
     let mut texts: Vec<String> = Vec::new();
@@ -421,7 +421,8 @@ pub fn execute_for_chat(sender_id: &str, prompt: &str) -> Result<String, String>
                 if !ended && !sent_processing {
                     let elapsed = monotonic_clock::now() - start;
                     if elapsed >= PROCESSING_TIMEOUT_NS {
-                        let _ = sender::send_text(sender_id, "正在处理中，请稍候...");
+                        let client = WechatClient::new(None);
+                        let _ = client.send_text(sender_id, "正在处理中，请稍候...");
                         sent_processing = true;
                         log(Level::Info, LOG_CTX, "CODEX CHAT: sent processing notice");
                     }

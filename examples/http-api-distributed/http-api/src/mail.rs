@@ -1,4 +1,4 @@
-use crate::bindings::custom::mail::sender;
+use crate::bindings::custom::mail::sender::MailClient;
 use crate::bindings::custom::mail::types::MailError;
 use crate::bindings::wasi::logging::logging::{Level, log};
 use crate::{LOG_CTX, helpers, templates};
@@ -26,7 +26,8 @@ struct SendMailRequest {
 pub async fn send_mail(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
     let body: SendMailRequest = helpers::parse_json_body(&mut req).await?;
     log(Level::Info, LOG_CTX, &format!("MAIL SEND: to={}", body.to));
-    match sender::send_mail(
+    let client = MailClient::new(None);
+    match client.send_mail(
         &body.to,
         &body.subject,
         body.body_text.as_deref(),
@@ -53,7 +54,8 @@ struct ListMailsRequest {
 pub async fn list_mails(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
     let body: ListMailsRequest = helpers::parse_json_body(&mut req).await?;
     log(Level::Info, LOG_CTX, "MAIL LIST");
-    match sender::list_mails(
+    let client = MailClient::new(None);
+    match client.list_mails(
         body.mailbox.as_deref(),
         body.search_criteria.as_deref(),
         body.limit,
@@ -80,7 +82,8 @@ pub async fn get_mail(mut req: Request<Body>) -> anyhow::Result<Response<Body>> 
         LOG_CTX,
         &format!("MAIL GET: message_id={}", body.message_id),
     );
-    match sender::get_mail(&body.message_id, body.mailbox.as_deref()) {
+    let client = MailClient::new(None);
+    match client.get_mail(&body.message_id, body.mailbox.as_deref()) {
         Ok(json) => {
             log(Level::Info, LOG_CTX, "MAIL GET OK");
             helpers::json_response(json)

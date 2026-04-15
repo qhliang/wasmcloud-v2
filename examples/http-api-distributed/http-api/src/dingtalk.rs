@@ -1,4 +1,4 @@
-use crate::bindings::custom::dingtalk_stream::sender;
+use crate::bindings::custom::dingtalk_stream::sender::DingtalkClient;
 use crate::bindings::custom::dingtalk_stream::types::DingtalkError;
 use crate::bindings::wasi::logging::logging::{Level, log};
 use crate::{LOG_CTX, helpers, templates};
@@ -28,7 +28,8 @@ pub async fn send_text(mut req: Request<Body>) -> anyhow::Result<Response<Body>>
             body.conversation_id, body.sender_id
         ),
     );
-    match sender::send_text(&body.conversation_id, &body.sender_id, &body.content) {
+    let client = DingtalkClient::new(None);
+    match client.send_text(&body.conversation_id, &body.sender_id, &body.content) {
         Ok(()) => {
             log(Level::Info, LOG_CTX, "DINGTALK SEND TEXT OK");
             helpers::json_response("{\"ok\":true}")
@@ -55,7 +56,8 @@ pub async fn send_markdown(mut req: Request<Body>) -> anyhow::Result<Response<Bo
             body.conversation_id, body.sender_id
         ),
     );
-    match sender::send_markdown(
+    let client = DingtalkClient::new(None);
+    match client.send_markdown(
         &body.conversation_id,
         &body.sender_id,
         &body.title,
@@ -82,7 +84,8 @@ pub async fn send_oto_text(mut req: Request<Body>) -> anyhow::Result<Response<Bo
         LOG_CTX,
         &format!("DINGTALK SEND OTO TEXT: user={}", body.user_id),
     );
-    match sender::send_oto_text(&body.user_id, &body.content) {
+    let client = DingtalkClient::new(None);
+    match client.send_oto_text(&body.user_id, &body.content) {
         Ok(()) => {
             log(Level::Info, LOG_CTX, "DINGTALK SEND OTO TEXT OK");
             helpers::json_response("{\"ok\":true}")
@@ -93,7 +96,8 @@ pub async fn send_oto_text(mut req: Request<Body>) -> anyhow::Result<Response<Bo
 
 pub async fn get_access_token(_req: Request<Body>) -> anyhow::Result<Response<Body>> {
     log(Level::Info, LOG_CTX, "DINGTALK GET ACCESS TOKEN");
-    match sender::get_access_token() {
+    let client = DingtalkClient::new(None);
+    match client.get_access_token() {
         Ok(token) => {
             log(Level::Info, LOG_CTX, "DINGTALK GET ACCESS TOKEN OK");
             helpers::json_response(serde_json::json!({ "token": token }).to_string())

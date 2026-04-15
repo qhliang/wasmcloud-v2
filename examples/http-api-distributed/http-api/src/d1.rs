@@ -1,24 +1,29 @@
 use crate::LOG_CTX;
-use crate::bindings::custom::cf_d1::query;
+use crate::bindings::custom::cf_d1::query::D1Client;
 use crate::bindings::custom::cf_d1::types::{ColumnValue, QueryError};
 use crate::bindings::wasi::logging::logging::{Level, log};
 use crate::helpers;
 use crate::templates;
 use serde::Deserialize;
 use wstd::http::{Body, Request, Response, StatusCode};
+
 const D1_HTML: &str = include_str!("../resources/d1.html");
+
 pub async fn home(_req: Request<Body>) -> anyhow::Result<Response<Body>> {
     helpers::html_response(templates::render(D1_HTML))
 }
+
 #[derive(Deserialize)]
 struct D1QueryRequest {
     sql: String,
     params: Vec<JsonValue>,
 }
+
 #[derive(Deserialize)]
 struct D1BatchRequest {
     sql: String,
 }
+
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum JsonValue {
@@ -28,6 +33,7 @@ enum JsonValue {
     Float(f64),
     String(String),
 }
+
 impl JsonValue {
     fn to_column_value(&self) -> ColumnValue {
         match self {
@@ -39,6 +45,7 @@ impl JsonValue {
         }
     }
 }
+
 fn column_value_to_json(val: &ColumnValue) -> serde_json::Value {
     match val {
         ColumnValue::Null => serde_json::Value::Null,
@@ -48,6 +55,7 @@ fn column_value_to_json(val: &ColumnValue) -> serde_json::Value {
         ColumnValue::Blob(b) => serde_json::json!({ "blob": b.len() }),
     }
 }
+
 fn query_error_to_string(e: QueryError) -> String {
     match e {
         QueryError::InvalidQuery(s) => format!("Invalid query: {}", s),
@@ -57,6 +65,7 @@ fn query_error_to_string(e: QueryError) -> String {
         QueryError::Unexpected(s) => format!("Unexpected error: {}", s),
     }
 }
+
 pub async fn query(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
     let query_req: D1QueryRequest = helpers::parse_json_body(&mut req).await?;
     log(
@@ -68,12 +77,15 @@ pub async fn query(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
             query_req.params.len()
         ),
     );
+
     let params: Vec<ColumnValue> = query_req
         .params
         .iter()
         .map(|p| p.to_column_value())
         .collect();
-    match query::query(&query_req.sql, &params) {
+
+    let client = D1Client::new(None);
+    match client.query(&query_req.sql, &params) {
         Ok(result) => {
             log(
                 Level::Info,
@@ -105,6 +117,7 @@ pub async fn query(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
         }
     }
 }
+
 pub async fn batch(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
     let batch_req: D1BatchRequest = helpers::parse_json_body(&mut req).await?;
     log(
@@ -112,12 +125,17 @@ pub async fn batch(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
         LOG_CTX,
         &format!("D1 BATCH: sql_len={}", batch_req.sql.len()),
     );
-    match query::query_batch(&batch_req.sql) {
+
+    let client = D1Client::new(None);
+    match client.query_batch(&batch_req.sql) {
         Ok(results) => {
             log(
                 Level::Info,
                 LOG_CTX,
-                &format!("D1 BATCH OK: {} statements(s) executed", results.len()),
+                &format!(
+                    "D1 BATCH OK: {} statements(s) executed",
+                    results.len()
+                ),
             );
             let json_results: Vec<serde_json::Value> = results
                 .iter()

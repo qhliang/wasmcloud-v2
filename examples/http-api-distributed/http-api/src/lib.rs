@@ -48,6 +48,7 @@ impl bindings::exports::custom::crontab::handler::Guest for CustomHandler {
 
 impl bindings::exports::custom::feishu::handler::Guest for CustomHandler {
     fn on_message(
+        _client: &bindings::custom::feishu::sender::FeishuClient,
         msg: bindings::exports::custom::feishu::handler::ImMessage,
     ) -> Result<(), String> {
         log(
@@ -61,6 +62,7 @@ impl bindings::exports::custom::feishu::handler::Guest for CustomHandler {
 
 impl bindings::exports::custom::dingtalk_stream::handler::Guest for CustomHandler {
     fn on_message(
+        _client: &bindings::custom::dingtalk_stream::sender::DingtalkClient,
         msg: bindings::exports::custom::dingtalk_stream::handler::ChatbotMessage,
     ) -> Result<(), String> {
         log(
@@ -88,6 +90,7 @@ impl bindings::exports::custom::telegram::handler::Guest for CustomHandler {
 
 impl bindings::exports::custom::wechat::handler::Guest for CustomHandler {
     fn on_message(
+        client: &bindings::custom::wechat::sender::WechatClient,
         msg: bindings::exports::custom::wechat::handler::WechatMessage,
     ) -> Result<(), String> {
         log(
@@ -114,7 +117,7 @@ impl bindings::exports::custom::wechat::handler::Guest for CustomHandler {
             }
         };
 
-        match bindings::custom::wechat::sender::send_text(&msg.sender, &reply) {
+        match client.send_text(&msg.sender, &reply) {
             Ok(()) => {
                 log(Level::Info, LOG_CTX, "WECHAT CODEX REPLY sent");
             }
