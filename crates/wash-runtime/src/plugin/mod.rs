@@ -62,8 +62,7 @@ pub mod config;
 /// imports and exports that will be directly linked to the workload's [`wasmtime::component::Linker`].
 ///
 /// For example, the runtime doesn't implement `wasi:keyvalue`, but it's a key capability for many component
-/// applications. This crate provides a [`wasi_keyvalue::WasiKeyvalue`] built-in that persists key-value data
-/// in-memory and implements the component imports of `wasi:keyvalue` atomics, batch and store.
+/// applications. The keyvalue capability is provided by the `custom_plugin_kv` crate (multi-backend),
 ///
 /// You can supply your own [`HostPlugin`] implementations to the [`crate::host::HostBuilder::with_plugin`] function.
 #[async_trait::async_trait]

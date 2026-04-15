@@ -1,9 +1,2 @@
-mod filesystem;
-mod in_memory;
-mod nats;
-mod redis;
-
-pub use filesystem::FilesystemKeyValue;
-pub use in_memory::InMemoryKeyValue;
-pub use nats::NatsKeyValue;
-pub use redis::RedisKeyValue;
+// Built-in KV implementations have been moved to custom_plugin_kv (multi-backend).
+// This module is kept as a placeholder for the wasi-keyvalue feature flag.

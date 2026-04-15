@@ -4,7 +4,7 @@ default-members = ["crates/wash"]
 members = [
     "crates/wash-runtime",
     "crates/wash",
-    "crates/custom_plugin_cf_kv",
+    "crates/custom_plugin_kv",
     "crates/custom_plugin_blobstore",
     "crates/custom_plugin_cf_d1",
     "crates/custom_plugin_llm_gateway",

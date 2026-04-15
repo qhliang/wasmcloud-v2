@@ -16,8 +16,7 @@ use wash_runtime::{
         http::{DevRouter, HttpServer},
     },
     plugin::{
-        wasi_blobstore::InMemoryBlobstore, wasi_config::DynamicConfig,
-        wasi_keyvalue::InMemoryKeyValue, wasi_logging::TracingLogger,
+        wasi_blobstore::InMemoryBlobstore, wasi_config::DynamicConfig, wasi_logging::TracingLogger,
     },
     types::{Component, LocalResources, Workload, WorkloadStartRequest},
     wit::WitInterface,
@@ -92,7 +91,7 @@ async fn start_host_with_all_plugins(addr: &str) -> Result<(std::net::SocketAddr
         .with_engine(engine)
         .with_http_handler(Arc::new(http_server))
         .with_plugin(Arc::new(InMemoryBlobstore::new(None)))?
-        .with_plugin(Arc::new(InMemoryKeyValue::new()))?
+        .with_plugin(Arc::new(custom_plugin_kv::MultiBackendKeyValue::new()))?
         .with_plugin(Arc::new(TracingLogger::default()))?
         .with_plugin(Arc::new(DynamicConfig::default()))?
         .build()?;

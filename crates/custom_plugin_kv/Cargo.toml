@@ -1,10 +1,10 @@
 [package]
-name = "custom_plugin_cf_kv"
+name = "custom_plugin_kv"
 authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
-description = "Custom host plugin for Cloudflare KV keyvalue service"
+description = "Multi-backend host plugin for wasi:keyvalue (OpenDAL, Cloudflare KV, NATS JetStream)"
 
 [lib]
 path = "src/lib.rs"
@@ -24,6 +24,14 @@ opentelemetry = { workspace = true, features = ["trace", "metrics"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 base64 = { workspace = true }
+
+# Multi-backend KV support
+opendal = { version = "0.53", default-features = false, features = [
+    "services-redis",
+    "services-memory",
+    "services-fs",
+] }
+async-nats = { workspace = true }
 
 wash-runtime = { path = "../wash-runtime" }
 

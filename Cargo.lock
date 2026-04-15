@@ -1540,6 +1540,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d953932541249c91e3fa70a75ff1e52adc62979a2a8132145d4b9b3e6d1a9b6a"
 
 [[package]]
+name = "crc16"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "338089f42c427b86394a5ee60ff321da23a5c89c9d89514c829687b26359fcff"
+
+[[package]]
 name = "crc32c"
 version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1708,25 +1714,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "custom_plugin_cf_kv"
-version = "2.0.1"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64 0.22.1",
- "bytes",
- "cloudflare-workers-kv-sdk-rs",
- "futures",
- "opentelemetry 0.31.0",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "wash-runtime",
- "wasmtime",
-]
-
-[[package]]
 name = "custom_plugin_codex"
 version = "2.0.1"
 dependencies = [
@@ -1796,6 +1783,27 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+ "tracing",
+ "wash-runtime",
+ "wasmtime",
+]
+
+[[package]]
+name = "custom_plugin_kv"
+version = "2.0.1"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "cloudflare-workers-kv-sdk-rs",
+ "futures",
+ "opendal",
+ "opentelemetry 0.31.0",
+ "serde",
+ "serde_json",
+ "tokio",
  "tracing",
  "wash-runtime",
  "wasmtime",
@@ -3732,15 +3740,6 @@ dependencies = [
 
 [[package]]
 name = "itertools"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
-dependencies = [
- "either",
-]
-
-[[package]]
-name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
@@ -4801,6 +4800,7 @@ dependencies = [
  "md-5",
  "percent-encoding",
  "quick-xml",
+ "redis",
  "reqsign",
  "reqwest 0.12.28",
  "rustls-native-certs 0.8.3",
@@ -6089,22 +6089,31 @@ dependencies = [
 
 [[package]]
 name = "redis"
-version = "0.27.6"
+version = "0.29.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09d8f99a4090c89cc489a94833c901ead69bfbf3877b4867d5482e321ee875bc"
+checksum = "1bc42f3a12fd4408ce64d8efef67048a924e543bd35c6591c0447fda9054695f"
 dependencies = [
  "arc-swap",
- "async-trait",
+ "backon",
  "bytes",
  "combine",
+ "crc16",
+ "futures-channel",
+ "futures-sink",
  "futures-util",
- "itertools 0.13.0",
  "itoa",
+ "log",
  "num-bigint",
  "percent-encoding",
  "pin-project-lite",
+ "rand 0.9.2",
+ "rustls 0.23.37",
+ "rustls-native-certs 0.8.3",
  "ryu",
+ "sha1_smol",
+ "socket2 0.5.10",
  "tokio",
+ "tokio-rustls 0.26.4",
  "tokio-util",
  "url",
 ]
@@ -6901,6 +6910,12 @@ dependencies = [
  "cpufeatures",
  "digest",
 ]
+
+[[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
 
 [[package]]
 name = "sha2"
@@ -8647,11 +8662,11 @@ dependencies = [
  "ctrlc",
  "custom_plugin_blobstore",
  "custom_plugin_cf_d1",
- "custom_plugin_cf_kv",
  "custom_plugin_codex",
  "custom_plugin_crontab",
  "custom_plugin_dingtalk_stream",
  "custom_plugin_feishu",
+ "custom_plugin_kv",
  "custom_plugin_llm_gateway",
  "custom_plugin_mail",
  "custom_plugin_telegram",
@@ -8702,6 +8717,7 @@ dependencies = [
  "cap-std",
  "chrono",
  "cidr",
+ "custom_plugin_kv",
  "deadpool-postgres",
  "docker_credential",
  "futures",
@@ -8728,7 +8744,6 @@ dependencies = [
  "pg_bigdecimal",
  "postgres-types",
  "prost 0.14.3",
- "redis",
  "reqwest 0.12.28",
  "rustix 1.1.4",
  "rustls 0.23.37",

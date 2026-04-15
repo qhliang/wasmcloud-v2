@@ -56,7 +56,7 @@ wasm-pkg-client = { workspace = true }
 wasm-pkg-core = { workspace = true }
 wash-runtime = { workspace = true, features = ["washlet", "oci", "wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "wasmcloud-postgres", "wasi-otel"] }
 wit-component = { workspace = true }
-custom_plugin_cf_kv = { path = "../custom_plugin_cf_kv" }
+custom_plugin_kv = { path = "../custom_plugin_kv" }
 custom_plugin_blobstore = { path = "../custom_plugin_blobstore" }
 custom_plugin_cf_d1 = { path = "../custom_plugin_cf_d1" }
 custom_plugin_llm_gateway = { path = "../custom_plugin_llm_gateway" }

@@ -4,7 +4,7 @@ use anyhow::Context as _;
 use clap::Args;
 use custom_plugin_blobstore::CustomBlobstore;
 use custom_plugin_cf_d1::CloudflareD1;
-use custom_plugin_cf_kv::CloudflareKeyValue;
+use custom_plugin_kv::MultiBackendKeyValue;
 use custom_plugin_llm_gateway::LlmGateway;
 use tracing::info;
 use wash_runtime::{
@@ -14,13 +14,6 @@ use wash_runtime::{
 };
 
 use crate::cli::{CliCommand, CliContext, CommandOutput};
-
-#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
-pub enum KeyValueBackendType {
-    #[default]
-    Nats,
-    Cloudflare,
-}
 
 #[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
 pub enum BlobstoreBackendType {
@@ -109,10 +102,6 @@ pub struct HostCommand {
     #[arg(long = "wasi-otel", default_value_t = false)]
     pub wasi_otel: bool,
 
-    /// The keyvalue backend to use
-    #[clap(long = "keyvalue-backend", env = "KEYVALUE_BACKEND")]
-    pub keyvalue_backend: KeyValueBackendType,
-
     /// The blobstore backend to use
     #[clap(long = "blobstore-backend", env = "BLOBSTORE_BACKEND")]
     pub blobstore_backend: BlobstoreBackendType,
@@ -170,20 +159,10 @@ impl CliCommand for HostCommand {
             )))?
             .with_meters(Meters::new(ctx.enable_meters()));
 
-        // Enable keyvalue plugin
-        match self.keyvalue_backend {
-            KeyValueBackendType::Nats => {
-                cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(
-                    plugin::wasi_keyvalue::NatsKeyValue::new(&data_nats_client),
-                ))?;
-                tracing::info!("Nats keyvalue plugin enabled");
-            }
-            KeyValueBackendType::Cloudflare => {
-                cluster_host_builder =
-                    cluster_host_builder.with_plugin(Arc::new(CloudflareKeyValue::new()))?;
-                tracing::info!("Cloudflare keyvalue plugin enabled");
-            }
-        }
+        // Enable multi-backend KV plugin
+        cluster_host_builder =
+            cluster_host_builder.with_plugin(Arc::new(MultiBackendKeyValue::new()))?;
+        tracing::info!("Multi-backend KV plugin enabled");
 
         // Enable blobstore plugin
         match self.blobstore_backend {
