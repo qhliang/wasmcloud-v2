@@ -21,7 +21,6 @@ tracing = { workspace = true }
 opentelemetry = { workspace = true, features = ["trace", "metrics"] }
 wasmtime = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
 teloxide = { version = "0.15", default-features = false, features = ["native-tls"] }
 futures = { workspace = true }
 wash-runtime = { path = "../wash-runtime" }
