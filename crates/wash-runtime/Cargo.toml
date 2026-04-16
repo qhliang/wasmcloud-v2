@@ -117,6 +117,7 @@ tonic-prost-build = { workspace = true, default-features = true }
 pbjson-build = { workspace = true, default-features = true }
 
 [dev-dependencies]
+custom_plugin_blobstore = { path = "../custom_plugin_blobstore" }
 custom_plugin_kv = { path = "../custom_plugin_kv" }
 tokio = { workspace = true, features = ["full"] }
 tracing-subscriber = { workspace = true }

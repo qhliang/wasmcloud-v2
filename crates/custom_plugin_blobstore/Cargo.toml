@@ -4,11 +4,11 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-description = "Multi-backend blobstore host plugin (Memory, S3, WebDAV, FTP, filesystem)"
+description = "Multi-backend blobstore host plugin (Memory, S3, WebDAV, FTP, filesystem, NATS)"
 license = "Apache-2.0"
 repository = "https://github.com/wasmcloud/wasmCloud"
 readme = "README.md"
-keywords = ["webassembly", "wasm", "blobstore", "opendal"]
+keywords = ["webassembly", "wasm", "blobstore", "opendal", "nats"]
 categories = ["wasm"]
 
 [lints]
@@ -16,8 +16,10 @@ workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+async-nats = { workspace = true }
 async-trait = { workspace = true }
-tokio = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["io-util"] }
 tracing = { workspace = true }
 wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }

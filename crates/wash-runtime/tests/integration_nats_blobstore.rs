@@ -1,10 +1,10 @@
-//! Integration test for HTTP + NatsBlobstore round-trip
+//! Integration test for HTTP + NATS blobstore round-trip
 //!
 //! Requires Docker. Gated behind `NATS_INTEGRATION_TESTS=1` so CI can opt in.
 //!
 //! Uses testcontainers to spin up a NATS server with JetStream, then validates
-//! that the http-blobstore fixture component can write data through NatsBlobstore
-//! and read it back correctly — exercising the TempFileOutputStream-based write path.
+//! that the http-blobstore fixture component can write data through the multi-backend
+//! blobstore plugin (NATS backend) and read it back correctly.
 
 use anyhow::{Context, Result};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
@@ -15,13 +15,13 @@ use testcontainers::{
 };
 use tokio::time::timeout;
 
+use custom_plugin_blobstore::CustomBlobstore;
 use wash_runtime::{
     engine::Engine,
     host::{
         HostApi, HostBuilder,
         http::{DevRouter, HttpServer},
     },
-    plugin::wasi_blobstore::NatsBlobstore,
     types::{Component, LocalResources, Workload, WorkloadStartRequest},
     wit::WitInterface,
 };
@@ -62,7 +62,7 @@ async fn setup() -> Result<TestHarness> {
     let engine = Engine::builder().build()?;
     let http_plugin = HttpServer::new(DevRouter::default(), "127.0.0.1:0".parse()?).await?;
     let addr = http_plugin.addr();
-    let blobstore_plugin = NatsBlobstore::new(&nats_client);
+    let blobstore_plugin = CustomBlobstore::new();
 
     let host = HostBuilder::new()
         .with_engine(engine)
@@ -72,6 +72,7 @@ async fn setup() -> Result<TestHarness> {
 
     let host = host.start().await.context("Failed to start host")?;
 
+    let nats_url = format!("nats://127.0.0.1:{port}");
     let req = WorkloadStartRequest {
         workload_id: uuid::Uuid::new_v4().to_string(),
         workload: Workload {
@@ -120,7 +121,8 @@ async fn setup() -> Result<TestHarness> {
                     version: Some(semver::Version::parse("0.2.0-draft").unwrap()),
                     config: {
                         let mut config = HashMap::new();
-                        config.insert("buckets".to_string(), "my-container-real".to_string());
+                        config.insert("backend".to_string(), "nats".to_string());
+                        config.insert("nats_url".to_string(), nats_url);
                         config
                     },
                     name: None,

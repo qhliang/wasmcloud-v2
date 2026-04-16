@@ -1678,7 +1678,9 @@ name = "custom_plugin_blobstore"
 version = "2.0.1"
 dependencies = [
  "anyhow",
+ "async-nats",
  "async-trait",
+ "futures",
  "opendal",
  "opentelemetry 0.31.0",
  "serde",
@@ -8702,6 +8704,7 @@ dependencies = [
  "cap-std",
  "chrono",
  "cidr",
+ "custom_plugin_blobstore",
  "custom_plugin_kv",
  "deadpool-postgres",
  "docker_credential",

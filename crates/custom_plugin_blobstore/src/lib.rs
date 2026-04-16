@@ -1,21 +1,25 @@
 //! Multi-Backend Blobstore Host Plugin
 //!
 //! This module implements a wasmCloud host plugin that provides `wasi:blobstore@0.2.0-draft`
-//! interfaces using OpenDAL as the unified storage access layer.
+//! interfaces using OpenDAL or NATS JetStream Object Store as the storage backend.
 //!
-//! Supported backends: Memory (default), S3 (including Cloudflare R2), WebDAV, FTP, Filesystem.
+//! Supported backends: Memory (default), S3 (including Cloudflare R2), WebDAV, FTP, Filesystem,
+//! NATS JetStream Object Store.
 //!
-//! Backend is selected via `backend` config key (e.g., "memory", "s3", "webdav", "ftp", "fs").
+//! Backend is selected via `backend` config key (e.g., "memory", "s3", "webdav", "ftp", "fs", "nats").
 //! If `backend` is not specified, "memory" is used by default.
-//! All other config keys are the YAML interface config are passed directly to OpenDAL.
+//! All other config keys from the YAML interface config are passed directly to OpenDAL.
+//! For NATS backend, use `nats_url` (default: "nats://127.0.0.1:4222") to configure the connection.
 
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use opendal::{Operator, Scheme};
 use opentelemetry::metrics::Counter;
+use tokio::io::AsyncReadExt;
 use tokio::sync::RwLock;
 use tracing::debug;
 use wasmtime::component::Resource;
@@ -70,12 +74,245 @@ pub struct OutgoingValueHandle {
     pub object_name: Option<String>,
 }
 
+/// Backend engine for blobstore operations
+enum BlobEngine {
+    /// OpenDAL operator (memory, s3, webdav, ftp, fs)
+    OpenDal(Operator),
+    /// NATS JetStream Object Store
+    Nats(NatsBlobBackend),
+}
+
+impl BlobEngine {
+    fn clone_engine(&self) -> BlobEngine {
+        match self {
+            BlobEngine::OpenDal(op) => BlobEngine::OpenDal(op.clone()),
+            BlobEngine::Nats(nats) => BlobEngine::Nats(nats.clone()),
+        }
+    }
+}
+
+/// NATS JetStream Object Store backend
+#[derive(Clone)]
+struct NatsBlobBackend {
+    context: Arc<async_nats::jetstream::Context>,
+}
+
+impl NatsBlobBackend {
+    async fn new(nats_url: &str) -> anyhow::Result<Self> {
+        let client = async_nats::connect(nats_url)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to connect to NATS: {e}"))?;
+        let context = async_nats::jetstream::new(client);
+        Ok(Self {
+            context: Arc::new(context),
+        })
+    }
+
+    async fn create_container(&self, name: &str) -> anyhow::Result<()> {
+        self.context
+            .create_object_store(async_nats::jetstream::object_store::Config {
+                bucket: name.to_string(),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to create object store '{name}': {e}"))?;
+        Ok(())
+    }
+
+    async fn container_exists(&self, name: &str) -> anyhow::Result<bool> {
+        match self.context.get_object_store(name.to_string()).await {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
+        }
+    }
+
+    async fn delete_container(&self, name: &str) -> anyhow::Result<()> {
+        self.context
+            .delete_object_store(name.to_string())
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to delete object store '{name}': {e}"))?;
+        Ok(())
+    }
+
+    async fn read(&self, container: &str, object: &str) -> anyhow::Result<Vec<u8>> {
+        let store = self
+            .context
+            .get_object_store(container.to_string())
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to get object store '{container}': {e}"))?;
+        let mut obj = store
+            .get(object)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to get object '{object}': {e}"))?;
+        let mut buf = Vec::new();
+        obj.read_to_end(&mut buf)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to read object '{object}': {e}"))?;
+        Ok(buf)
+    }
+
+    async fn write(&self, container: &str, object: &str, data: Vec<u8>) -> anyhow::Result<()> {
+        let store = self
+            .context
+            .get_object_store(container.to_string())
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to get object store '{container}': {e}"))?;
+        let mut cursor = std::io::Cursor::new(data);
+        store
+            .put(object, &mut cursor)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to put object '{object}': {e}"))?;
+        Ok(())
+    }
+
+    async fn delete(&self, container: &str, object: &str) -> anyhow::Result<()> {
+        let store = self
+            .context
+            .get_object_store(container.to_string())
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to get object store '{container}': {e}"))?;
+        store
+            .delete(object)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to delete object '{object}': {e}"))?;
+        Ok(())
+    }
+
+    async fn list(&self, container: &str) -> anyhow::Result<Vec<String>> {
+        let store = self
+            .context
+            .get_object_store(container.to_string())
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to get object store '{container}': {e}"))?;
+        let mut list_stream = store
+            .list()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to list objects in '{container}': {e}"))?;
+        let mut names = Vec::new();
+        while let Some(item) = list_stream.next().await {
+            match item {
+                Ok(info) => names.push(info.name),
+                Err(e) => {
+                    return Err(anyhow::anyhow!("failed to list objects in '{container}': {e}"))
+                }
+            }
+        }
+        Ok(names)
+    }
+
+    async fn exists(&self, container: &str, object: &str) -> anyhow::Result<bool> {
+        let store = self
+            .context
+            .get_object_store(container.to_string())
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to get object store '{container}': {e}"))?;
+        match store.info(object).await {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
+        }
+    }
+
+    async fn stat(&self, container: &str, object: &str) -> anyhow::Result<(u64, u64)> {
+        let store = self
+            .context
+            .get_object_store(container.to_string())
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to get object store '{container}': {e}"))?;
+        let info = store
+            .info(object)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to get object info '{object}': {e}"))?;
+        Ok((info.size as u64, 0))
+    }
+
+    async fn copy(
+        &self,
+        src_container: &str,
+        src_object: &str,
+        dest_container: &str,
+        dest_object: &str,
+    ) -> anyhow::Result<()> {
+        let src_store = self
+            .context
+            .get_object_store(src_container.to_string())
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to get source object store '{src_container}': {e}"))?;
+        let dest_store = self
+            .context
+            .get_object_store(dest_container.to_string())
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("failed to get destination object store '{dest_container}': {e}")
+            })?;
+        let mut obj = src_store
+            .get(src_object)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to get source object '{src_object}': {e}"))?;
+        dest_store
+            .put(dest_object, &mut obj)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to put object to destination '{dest_object}': {e}"))?;
+        Ok(())
+    }
+
+    async fn rename(
+        &self,
+        src_container: &str,
+        src_object: &str,
+        dest_container: &str,
+        dest_object: &str,
+    ) -> anyhow::Result<()> {
+        self.copy(src_container, src_object, dest_container, dest_object)
+            .await?;
+        let src_store = self
+            .context
+            .get_object_store(src_container.to_string())
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to get source object store '{src_container}': {e}"))?;
+        src_store
+            .delete(src_object)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to delete source object '{src_object}': {e}"))?;
+        Ok(())
+    }
+
+    async fn clear(&self, container: &str) -> anyhow::Result<()> {
+        let store = self
+            .context
+            .get_object_store(container.to_string())
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to get object store '{container}': {e}"))?;
+        let mut list_stream = store
+            .list()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to list objects in '{container}': {e}"))?;
+        while let Some(item) = list_stream.next().await {
+            match item {
+                Ok(info) => {
+                    if let Err(e) = store.delete(&info.name).await {
+                        return Err(anyhow::anyhow!(
+                            "failed to delete object '{}' in '{container}': {e}",
+                            info.name
+                        ));
+                    }
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "failed to list objects in '{container}': {e}"
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Per-component data.
 struct ComponentData {
     /// Static interface config from wasmcloud config
     interface_config: HashMap<String, String>,
-    /// Cached OpenDAL operator
-    operator: Option<Operator>,
+    /// Cached backend engine
+    engine: Option<BlobEngine>,
 }
 
 /// Multi-backend blobstore plugin
@@ -132,19 +369,19 @@ impl CustomBlobstore {
         self.metrics.operations_total.add(1, &attributes);
     }
 
-    /// Get an existing operator for a component, creating one if needed.
-    async fn get_operator(&self, component_id: &str) -> anyhow::Result<Operator> {
-        // Check if operator already cached
+    /// Get an existing engine for a component, creating one if needed.
+    async fn get_engine(&self, component_id: &str) -> anyhow::Result<BlobEngine> {
+        // Check if engine already cached
         {
             let lock = self.tracker.read().await;
             if let Some(data) = lock.get_component_data(component_id)
-                && let Some(ref op) = data.operator
+                && let Some(ref engine) = data.engine
             {
-                return Ok(op.clone());
+                return Ok(engine.clone_engine());
             }
         }
 
-        // Need to create operator from interface config
+        // Need to create engine from interface config
         let interface_config = {
             let lock = self.tracker.read().await;
             match lock.get_component_data(component_id) {
@@ -163,27 +400,39 @@ impl CustomBlobstore {
             .cloned()
             .unwrap_or_else(|| "memory".to_string());
 
-        let scheme =
-            Scheme::from_str(&backend).map_err(|e| anyhow::anyhow!("unknown backend: {e}"))?;
+        let engine = match backend.as_str() {
+            "nats" => {
+                let nats_url = interface_config
+                    .get("nats_url")
+                    .cloned()
+                    .unwrap_or_else(|| "nats://127.0.0.1:4222".to_string());
+                let nats = NatsBlobBackend::new(&nats_url).await?;
+                BlobEngine::Nats(nats)
+            }
+            _ => {
+                // OpenDAL backends: memory, s3, webdav, ftp, fs, etc.
+                let scheme = Scheme::from_str(&backend)
+                    .map_err(|e| anyhow::anyhow!("unknown backend '{backend}': {e}"))?;
+                let iter = interface_config
+                    .iter()
+                    .filter(|(k, _)| k.as_str() != "backend")
+                    .map(|(k, v)| (k.clone(), v.clone()));
+                let op = Operator::via_iter(scheme, iter).map_err(|e| {
+                    anyhow::anyhow!("failed to create OpenDAL operator for backend '{backend}': {e}")
+                })?;
+                BlobEngine::OpenDal(op)
+            }
+        };
 
-        let iter = interface_config
-            .iter()
-            .filter(|(k, _)| k.as_str() != "backend")
-            .map(|(k, v)| (k.clone(), v.clone()));
-
-        let op = Operator::via_iter(scheme, iter).map_err(|e| {
-            anyhow::anyhow!("failed to create OpenDAL operator for backend '{backend}': {e}")
-        })?;
-
-        // Cache the operator
+        // Cache the engine
         {
             let mut lock = self.tracker.write().await;
             if let Some(data) = lock.get_component_data_mut(component_id) {
-                data.operator = Some(op.clone());
+                data.engine = Some(engine.clone_engine());
             }
         }
 
-        Ok(op)
+        Ok(engine)
     }
 }
 
@@ -248,7 +497,7 @@ impl HostPlugin for CustomBlobstore {
             component_handle,
             ComponentData {
                 interface_config,
-                operator: None,
+                engine: None,
             },
         );
 
@@ -290,16 +539,23 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
             "Creating container"
         );
 
-        let op = match plugin.get_operator(&self.component_id).await {
-            Ok(o) => o,
-            Err(e) => return Ok(Err(format!("failed to get operator: {e}"))),
+        let engine = match plugin.get_engine(&self.component_id).await {
+            Ok(e) => e,
+            Err(e) => return Ok(Err(format!("failed to get engine: {e}"))),
         };
 
-        // Create the container as a directory
-        let path = format!("{name}/");
-        if let Err(e) = op.create_dir(&path).await {
-            debug!(error = %e, "Failed to create container directory");
-            // Some backends don't support explicit directory creation; treat as success
+        match engine {
+            BlobEngine::OpenDal(op) => {
+                let path = format!("{name}/");
+                if let Err(e) = op.create_dir(&path).await {
+                    debug!(error = %e, "Failed to create container directory");
+                }
+            }
+            BlobEngine::Nats(nats) => {
+                if let Err(e) = nats.create_container(&name).await {
+                    return Ok(Err(format!("failed to create container: {e}")));
+                }
+            }
         }
 
         let resource = self.table.push(name)?;
@@ -328,15 +584,23 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         };
         plugin.record_operation("container_exists");
 
-        let op = match plugin.get_operator(&self.component_id).await {
-            Ok(o) => o,
-            Err(e) => return Ok(Err(format!("failed to get operator: {e}"))),
+        let engine = match plugin.get_engine(&self.component_id).await {
+            Ok(e) => e,
+            Err(e) => return Ok(Err(format!("failed to get engine: {e}"))),
         };
 
-        let path = format!("{name}/");
-        match op.exists(&path).await {
-            Ok(exists) => Ok(Ok(exists)),
-            Err(_) => Ok(Ok(false)),
+        match engine {
+            BlobEngine::OpenDal(op) => {
+                let path = format!("{name}/");
+                match op.exists(&path).await {
+                    Ok(exists) => Ok(Ok(exists)),
+                    Err(_) => Ok(Ok(false)),
+                }
+            }
+            BlobEngine::Nats(nats) => match nats.container_exists(&name).await {
+                Ok(exists) => Ok(Ok(exists)),
+                Err(e) => Ok(Err(format!("failed to check container: {e}"))),
+            },
         }
     }
 
@@ -355,15 +619,23 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
             "Deleting container"
         );
 
-        let op = match plugin.get_operator(&self.component_id).await {
-            Ok(o) => o,
-            Err(e) => return Ok(Err(format!("failed to get operator: {e}"))),
+        let engine = match plugin.get_engine(&self.component_id).await {
+            Ok(e) => e,
+            Err(e) => return Ok(Err(format!("failed to get engine: {e}"))),
         };
 
-        // Remove all objects under the container prefix
-        let path = format!("{name}/");
-        if let Err(e) = op.remove_all(&path).await {
-            debug!(error = %e, "Failed to delete container");
+        match engine {
+            BlobEngine::OpenDal(op) => {
+                let path = format!("{name}/");
+                if let Err(e) = op.remove_all(&path).await {
+                    debug!(error = %e, "Failed to delete container");
+                }
+            }
+            BlobEngine::Nats(nats) => {
+                if let Err(e) = nats.delete_container(&name).await {
+                    return Ok(Err(format!("failed to delete container: {e}")));
+                }
+            }
         }
 
         Ok(Ok(()))
@@ -379,16 +651,27 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         };
         plugin.record_operation("copy_object");
 
-        let op = match plugin.get_operator(&self.component_id).await {
-            Ok(o) => o,
-            Err(e) => return Ok(Err(format!("failed to get operator: {e}"))),
+        let engine = match plugin.get_engine(&self.component_id).await {
+            Ok(e) => e,
+            Err(e) => return Ok(Err(format!("failed to get engine: {e}"))),
         };
 
-        let src_path = format!("{}/{}", src.container, src.object);
-        let dest_path = format!("{}/{}", dest.container, dest.object);
-
-        if let Err(e) = op.copy(&src_path, &dest_path).await {
-            return Ok(Err(format!("failed to copy object: {e}")));
+        match engine {
+            BlobEngine::OpenDal(op) => {
+                let src_path = format!("{}/{}", src.container, src.object);
+                let dest_path = format!("{}/{}", dest.container, dest.object);
+                if let Err(e) = op.copy(&src_path, &dest_path).await {
+                    return Ok(Err(format!("failed to copy object: {e}")));
+                }
+            }
+            BlobEngine::Nats(nats) => {
+                if let Err(e) = nats
+                    .copy(&src.container, &src.object, &dest.container, &dest.object)
+                    .await
+                {
+                    return Ok(Err(format!("failed to copy object: {e}")));
+                }
+            }
         }
 
         Ok(Ok(()))
@@ -404,16 +687,27 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         };
         plugin.record_operation("move_object");
 
-        let op = match plugin.get_operator(&self.component_id).await {
-            Ok(o) => o,
-            Err(e) => return Ok(Err(format!("failed to get operator: {e}"))),
+        let engine = match plugin.get_engine(&self.component_id).await {
+            Ok(e) => e,
+            Err(e) => return Ok(Err(format!("failed to get engine: {e}"))),
         };
 
-        let src_path = format!("{}/{}", src.container, src.object);
-        let dest_path = format!("{}/{}", dest.container, dest.object);
-
-        if let Err(e) = op.rename(&src_path, &dest_path).await {
-            return Ok(Err(format!("failed to move object: {e}")));
+        match engine {
+            BlobEngine::OpenDal(op) => {
+                let src_path = format!("{}/{}", src.container, src.object);
+                let dest_path = format!("{}/{}", dest.container, dest.object);
+                if let Err(e) = op.rename(&src_path, &dest_path).await {
+                    return Ok(Err(format!("failed to move object: {e}")));
+                }
+            }
+            BlobEngine::Nats(nats) => {
+                if let Err(e) = nats
+                    .rename(&src.container, &src.object, &dest.container, &dest.object)
+                    .await
+                {
+                    return Ok(Err(format!("failed to move object: {e}")));
+                }
+            }
         }
 
         Ok(Ok(()))
@@ -466,41 +760,48 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
             return Ok(Err("Blobstore plugin not available".to_string()));
         };
 
-        let op = match plugin.get_operator(&self.component_id).await {
-            Ok(o) => o,
-            Err(e) => return Ok(Err(format!("failed to get operator: {e}"))),
+        let engine = match plugin.get_engine(&self.component_id).await {
+            Ok(e) => e,
+            Err(e) => return Ok(Err(format!("failed to get engine: {e}"))),
         };
 
-        let path = format!("{container_name}/{name}");
-
-        match op.read(&path).await {
-            Ok(full_data) => {
-                let data = full_data.to_vec();
-                let start_idx = start.min(data.len() as u64) as usize;
-                let end_idx = end.min(data.len() as u64) as usize;
-                let data_slice = data.get(start_idx..end_idx).unwrap_or_default().to_vec();
-
-                debug!(
-                    container = container_name,
-                    object = name,
-                    original_size = data.len(),
-                    slice_size = data_slice.len(),
-                    "Retrieved object data slice"
-                );
-
-                let resource = self.table.push(data_slice)?;
-                Ok(Ok(resource))
+        let full_data = match engine {
+            BlobEngine::OpenDal(op) => {
+                let path = format!("{container_name}/{name}");
+                match op.read(&path).await {
+                    Ok(data) => data.to_vec(),
+                    Err(e) => {
+                        debug!(error = %e, "Object not found");
+                        return Ok(Err(format!("object '{name}' not found: {e}")));
+                    }
+                }
             }
-            Err(e) => {
-                debug!(
-                    container = container_name,
-                    object = name,
-                    error = %e,
-                    "Object not found"
-                );
-                Ok(Err(format!("object '{name}' not found: {e}")))
-            }
-        }
+            BlobEngine::Nats(nats) => match nats.read(container_name, &name).await {
+                Ok(data) => data,
+                Err(e) => {
+                    debug!(error = %e, "Object not found");
+                    return Ok(Err(format!("object '{name}' not found: {e}")));
+                }
+            },
+        };
+
+        let start_idx = start.min(full_data.len() as u64) as usize;
+        let end_idx = end.min(full_data.len() as u64) as usize;
+        let data_slice = full_data
+            .get(start_idx..end_idx)
+            .unwrap_or_default()
+            .to_vec();
+
+        debug!(
+            container = container_name,
+            object = name,
+            original_size = full_data.len(),
+            slice_size = data_slice.len(),
+            "Retrieved object data slice"
+        );
+
+        let resource = self.table.push(data_slice)?;
+        Ok(Ok(resource))
     }
 
     async fn write_data(
@@ -518,7 +819,6 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
             "Initiating write_data for object"
         );
 
-        // Store the container and object names for actual writing in finish()
         let outgoing_handle = self.table.get_mut(&data)?;
         outgoing_handle.container_name = Some(container_name.clone());
         outgoing_handle.object_name = Some(name.clone());
@@ -542,40 +842,46 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
             return Ok(Err("Blobstore plugin not available".to_string()));
         };
 
-        let op = match plugin.get_operator(&self.component_id).await {
-            Ok(o) => o,
-            Err(e) => return Ok(Err(format!("failed to get operator: {e}"))),
+        let engine = match plugin.get_engine(&self.component_id).await {
+            Ok(e) => e,
+            Err(e) => return Ok(Err(format!("failed to get engine: {e}"))),
         };
 
         debug!(container = container_name, "Listing objects in container");
 
-        let path = format!("{container_name}/");
-        match op.list(&path).await {
-            Ok(raw_entries) => {
-                let names: Vec<String> = raw_entries
-                    .into_iter()
-                    .map(|e| {
-                        let name = e.name().to_string();
-                        name.trim_end_matches('/').to_string()
-                    })
-                    .filter(|n| !n.is_empty())
-                    .collect();
-
-                debug!(
-                    container = container_name,
-                    count = names.len(),
-                    "Listed objects in container"
-                );
-
-                let handle = StreamObjectNamesHandle {
-                    objects: names,
-                    position: 0,
-                };
-                let resource = self.table.push(handle)?;
-                Ok(Ok(resource))
+        let names = match engine {
+            BlobEngine::OpenDal(op) => {
+                let path = format!("{container_name}/");
+                match op.list(&path).await {
+                    Ok(raw_entries) => raw_entries
+                        .into_iter()
+                        .map(|e| {
+                            let name = e.name().to_string();
+                            name.trim_end_matches('/').to_string()
+                        })
+                        .filter(|n| !n.is_empty())
+                        .collect(),
+                    Err(e) => return Ok(Err(format!("failed to list objects: {e}"))),
+                }
             }
-            Err(e) => Ok(Err(format!("failed to list objects: {e}"))),
-        }
+            BlobEngine::Nats(nats) => match nats.list(container_name).await {
+                Ok(names) => names,
+                Err(e) => return Ok(Err(format!("failed to list objects: {e}"))),
+            },
+        };
+
+        debug!(
+            container = container_name,
+            count = names.len(),
+            "Listed objects in container"
+        );
+
+        let handle = StreamObjectNamesHandle {
+            objects: names,
+            position: 0,
+        };
+        let resource = self.table.push(handle)?;
+        Ok(Ok(resource))
     }
 
     async fn delete_object(
@@ -589,14 +895,23 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
             return Ok(Err("Blobstore plugin not available".to_string()));
         };
 
-        let op = match plugin.get_operator(&self.component_id).await {
-            Ok(o) => o,
-            Err(e) => return Ok(Err(format!("failed to get operator: {e}"))),
+        let engine = match plugin.get_engine(&self.component_id).await {
+            Ok(e) => e,
+            Err(e) => return Ok(Err(format!("failed to get engine: {e}"))),
         };
 
-        let path = format!("{container_name}/{name}");
-        if let Err(e) = op.delete(&path).await {
-            return Ok(Err(format!("failed to delete object: {e}")));
+        match engine {
+            BlobEngine::OpenDal(op) => {
+                let path = format!("{container_name}/{name}");
+                if let Err(e) = op.delete(&path).await {
+                    return Ok(Err(format!("failed to delete object: {e}")));
+                }
+            }
+            BlobEngine::Nats(nats) => {
+                if let Err(e) = nats.delete(container_name, &name).await {
+                    return Ok(Err(format!("failed to delete object: {e}")));
+                }
+            }
         }
 
         Ok(Ok(()))
@@ -613,15 +928,24 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
             return Ok(Err("Blobstore plugin not available".to_string()));
         };
 
-        let op = match plugin.get_operator(&self.component_id).await {
-            Ok(o) => o,
-            Err(e) => return Ok(Err(format!("failed to get operator: {e}"))),
+        let engine = match plugin.get_engine(&self.component_id).await {
+            Ok(e) => e,
+            Err(e) => return Ok(Err(format!("failed to get engine: {e}"))),
         };
 
         for name in &names {
-            let path = format!("{container_name}/{name}");
-            if let Err(e) = op.delete(&path).await {
-                return Ok(Err(format!("failed to delete object '{name}': {e}")));
+            match &engine {
+                BlobEngine::OpenDal(op) => {
+                    let path = format!("{container_name}/{name}");
+                    if let Err(e) = op.delete(&path).await {
+                        return Ok(Err(format!("failed to delete object '{name}': {e}")));
+                    }
+                }
+                BlobEngine::Nats(nats) => {
+                    if let Err(e) = nats.delete(container_name, name).await {
+                        return Ok(Err(format!("failed to delete object '{name}': {e}")));
+                    }
+                }
             }
         }
 
@@ -639,15 +963,23 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
             return Ok(Err("Blobstore plugin not available".to_string()));
         };
 
-        let op = match plugin.get_operator(&self.component_id).await {
-            Ok(o) => o,
-            Err(e) => return Ok(Err(format!("failed to get operator: {e}"))),
+        let engine = match plugin.get_engine(&self.component_id).await {
+            Ok(e) => e,
+            Err(e) => return Ok(Err(format!("failed to get engine: {e}"))),
         };
 
-        let path = format!("{container_name}/{name}");
-        match op.exists(&path).await {
-            Ok(exists) => Ok(Ok(exists)),
-            Err(_) => Ok(Ok(false)),
+        match engine {
+            BlobEngine::OpenDal(op) => {
+                let path = format!("{container_name}/{name}");
+                match op.exists(&path).await {
+                    Ok(exists) => Ok(Ok(exists)),
+                    Err(_) => Ok(Ok(false)),
+                }
+            }
+            BlobEngine::Nats(nats) => match nats.exists(container_name, &name).await {
+                Ok(exists) => Ok(Ok(exists)),
+                Err(e) => Ok(Err(format!("failed to check object: {e}"))),
+            },
         }
     }
 
@@ -662,22 +994,35 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
             return Ok(Err("Blobstore plugin not available".to_string()));
         };
 
-        let op = match plugin.get_operator(&self.component_id).await {
-            Ok(o) => o,
-            Err(e) => return Ok(Err(format!("failed to get operator: {e}"))),
+        let engine = match plugin.get_engine(&self.component_id).await {
+            Ok(e) => e,
+            Err(e) => return Ok(Err(format!("failed to get engine: {e}"))),
         };
 
-        let path = format!("{container_name}/{name}");
-        match op.stat(&path).await {
-            Ok(meta) => Ok(Ok(ObjectMetadata {
-                name: name.clone(),
-                container: container_name.clone(),
-                created_at: meta
-                    .last_modified()
-                    .map_or(0, |ts| ts.timestamp_millis() as u64),
-                size: meta.content_length(),
-            })),
-            Err(e) => Ok(Err(format!("object '{name}' not found: {e}"))),
+        match engine {
+            BlobEngine::OpenDal(op) => {
+                let path = format!("{container_name}/{name}");
+                match op.stat(&path).await {
+                    Ok(meta) => Ok(Ok(ObjectMetadata {
+                        name: name.clone(),
+                        container: container_name.clone(),
+                        created_at: meta
+                            .last_modified()
+                            .map_or(0, |ts| ts.timestamp_millis() as u64),
+                        size: meta.content_length(),
+                    })),
+                    Err(e) => Ok(Err(format!("object '{name}' not found: {e}"))),
+                }
+            }
+            BlobEngine::Nats(nats) => match nats.stat(container_name, &name).await {
+                Ok((size, created_at)) => Ok(Ok(ObjectMetadata {
+                    name: name.clone(),
+                    container: container_name.clone(),
+                    created_at,
+                    size,
+                })),
+                Err(e) => Ok(Err(format!("object '{name}' not found: {e}"))),
+            },
         }
     }
 
@@ -691,14 +1036,23 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
             return Ok(Err("Blobstore plugin not available".to_string()));
         };
 
-        let op = match plugin.get_operator(&self.component_id).await {
-            Ok(o) => o,
-            Err(e) => return Ok(Err(format!("failed to get operator: {e}"))),
+        let engine = match plugin.get_engine(&self.component_id).await {
+            Ok(e) => e,
+            Err(e) => return Ok(Err(format!("failed to get engine: {e}"))),
         };
 
-        let path = format!("{container_name}/");
-        if let Err(e) = op.remove_all(&path).await {
-            return Ok(Err(format!("failed to clear container: {e}")));
+        match engine {
+            BlobEngine::OpenDal(op) => {
+                let path = format!("{container_name}/");
+                if let Err(e) = op.remove_all(&path).await {
+                    return Ok(Err(format!("failed to clear container: {e}")));
+                }
+            }
+            BlobEngine::Nats(nats) => {
+                if let Err(e) = nats.clear(container_name).await {
+                    return Ok(Err(format!("failed to clear container: {e}")));
+                }
+            }
         }
 
         Ok(Ok(()))
@@ -883,14 +1237,23 @@ impl<'a> bindings::wasi::blobstore::types::HostOutgoingValue for ActiveCtx<'a> {
                 "Retrieved data from pipe in finish()"
             );
 
-            let op = match plugin.get_operator(&self.component_id).await {
-                Ok(o) => o,
-                Err(e) => return Ok(Err(format!("failed to get operator: {e}"))),
+            let engine = match plugin.get_engine(&self.component_id).await {
+                Ok(e) => e,
+                Err(e) => return Ok(Err(format!("failed to get engine: {e}"))),
             };
 
-            let path = format!("{container_name}/{object_name}");
-            if let Err(e) = op.write(&path, data_bytes).await {
-                return Ok(Err(format!("failed to upload object: {e}")));
+            match engine {
+                BlobEngine::OpenDal(op) => {
+                    let path = format!("{container_name}/{object_name}");
+                    if let Err(e) = op.write(&path, data_bytes).await {
+                        return Ok(Err(format!("failed to upload object: {e}")));
+                    }
+                }
+                BlobEngine::Nats(nats) => {
+                    if let Err(e) = nats.write(container_name, object_name, data_bytes).await {
+                        return Ok(Err(format!("failed to upload object: {e}")));
+                    }
+                }
             }
 
             debug!(

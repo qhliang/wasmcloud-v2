@@ -15,13 +15,6 @@ use wash_runtime::{
 
 use crate::cli::{CliCommand, CliContext, CommandOutput};
 
-#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
-pub enum BlobstoreBackendType {
-    #[default]
-    Nats,
-    Cloudflare,
-}
-
 #[derive(Debug, Clone, Args)]
 pub struct HostCommand {
     /// The host group label to assign to the host
@@ -101,10 +94,6 @@ pub struct HostCommand {
     /// Enable WASI OpenTelemetry plugin
     #[arg(long = "wasi-otel", default_value_t = false)]
     pub wasi_otel: bool,
-
-    /// The blobstore backend to use
-    #[clap(long = "blobstore-backend", env = "BLOBSTORE_BACKEND")]
-    pub blobstore_backend: BlobstoreBackendType,
 }
 
 impl CliCommand for HostCommand {
@@ -164,20 +153,10 @@ impl CliCommand for HostCommand {
             cluster_host_builder.with_plugin(Arc::new(MultiBackendKeyValue::new()))?;
         tracing::info!("Multi-backend KV plugin enabled");
 
-        // Enable blobstore plugin
-        match self.blobstore_backend {
-            BlobstoreBackendType::Nats => {
-                cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(
-                    plugin::wasi_blobstore::NatsBlobstore::new(&data_nats_client),
-                ))?;
-                tracing::info!("Nats blobstore plugin enabled");
-            }
-            BlobstoreBackendType::Cloudflare => {
-                cluster_host_builder =
-                    cluster_host_builder.with_plugin(Arc::new(CustomBlobstore::new()))?;
-                tracing::info!("Cloudflare R2 blobstore plugin enabled");
-            }
-        }
+        // Enable multi-backend blobstore plugin
+        cluster_host_builder =
+            cluster_host_builder.with_plugin(Arc::new(CustomBlobstore::new()))?;
+        tracing::info!("Multi-backend blobstore plugin enabled");
 
         // Enable Cloudflare D1 plugin (always loaded by default)
         cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(CloudflareD1::new()))?;
