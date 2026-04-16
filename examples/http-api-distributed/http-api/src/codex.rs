@@ -296,7 +296,8 @@ pub async fn change_session(mut req: Request<Body>) -> anyhow::Result<Response<B
             "success": true,
             "context_key": context_key,
             "session_id": body.session_id,
-        }))?), Err(e) => {
+        }))?),
+        Err(e) => {
             log(
                 Level::Error,
                 LOG_CTX,
@@ -321,7 +322,8 @@ pub async fn delete_session(mut req: Request<Body>) -> anyhow::Result<Response<B
         Ok(()) => helpers::json_response(serde_json::to_string(&serde_json::json!({
             "success": true,
             "session_id": body.session_id,
-        }))?), Err(e) => {
+        }))?),
+        Err(e) => {
             log(
                 Level::Error,
                 LOG_CTX,
@@ -444,7 +446,7 @@ pub fn execute_for_chat(sender_id: &str, prompt: &str) -> Result<String, String>
     }
 
     let result = if texts.is_empty() {
-        String::from("(无输出)")
+        String::from("(进程已经结束但无任何输出)")
     } else {
         texts.join("\n")
     };
@@ -452,7 +454,11 @@ pub fn execute_for_chat(sender_id: &str, prompt: &str) -> Result<String, String>
     log(
         Level::Info,
         LOG_CTX,
-        &format!("CODEX CHAT DONE: sender={}, result_len={}", sender_id, result.len()),
+        &format!(
+            "CODEX CHAT DONE: sender={}, result_len={}",
+            sender_id,
+            result.len()
+        ),
     );
 
     Ok(result)

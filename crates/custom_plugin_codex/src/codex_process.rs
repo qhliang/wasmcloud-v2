@@ -134,19 +134,35 @@ pub async fn read_jsonl_output(
 
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
+    let mut had_terminal_event = false;
 
     while let Ok(Some(line)) = lines.next_line().await {
         match serde_json::from_str::<CodexJsonlEvent>(&line) {
             Ok(event) => {
-                // debug!(event_type = ?std::mem::discriminant(&event), "Parsed JSONL event");
+                if matches!(
+                    event,
+                    CodexJsonlEvent::TurnCompleted { .. }
+                        | CodexJsonlEvent::TurnFailed { .. }
+                        | CodexJsonlEvent::Error { .. }
+                ) {
+                    had_terminal_event = true;
+                }
                 if sender.send(event).is_err() {
-                    break;
+                    return;
                 }
             }
             Err(e) => {
                 warn!(error = %e, line = %line, "Failed to parse JSONL event from codex");
             }
         }
+    }
+
+    // If stdout closed without a terminal event, send an EOF error so the
+    // consumer doesn't block forever on stream.next().
+    if !had_terminal_event {
+        let _ = sender.send(CodexJsonlEvent::Error {
+            message: "codex process exited without producing output".to_string(),
+        });
     }
 
     debug!("Codex JSONL reader finished (stdout closed)");

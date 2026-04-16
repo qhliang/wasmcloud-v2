@@ -30,6 +30,7 @@ dev:
       interfaces:
         - store
       config:
+        backend: cloudflare
         account_id: 4e4a9cbc00e5e3a6c07597fb44cf7be4
         api_token: 8pTPivMklAfqBdQ1zMx0loXQL0mEeDOcUCC09dw4
         namespace_id: 084a73f4e44d40679f8f3eb5bc4bbf61
@@ -139,7 +140,7 @@ dev:
       interfaces:
         - sender
       config:
-        bot_token: "invalid.token"
+        bot_token: "8513173258:AAG6DJ3pkl8qyznNLc9ybC01FEniEarheFw"
 
 new:
   command: cargo fetch
