@@ -22,9 +22,8 @@
 //! - [`wasi_logging`] - Structured logging (`wasi:logging`)
 //! - [`wasi_otel`] - OpenTelemetry tracing, metrics, and logs (`wasi:otel/*`)
 
+use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
-use std::{collections::HashMap, path::Path};
 
 use crate::engine::workload::WorkloadItem;
 use crate::{
@@ -326,25 +325,4 @@ impl<T, Y> WorkloadTracker<T, Y> {
         let item = self.workloads.get_mut(workload_id)?;
         item.components.get_mut(component_id)
     }
-}
-
-/// Locks an untrusted path to be within the given root directory.
-pub(crate) fn lock_root(root: impl AsRef<Path>, untrusted: &str) -> Result<PathBuf, &'static str> {
-    let path = Path::new(untrusted);
-
-    // Reject absolute paths
-    if path.is_absolute() {
-        return Err("absolute paths not allowed");
-    }
-
-    // Reject paths with parent references
-    for component in path.components() {
-        match component {
-            std::path::Component::ParentDir => return Err("path traversal not allowed"),
-            std::path::Component::Prefix(_) => return Err("windows prefixes not allowed"),
-            _ => {}
-        }
-    }
-
-    Ok(root.as_ref().join(path))
 }

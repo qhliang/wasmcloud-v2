@@ -19,7 +19,6 @@ use wash_runtime::{
         HostApi, HostBuilder,
         http::{DevRouter, HttpServer},
     },
-    plugin::wasi_blobstore::InMemoryBlobstore,
     types::{Component, LocalResources, Workload, WorkloadStartRequest},
     wit::WitInterface,
 };
@@ -42,7 +41,7 @@ async fn test_http_blobstore_integration() -> Result<()> {
     let addr = http_plugin.addr();
 
     // Create blobstore plugin
-    let blobstore_plugin = InMemoryBlobstore::new(None);
+    let blobstore_plugin = custom_plugin_blobstore::CustomBlobstore::new();
 
     // Build host with plugins following the existing pattern from lib.rs test
     let host = HostBuilder::new()
@@ -176,8 +175,8 @@ async fn test_plugin_isolation() -> Result<()> {
     println!("Testing plugin isolation between workloads");
 
     let engine = Engine::builder().build()?;
-    let blobstore1 = InMemoryBlobstore::new(None);
-    let blobstore2 = InMemoryBlobstore::new(None);
+    let blobstore1 = custom_plugin_blobstore::CustomBlobstore::new();
+    let blobstore2 = custom_plugin_blobstore::CustomBlobstore::new();
 
     // Create two identical hosts with blobstore plugins
     let _host1 = HostBuilder::new()

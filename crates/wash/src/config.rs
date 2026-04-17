@@ -194,14 +194,6 @@ pub struct DevConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wasi_keyvalue_cloudflare: Option<String>,
 
-    /// Optional path for WASI blobstore filesystem storage. If not set, an in-memory store is used.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub wasi_blobstore_path: Option<PathBuf>,
-
-    /// Optional Cloudflare for the WASI blobstore plugin.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub wasi_blobstore_cloudflare: Option<String>,
-
     /// Optional PostgreSQL connection URL for the wasmcloud:postgres plugin.
     /// Example: postgres://user:pass@bouncer:6432?sslmode=require&pool_size=10
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -1,0 +1,18 @@
+[package]
+name = "custom_plugin_nats_utils"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+description = "Shared NATS connection utilities for custom host plugins"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+async-nats = { workspace = true }
+nkeys = "0.4"

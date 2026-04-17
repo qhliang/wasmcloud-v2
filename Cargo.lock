@@ -1680,8 +1680,8 @@ dependencies = [
  "anyhow",
  "async-nats",
  "async-trait",
+ "custom_plugin_nats_utils",
  "futures",
- "nkeys",
  "opendal",
  "opentelemetry 0.31.0",
  "serde",
@@ -1790,8 +1790,8 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "cloudflare-workers-kv-sdk-rs",
+ "custom_plugin_nats_utils",
  "futures",
- "nkeys",
  "opendal",
  "opentelemetry 0.31.0",
  "serde",
@@ -1838,6 +1838,15 @@ dependencies = [
  "wash-runtime",
  "wasmtime",
  "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "custom_plugin_nats_utils"
+version = "2.0.1"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "nkeys",
 ]
 
 [[package]]

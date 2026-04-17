@@ -72,25 +72,10 @@ impl CliCommand for DevCommand {
             plugin::wasmcloud_messaging::InMemoryMessaging::default(),
         ))?;
 
-        // Add blobstore plugin
-        if let Some(blobstore_path) = &dev_config.wasi_blobstore_path {
-            host_builder = host_builder.with_plugin(Arc::new(
-                plugin::wasi_blobstore::FilesystemBlobstore::new(blobstore_path.clone()),
-            ))?;
-            debug!(
-                path = %blobstore_path.display(),
-                "WASI Blobstore plugin registered with filesystem backend"
-            );
-        } else if dev_config.wasi_blobstore_cloudflare.is_some() {
-            host_builder = host_builder
-                .with_plugin(Arc::new(custom_plugin_blobstore::CustomBlobstore::new()))?;
-            debug!("WASI Blobstore plugin registered with Cloudflare backend");
-        } else {
-            host_builder = host_builder.with_plugin(Arc::new(
-                plugin::wasi_blobstore::InMemoryBlobstore::default(),
-            ))?;
-            debug!("WASI Blobstore plugin registered with in-memory backend");
-        }
+        // Add blobstore plugin (multi-backend: memory, filesystem, S3, WebDAV, FTP, NATS)
+        host_builder =
+            host_builder.with_plugin(Arc::new(custom_plugin_blobstore::CustomBlobstore::new()))?;
+        debug!("WASI Blobstore plugin registered with multi-backend support");
 
         let http_handler = wash_runtime::host::http::DevRouter::default();
         // TODO(#19): Only spawn the server if the component exports wasi:http

@@ -31,9 +31,9 @@ opendal = { version = "0.53", default-features = false, features = [
     "services-fs",
 ] }
 async-nats = { workspace = true }
-nkeys = "0.4"
 
 wash-runtime = { path = "../wash-runtime" }
+custom_plugin_nats_utils = { path = "../custom_plugin_nats_utils" }
 
 # Cloudflare KV SDK
 cloudflare-workers-kv-sdk-rs = "0.1.2"
