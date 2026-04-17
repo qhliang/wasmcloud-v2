@@ -92,6 +92,26 @@ pub struct BucketHandle {
     identifier: String,
 }
 
+impl BucketHandle {
+    /// Build the full storage key with identifier prefix for OpenDAL backends (slash-separated).
+    fn full_key(&self, key: &str) -> String {
+        if self.identifier.is_empty() {
+            key.to_string()
+        } else {
+            format!("{}/{}", self.identifier, key)
+        }
+    }
+
+    /// Build the NATS-style dotted key with identifier prefix.
+    fn nats_key(&self, key: &str) -> String {
+        if self.identifier.is_empty() {
+            key.to_string()
+        } else {
+            format!("{}.{}", self.identifier, key)
+        }
+    }
+}
+
 /// Multi-backend keyvalue plugin
 #[derive(Clone)]
 pub struct MultiBackendKeyValue {
@@ -235,9 +255,15 @@ impl MultiBackendKeyValue {
             }
         };
 
-        // Cache the engine
+        // Cache the engine (double-check to avoid race)
         {
             let mut lock = self.tracker.write().await;
+            // Another task may have created the engine while we were building ours
+            if let Some(data) = lock.get_component_data(component_id)
+                && let Some(ref existing) = data.engine
+            {
+                return Ok(existing.clone_engine());
+            }
             if let Some(data) = lock.get_component_data_mut(component_id) {
                 data.engine = Some(engine.clone_engine());
             }
@@ -254,9 +280,10 @@ impl<'a> bindings::wasi::keyvalue::store::Host for ActiveCtx<'a> {
         identifier: String,
     ) -> wasmtime::Result<Result<Resource<BucketHandle>, StoreError>> {
         let Some(plugin) = self.get_plugin::<MultiBackendKeyValue>(PLUGIN_KEYVALUE_ID) else {
-            return Ok(Err(StoreError::Other(
-                "KV plugin not available".to_string(),
-            )));
+            return Ok(Err(StoreError::Other(format!(
+                "KV plugin not available for component '{}'",
+                self.component_id
+            ))));
         };
         plugin.record_operation("open");
 
@@ -327,14 +354,15 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
         key: String,
     ) -> wasmtime::Result<Result<Option<Vec<u8>>, StoreError>> {
         let Some(plugin) = self.get_plugin::<MultiBackendKeyValue>(PLUGIN_KEYVALUE_ID) else {
-            return Ok(Err(StoreError::Other(
-                "KV plugin not available".to_string(),
-            )));
+            return Ok(Err(StoreError::Other(format!(
+                "KV plugin not available for component '{}'",
+                self.component_id
+            ))));
         };
         plugin.record_operation("get");
 
         let bucket_handle = self.table.get(&bucket)?;
-        let full_key = format!("{}/{}", bucket_handle.identifier, key);
+        let full_key = bucket_handle.full_key(&key);
 
         match bucket_handle.engine.as_ref() {
             KvEngine::OpenDal(op) => match op.read(&full_key).await {
@@ -361,11 +389,7 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
                 }
             }
             KvEngine::Nats { store } => {
-                let nats_key = if bucket_handle.identifier.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{}.{}", bucket_handle.identifier, key)
-                };
+                let nats_key = bucket_handle.nats_key(&key);
                 match store.get(&nats_key).await {
                     Ok(Some(bytes)) => Ok(Ok(Some(bytes.to_vec()))),
                     Ok(None) => Ok(Ok(None)),
@@ -382,14 +406,15 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
         value: Vec<u8>,
     ) -> wasmtime::Result<Result<(), StoreError>> {
         let Some(plugin) = self.get_plugin::<MultiBackendKeyValue>(PLUGIN_KEYVALUE_ID) else {
-            return Ok(Err(StoreError::Other(
-                "KV plugin not available".to_string(),
-            )));
+            return Ok(Err(StoreError::Other(format!(
+                "KV plugin not available for component '{}'",
+                self.component_id
+            ))));
         };
         plugin.record_operation("set");
 
         let bucket_handle = self.table.get(&bucket)?;
-        let full_key = format!("{}/{}", bucket_handle.identifier, key);
+        let full_key = bucket_handle.full_key(&key);
 
         match bucket_handle.engine.as_ref() {
             KvEngine::OpenDal(op) => match op.write(&full_key, value).await {
@@ -410,11 +435,7 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
                 }
             }
             KvEngine::Nats { store } => {
-                let nats_key = if bucket_handle.identifier.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{}.{}", bucket_handle.identifier, key)
-                };
+                let nats_key = bucket_handle.nats_key(&key);
                 match store.put(nats_key, value.into()).await {
                     Ok(_) => Ok(Ok(())),
                     Err(e) => Ok(Err(StoreError::Other(format!("{e}")))),
@@ -429,14 +450,15 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
         key: String,
     ) -> wasmtime::Result<Result<(), StoreError>> {
         let Some(plugin) = self.get_plugin::<MultiBackendKeyValue>(PLUGIN_KEYVALUE_ID) else {
-            return Ok(Err(StoreError::Other(
-                "KV plugin not available".to_string(),
-            )));
+            return Ok(Err(StoreError::Other(format!(
+                "KV plugin not available for component '{}'",
+                self.component_id
+            ))));
         };
         plugin.record_operation("delete");
 
         let bucket_handle = self.table.get(&bucket)?;
-        let full_key = format!("{}/{}", bucket_handle.identifier, key);
+        let full_key = bucket_handle.full_key(&key);
 
         match bucket_handle.engine.as_ref() {
             KvEngine::OpenDal(op) => match op.delete(&full_key).await {
@@ -450,11 +472,7 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
                 }
             }
             KvEngine::Nats { store } => {
-                let nats_key = if bucket_handle.identifier.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{}.{}", bucket_handle.identifier, key)
-                };
+                let nats_key = bucket_handle.nats_key(&key);
                 match store.delete(&nats_key).await {
                     Ok(_) => Ok(Ok(())),
                     Err(e) => Ok(Err(StoreError::Other(format!("{e}")))),
@@ -469,14 +487,15 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
         key: String,
     ) -> wasmtime::Result<Result<bool, StoreError>> {
         let Some(plugin) = self.get_plugin::<MultiBackendKeyValue>(PLUGIN_KEYVALUE_ID) else {
-            return Ok(Err(StoreError::Other(
-                "KV plugin not available".to_string(),
-            )));
+            return Ok(Err(StoreError::Other(format!(
+                "KV plugin not available for component '{}'",
+                self.component_id
+            ))));
         };
         plugin.record_operation("exists");
 
         let bucket_handle = self.table.get(&bucket)?;
-        let full_key = format!("{}/{}", bucket_handle.identifier, key);
+        let full_key = bucket_handle.full_key(&key);
 
         match bucket_handle.engine.as_ref() {
             KvEngine::OpenDal(op) => match op.exists(&full_key).await {
@@ -490,11 +509,7 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
                 }
             }
             KvEngine::Nats { store } => {
-                let nats_key = if bucket_handle.identifier.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{}.{}", bucket_handle.identifier, key)
-                };
+                let nats_key = bucket_handle.nats_key(&key);
                 match store.get(&nats_key).await {
                     Ok(Some(_)) => Ok(Ok(true)),
                     Ok(None) => Ok(Ok(false)),
@@ -510,9 +525,10 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
         cursor: Option<u64>,
     ) -> wasmtime::Result<Result<KeyResponse, StoreError>> {
         let Some(plugin) = self.get_plugin::<MultiBackendKeyValue>(PLUGIN_KEYVALUE_ID) else {
-            return Ok(Err(StoreError::Other(
-                "KV plugin not available".to_string(),
-            )));
+            return Ok(Err(StoreError::Other(format!(
+                "KV plugin not available for component '{}'",
+                self.component_id
+            ))));
         };
         plugin.record_operation("list_keys");
 
@@ -637,14 +653,15 @@ impl<'a> bindings::wasi::keyvalue::atomics::Host for ActiveCtx<'a> {
         delta: u64,
     ) -> wasmtime::Result<Result<u64, StoreError>> {
         let Some(plugin) = self.get_plugin::<MultiBackendKeyValue>(PLUGIN_KEYVALUE_ID) else {
-            return Ok(Err(StoreError::Other(
-                "KV plugin not available".to_string(),
-            )));
+            return Ok(Err(StoreError::Other(format!(
+                "KV plugin not available for component '{}'",
+                self.component_id
+            ))));
         };
         plugin.record_operation("increment");
 
         let bucket_handle = self.table.get(&bucket)?;
-        let full_key = format!("{}/{}", bucket_handle.identifier, key);
+        let full_key = bucket_handle.full_key(&key);
 
         match bucket_handle.engine.as_ref() {
             KvEngine::OpenDal(op) => {
@@ -702,11 +719,7 @@ impl<'a> bindings::wasi::keyvalue::atomics::Host for ActiveCtx<'a> {
             }
             KvEngine::Nats { store } => {
                 // CAS via revision check
-                let nats_key = if bucket_handle.identifier.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{}.{}", bucket_handle.identifier, key)
-                };
+                let nats_key = bucket_handle.nats_key(&key);
                 let (entry_revision, entry_value) = match store.entry(&nats_key).await {
                     Ok(Some(mut e)) => (Some(e.revision), e.value.get_u64()),
                     Ok(None) => (None, 0),
@@ -737,20 +750,20 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
         keys: Vec<String>,
     ) -> wasmtime::Result<Result<Vec<Option<(String, Vec<u8>)>>, StoreError>> {
         let Some(plugin) = self.get_plugin::<MultiBackendKeyValue>(PLUGIN_KEYVALUE_ID) else {
-            return Ok(Err(StoreError::Other(
-                "KV plugin not available".to_string(),
-            )));
+            return Ok(Err(StoreError::Other(format!(
+                "KV plugin not available for component '{}'",
+                self.component_id
+            ))));
         };
         plugin.record_operation("get_many");
 
         let bucket_handle = self.table.get(&bucket)?;
-        let prefix = &bucket_handle.identifier;
 
         match bucket_handle.engine.as_ref() {
             KvEngine::OpenDal(op) => {
                 let mut results = Vec::with_capacity(keys.len());
                 for key in keys {
-                    let full_key = format!("{prefix}/{key}");
+                    let full_key = bucket_handle.full_key(&key);
                     match op.read(&full_key).await {
                         Ok(data) => results.push(Some((key, data.to_vec()))),
                         Err(_) => results.push(None),
@@ -784,11 +797,7 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
             KvEngine::Nats { store } => {
                 let mut results = Vec::with_capacity(keys.len());
                 for key in keys {
-                    let nats_key = if prefix.is_empty() {
-                        key.clone()
-                    } else {
-                        format!("{prefix}.{key}")
-                    };
+                    let nats_key = bucket_handle.nats_key(&key);
                     match store.get(&nats_key).await {
                         Ok(Some(bytes)) => results.push(Some((key, bytes.to_vec()))),
                         Ok(None) => results.push(None),
@@ -806,19 +815,19 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
         key_values: Vec<(String, Vec<u8>)>,
     ) -> wasmtime::Result<Result<(), StoreError>> {
         let Some(plugin) = self.get_plugin::<MultiBackendKeyValue>(PLUGIN_KEYVALUE_ID) else {
-            return Ok(Err(StoreError::Other(
-                "KV plugin not available".to_string(),
-            )));
+            return Ok(Err(StoreError::Other(format!(
+                "KV plugin not available for component '{}'",
+                self.component_id
+            ))));
         };
         plugin.record_operation("set_many");
 
         let bucket_handle = self.table.get(&bucket)?;
-        let prefix = &bucket_handle.identifier;
 
         match bucket_handle.engine.as_ref() {
             KvEngine::OpenDal(op) => {
                 for (key, value) in key_values {
-                    let full_key = format!("{prefix}/{key}");
+                    let full_key = bucket_handle.full_key(&key);
                     if let Err(e) = op.write(&full_key, value).await {
                         return Ok(Err(StoreError::Other(format!("{e}"))));
                     }
@@ -848,11 +857,7 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
             }
             KvEngine::Nats { store } => {
                 for (key, value) in key_values {
-                    let nats_key = if prefix.is_empty() {
-                        key.clone()
-                    } else {
-                        format!("{prefix}.{key}")
-                    };
+                    let nats_key = bucket_handle.nats_key(&key);
                     if let Err(e) = store.put(nats_key, value.into()).await {
                         return Ok(Err(StoreError::Other(format!("{e}"))));
                     }
@@ -868,19 +873,19 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
         keys: Vec<String>,
     ) -> wasmtime::Result<Result<(), StoreError>> {
         let Some(plugin) = self.get_plugin::<MultiBackendKeyValue>(PLUGIN_KEYVALUE_ID) else {
-            return Ok(Err(StoreError::Other(
-                "KV plugin not available".to_string(),
-            )));
+            return Ok(Err(StoreError::Other(format!(
+                "KV plugin not available for component '{}'",
+                self.component_id
+            ))));
         };
         plugin.record_operation("delete_many");
 
         let bucket_handle = self.table.get(&bucket)?;
-        let prefix = &bucket_handle.identifier;
 
         match bucket_handle.engine.as_ref() {
             KvEngine::OpenDal(op) => {
                 for key in keys {
-                    let full_key = format!("{prefix}/{key}");
+                    let full_key = bucket_handle.full_key(&key);
                     if let Err(e) = op.delete(&full_key).await {
                         return Ok(Err(StoreError::Other(format!("{e}"))));
                     }
@@ -896,11 +901,7 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
             }
             KvEngine::Nats { store } => {
                 for key in keys {
-                    let nats_key = if prefix.is_empty() {
-                        key.clone()
-                    } else {
-                        format!("{prefix}.{key}")
-                    };
+                    let nats_key = bucket_handle.nats_key(&key);
                     if let Err(e) = store.delete(&nats_key).await {
                         return Ok(Err(StoreError::Other(format!("{e}"))));
                     }

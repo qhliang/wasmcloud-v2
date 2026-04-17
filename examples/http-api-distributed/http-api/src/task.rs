@@ -51,7 +51,7 @@ pub async fn create(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
                 LOG_CTX,
                 &format!("Task failed: subject={}, error={}", subject, err),
             );
-            helpers::text_response(StatusCode::BAD_GATEWAY, err)
+            helpers::text_response(StatusCode::BAD_GATEWAY, "task processing failed")
         }
     }
 }

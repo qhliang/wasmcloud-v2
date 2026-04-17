@@ -436,9 +436,15 @@ impl CustomBlobstore {
             }
         };
 
-        // Cache the engine
+        // Cache the engine (double-check to avoid race)
         {
             let mut lock = self.tracker.write().await;
+            // Another task may have created the engine while we were building ours
+            if let Some(data) = lock.get_component_data(component_id)
+                && let Some(ref existing) = data.engine
+            {
+                return Ok(existing.clone_engine());
+            }
             if let Some(data) = lock.get_component_data_mut(component_id) {
                 data.engine = Some(engine.clone_engine());
             }
@@ -541,7 +547,10 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         name: ContainerName,
     ) -> wasmtime::Result<Result<Resource<String>, BlobstoreError>> {
         let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
-            return Ok(Err("Blobstore plugin not available".to_string()));
+            return Ok(Err(format!(
+                "blobstore plugin not available for component '{}'",
+                self.component_id
+            )));
         };
         plugin.record_operation("create_container");
 
@@ -560,7 +569,11 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
             BlobEngine::OpenDal(op) => {
                 let path = format!("{name}/");
                 if let Err(e) = op.create_dir(&path).await {
-                    debug!(error = %e, "Failed to create container directory");
+                    tracing::warn!(
+                        error = %e,
+                        container = %name,
+                        "Failed to create container directory, some operations may fail"
+                    );
                 }
             }
             BlobEngine::Nats(nats) => {
@@ -579,7 +592,10 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         name: ContainerName,
     ) -> wasmtime::Result<Result<Resource<String>, BlobstoreError>> {
         let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
-            return Ok(Err("Blobstore plugin not available".to_string()));
+            return Ok(Err(format!(
+                "blobstore plugin not available for component '{}'",
+                self.component_id
+            )));
         };
         plugin.record_operation("get_container");
 
@@ -605,7 +621,10 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         name: ContainerName,
     ) -> wasmtime::Result<Result<bool, BlobstoreError>> {
         let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
-            return Ok(Err("Blobstore plugin not available".to_string()));
+            return Ok(Err(format!(
+                "blobstore plugin not available for component '{}'",
+                self.component_id
+            )));
         };
         plugin.record_operation("container_exists");
 
@@ -634,7 +653,10 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         name: ContainerName,
     ) -> wasmtime::Result<Result<(), BlobstoreError>> {
         let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
-            return Ok(Err("Blobstore plugin not available".to_string()));
+            return Ok(Err(format!(
+                "blobstore plugin not available for component '{}'",
+                self.component_id
+            )));
         };
         plugin.record_operation("delete_container");
 
@@ -653,7 +675,11 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
             BlobEngine::OpenDal(op) => {
                 let path = format!("{name}/");
                 if let Err(e) = op.remove_all(&path).await {
-                    debug!(error = %e, "Failed to delete container");
+                    tracing::warn!(
+                        error = %e,
+                        container = %name,
+                        "Failed to delete container contents"
+                    );
                 }
             }
             BlobEngine::Nats(nats) => {
@@ -672,7 +698,10 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         dest: ObjectId,
     ) -> wasmtime::Result<Result<(), BlobstoreError>> {
         let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
-            return Ok(Err("Blobstore plugin not available".to_string()));
+            return Ok(Err(format!(
+                "blobstore plugin not available for component '{}'",
+                self.component_id
+            )));
         };
         plugin.record_operation("copy_object");
 
@@ -708,7 +737,10 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         dest: ObjectId,
     ) -> wasmtime::Result<Result<(), BlobstoreError>> {
         let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
-            return Ok(Err("Blobstore plugin not available".to_string()));
+            return Ok(Err(format!(
+                "blobstore plugin not available for component '{}'",
+                self.component_id
+            )));
         };
         plugin.record_operation("move_object");
 
@@ -782,7 +814,10 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
         );
 
         let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
-            return Ok(Err("Blobstore plugin not available".to_string()));
+            return Ok(Err(format!(
+                "blobstore plugin not available for component '{}'",
+                self.component_id
+            )));
         };
 
         let engine = match plugin.get_engine(&self.component_id).await {
@@ -864,7 +899,10 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
         let container_name = self.table.get(&container)?;
 
         let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
-            return Ok(Err("Blobstore plugin not available".to_string()));
+            return Ok(Err(format!(
+                "blobstore plugin not available for component '{}'",
+                self.component_id
+            )));
         };
 
         let engine = match plugin.get_engine(&self.component_id).await {
@@ -917,7 +955,10 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
         let container_name = self.table.get(&container)?;
 
         let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
-            return Ok(Err("Blobstore plugin not available".to_string()));
+            return Ok(Err(format!(
+                "blobstore plugin not available for component '{}'",
+                self.component_id
+            )));
         };
 
         let engine = match plugin.get_engine(&self.component_id).await {
@@ -950,7 +991,10 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
         let container_name = self.table.get(&container)?;
 
         let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
-            return Ok(Err("Blobstore plugin not available".to_string()));
+            return Ok(Err(format!(
+                "blobstore plugin not available for component '{}'",
+                self.component_id
+            )));
         };
 
         let engine = match plugin.get_engine(&self.component_id).await {
@@ -985,7 +1029,10 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
         let container_name = self.table.get(&container)?;
 
         let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
-            return Ok(Err("Blobstore plugin not available".to_string()));
+            return Ok(Err(format!(
+                "blobstore plugin not available for component '{}'",
+                self.component_id
+            )));
         };
 
         let engine = match plugin.get_engine(&self.component_id).await {
@@ -1016,7 +1063,10 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
         let container_name = self.table.get(&container)?;
 
         let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
-            return Ok(Err("Blobstore plugin not available".to_string()));
+            return Ok(Err(format!(
+                "blobstore plugin not available for component '{}'",
+                self.component_id
+            )));
         };
 
         let engine = match plugin.get_engine(&self.component_id).await {
@@ -1058,7 +1108,10 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
         let container_name = self.table.get(&container)?;
 
         let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
-            return Ok(Err("Blobstore plugin not available".to_string()));
+            return Ok(Err(format!(
+                "blobstore plugin not available for component '{}'",
+                self.component_id
+            )));
         };
 
         let engine = match plugin.get_engine(&self.component_id).await {
@@ -1248,7 +1301,10 @@ impl<'a> bindings::wasi::blobstore::types::HostOutgoingValue for ActiveCtx<'a> {
             (&handle.container_name, &handle.object_name)
         {
             let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
-                return Ok(Err("Blobstore plugin not available".to_string()));
+                return Ok(Err(format!(
+                    "blobstore plugin not available for component '{}'",
+                    self.component_id
+                )));
             };
 
             let data_bytes = handle.pipe.contents().to_vec();

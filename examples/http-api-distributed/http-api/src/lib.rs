@@ -249,13 +249,6 @@ async fn main(req: Request<Body>) -> anyhow::Result<Response<Body>> {
         }
     };
 
-    match &result {
-        Ok(resp) => log(
-            Level::Debug,
-            LOG_CTX,
-            &format!("Response: {}", resp.status()),
-        ),
-        Err(e) => log(Level::Error, LOG_CTX, &format!("Error: {}", e)),
-    }
+    helpers::log_response(&result);
     result
 }

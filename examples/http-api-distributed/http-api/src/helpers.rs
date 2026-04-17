@@ -41,46 +41,20 @@ pub fn text_response(status: StatusCode, text: impl Into<Body>) -> anyhow::Resul
 // ============ Request parsing ============
 
 pub fn query_params(uri: &wstd::http::Uri) -> HashMap<String, String> {
-    uri.query().map(|q| urlencoded_parse(q)).unwrap_or_default()
+    uri.query()
+        .map(|q| url::form_urlencoded::parse(q.as_bytes()).into_owned().collect())
+        .unwrap_or_default()
 }
 
 pub async fn parse_json_body<T: DeserializeOwned>(req: &mut Request<Body>) -> anyhow::Result<T> {
     req.body_mut().json().await.context("failed to parse body")
 }
 
-// ============ URL encoding ============
+// ============ Logging ============
 
-fn urlencoded_parse(query: &str) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    for pair in query.split('&') {
-        if let Some(eq) = pair.find('=') {
-            let key = urlencoding_decode(&pair[..eq]);
-            let value = urlencoding_decode(&pair[eq + 1..]);
-            map.insert(key, value);
-        } else if !pair.is_empty() {
-            map.insert(pair.to_string(), String::new());
-        }
+pub fn log_response(result: &anyhow::Result<Response<Body>>) {
+    match result {
+        Ok(resp) => log(Level::Debug, "http-api", &format!("Response: {}", resp.status())),
+        Err(e) => log(Level::Error, "http-api", &format!("Error: {}", e)),
     }
-    map
-}
-
-fn urlencoding_decode(s: &str) -> String {
-    let mut result = String::new();
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '%' {
-            let hex: String = chars.by_ref().take(2).collect();
-            if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                result.push(byte as char);
-            } else {
-                result.push('%');
-                result.push_str(&hex);
-            }
-        } else if c == '+' {
-            result.push(' ');
-        } else {
-            result.push(c);
-        }
-    }
-    result
 }

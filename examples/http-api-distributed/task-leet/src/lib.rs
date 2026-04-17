@@ -33,11 +33,8 @@ impl exports::wasmcloud::messaging::handler::Guest for Component {
             return Err("missing reply_to".to_string());
         };
 
-        let payload = String::from_utf8(msg.body.to_vec()).map_err(|e| {
-            let err = format!("Failed to decode message body: {}", e);
-            log(Level::Error, LOG_CTX, &err);
-            err
-        })?;
+        let payload = String::from_utf8(msg.body.to_vec())
+            .map_err(|e| format!("failed to decode message body: {e}"))?;
 
         log(
             Level::Debug,
@@ -70,14 +67,7 @@ impl exports::wasmcloud::messaging::handler::Guest for Component {
             reply_to: None,
         };
 
-        consumer::publish(&reply).map_err(|e| {
-            log(
-                Level::Error,
-                LOG_CTX,
-                &format!("Failed to publish reply: {}", e),
-            );
-            e
-        })?;
+        consumer::publish(&reply).map_err(|e| format!("failed to publish reply: {e}"))?;
 
         log(Level::Debug, LOG_CTX, "Reply published successfully");
         Ok(())
