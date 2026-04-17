@@ -583,6 +583,19 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         };
         plugin.record_operation("get_container");
 
+        let engine = match plugin.get_engine(&self.component_id).await {
+            Ok(e) => e,
+            Err(e) => return Ok(Err(format!("failed to get engine: {e}"))),
+        };
+
+        // For NATS backend, ensure the object store (bucket) exists
+        if let BlobEngine::Nats(nats) = &engine
+            && !nats.container_exists(&name).await.unwrap_or(false)
+            && let Err(e) = nats.create_container(&name).await
+        {
+            return Ok(Err(format!("failed to create container: {e}")));
+        }
+
         let resource = self.table.push(name)?;
         Ok(Ok(resource))
     }
