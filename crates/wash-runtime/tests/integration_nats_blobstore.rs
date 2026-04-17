@@ -183,7 +183,13 @@ async fn test_nats_blobstore_roundtrip() -> Result<()> {
         .await
         .context("Failed to read response body")?;
 
-    assert!(status.is_success(), "Expected success, got {status}");
+    if !status.is_success() {
+        eprintln!("Error response ({status}): {response_text}");
+    }
+    assert!(
+        status.is_success(),
+        "Expected success, got {status}: {response_text}"
+    );
     assert_eq!(
         response_text.trim(),
         test_data,
