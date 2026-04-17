@@ -247,7 +247,9 @@ impl NatsBlobBackend {
             match item {
                 Ok(info) => names.push(info.name),
                 Err(e) => {
-                    return Err(anyhow::anyhow!("failed to list objects in '{container}': {e}"))
+                    return Err(anyhow::anyhow!(
+                        "failed to list objects in '{container}': {e}"
+                    ));
                 }
             }
         }
@@ -290,7 +292,9 @@ impl NatsBlobBackend {
             .context
             .get_object_store(src_container.to_string())
             .await
-            .map_err(|e| anyhow::anyhow!("failed to get source object store '{src_container}': {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("failed to get source object store '{src_container}': {e}")
+            })?;
         let dest_store = self
             .context
             .get_object_store(dest_container.to_string())
@@ -302,10 +306,9 @@ impl NatsBlobBackend {
             .get(src_object)
             .await
             .map_err(|e| anyhow::anyhow!("failed to get source object '{src_object}': {e}"))?;
-        dest_store
-            .put(dest_object, &mut obj)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to put object to destination '{dest_object}': {e}"))?;
+        dest_store.put(dest_object, &mut obj).await.map_err(|e| {
+            anyhow::anyhow!("failed to put object to destination '{dest_object}': {e}")
+        })?;
         Ok(())
     }
 
@@ -322,7 +325,9 @@ impl NatsBlobBackend {
             .context
             .get_object_store(src_container.to_string())
             .await
-            .map_err(|e| anyhow::anyhow!("failed to get source object store '{src_container}': {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("failed to get source object store '{src_container}': {e}")
+            })?;
         src_store
             .delete(src_object)
             .await
@@ -353,7 +358,7 @@ impl NatsBlobBackend {
                 Err(e) => {
                     return Err(anyhow::anyhow!(
                         "failed to list objects in '{container}': {e}"
-                    ))
+                    ));
                 }
             }
         }
@@ -468,7 +473,9 @@ impl CustomBlobstore {
                     .filter(|(k, _)| k.as_str() != "backend")
                     .map(|(k, v)| (k.clone(), v.clone()));
                 let op = Operator::via_iter(scheme, iter).map_err(|e| {
-                    anyhow::anyhow!("failed to create OpenDAL operator for backend '{backend}': {e}")
+                    anyhow::anyhow!(
+                        "failed to create OpenDAL operator for backend '{backend}': {e}"
+                    )
                 })?;
                 BlobEngine::OpenDal(op)
             }
