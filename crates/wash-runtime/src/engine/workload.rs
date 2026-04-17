@@ -534,15 +534,11 @@ impl ResolvedWorkload {
             for (name, item) in exported_instances {
                 // TODO(#11): It's probably a good idea to skip registering wasi@0.2 interfaces
                 match name.split_once('@') {
-                    Some(("wasmcloud:wash/plugin", _)) => {
+                    Some(("wasmcloud:wash/plugin", _)) | None
+                        if name == "wasmcloud:wash/plugin" =>
+                    {
                         trace!(name, "skipping internal plugin export");
                         continue;
-                    }
-                    None => {
-                        if name == "wasmcloud:wash/plugin" {
-                            trace!(name, "skipping internal plugin export");
-                            continue;
-                        }
                     }
                     _ => {}
                 }
@@ -1031,8 +1027,8 @@ impl ResolvedWorkload {
 
         // Mount all possible volume mounts in the workload since components share a WasiCtx
         for (host_path, mount) in &components
-            .iter()
-            .flat_map(|(_id, workload_component)| workload_component.metadata.volume_mounts.clone())
+            .values()
+            .flat_map(|workload_component| workload_component.metadata.volume_mounts.clone())
             .collect::<Vec<_>>()
         {
             let dir = tokio::fs::canonicalize(host_path).await?;
