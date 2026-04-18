@@ -34,7 +34,7 @@ jobs:
           rust-targets: wasm32-wasip2
 
       - name: Download wash binary artifact
-        uses: actions/download-artifact@018cc2cf5baa6db3efc5f8a56943fffe632ef53 # v6.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: wash-x86_64-unknown-linux-musl
           path: ./wash-bin
@@ -58,14 +58,14 @@ jobs:
           ls -lh target/wasm32-wasip2/release/task_leet.wasm
 
       - name: Login to GHCR
-        uses: docker/login-action@5e57cd11890d871c5c7afbaffeae0e6b7e5e9bc3 # v3.6.0
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install oras
-        uses: oras-project/setup-oras@227458c4b8a19ebae8c0b9553003f4f2bc6c4f04 # v1.2.6
+        uses: oras-project/setup-oras@38de303aac69abb66f3e6255b7198bff35f323e3 # v2.0.0
 
       - name: Determine tag
         id: meta
