@@ -241,6 +241,23 @@ Errors are returned in the format appropriate to the endpoint:
 
 HTTP status codes follow the respective API conventions (400 for bad request, 401 for auth errors, 429 for rate limits, 500 for server errors).
 
+## Data Type Adapter Layer
+
+byokey-types and genai define their own request/response data structures. An adapter module is needed to convert between them:
+
+```
+byokey-types::ChatRequest      <->  genai::ChatRequest
+byokey-types::ChatResponse     <->  genai::ChatResponse
+byokey-types::Message          <->  genai::Message
+byokey-types::ToolDefinition   <->  genai::ToolDefinition
+```
+
+This adapter lives in the plugin code (not a separate crate) and handles:
+- Message role mapping (system/user/assistant/tool)
+- Content block conversion (text, tool_call, tool_result)
+- Option mapping (temperature, max_tokens, top_p, etc.)
+- Usage statistics mapping
+
 ## Testing
 
 1. **Unit tests**: Format translation logic (byokey-translate conversions)
