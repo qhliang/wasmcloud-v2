@@ -55,6 +55,9 @@ use wash_runtime::engine::workload::WorkloadItem;
 use wash_runtime::plugin::{HostPlugin, WorkloadTracker};
 use wash_runtime::wit::{WitInterface, WitWorld};
 
+mod anthropic_types;
+mod openai_types;
+
 mod bindings {
     wasmtime::component::bindgen!({
         world: "llm-gateway",
