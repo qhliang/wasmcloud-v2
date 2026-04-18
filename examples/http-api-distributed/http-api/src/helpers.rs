@@ -4,6 +4,8 @@ use anyhow::Context as _;
 use serde::de::DeserializeOwned;
 use wstd::http::{Body, Request, Response, StatusCode};
 
+use crate::bindings::wasi::logging::logging::{Level, log};
+
 // ============ Response builders ============
 
 pub fn html_response(html: impl Into<Body>) -> anyhow::Result<Response<Body>> {
