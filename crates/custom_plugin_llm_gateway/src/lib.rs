@@ -56,6 +56,7 @@ use wash_runtime::plugin::{HostPlugin, WorkloadTracker};
 use wash_runtime::wit::{WitInterface, WitWorld};
 
 mod anthropic_types;
+mod http_handler;
 mod openai_types;
 
 mod bindings {
@@ -419,7 +420,7 @@ fn extract_config(
 // Type conversion helpers
 // ============================================================================
 
-fn to_genai_role(role: &str) -> genai::chat::ChatRole {
+pub(crate) fn to_genai_role(role: &str) -> genai::chat::ChatRole {
     match role {
         "system" => genai::chat::ChatRole::System,
         "assistant" => genai::chat::ChatRole::Assistant,

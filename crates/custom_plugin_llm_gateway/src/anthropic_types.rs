@@ -331,10 +331,7 @@ mod tests {
         }"#;
         let err: ResponsesError = serde_json::from_str(json).unwrap();
         assert_eq!(err.error.error_type, "authentication_error");
-        assert_eq!(
-            err.error.message.as_deref(),
-            Some("invalid x-api-key")
-        );
+        assert_eq!(err.error.message.as_deref(), Some("invalid x-api-key"));
     }
 
     #[test]
