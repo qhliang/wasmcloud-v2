@@ -27,3 +27,7 @@ wash-runtime = { path = "../wash-runtime" }
 
 # Multi-provider LLM library
 genai = "0.6.0-beta.11"
+
+# API format translation
+byokey-translate = "0.6"
+byokey-types = "0.6"
