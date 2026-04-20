@@ -1,0 +1,4 @@
+FROM cgr.dev/chainguard/wolfi-base
+RUN apk add --no-cache git
+COPY wash /usr/local/bin/wash
+ENTRYPOINT ["/usr/local/bin/wash"]

@@ -82,7 +82,7 @@ jobs:
       - name: Setup Rust
         uses: ./.github/actions/setup-rust
       - name: Build
-        run: cargo build
+        run: cargo build --release
       - name: Test
         env:
           RUST_BACKTRACE: "1"
@@ -90,6 +90,13 @@ jobs:
           NATS_INTEGRATION_TESTS: ${{ matrix.os == 'ubuntu-latest' && '1' || '' }}
         run: |
           cargo test --workspace
+      - name: Upload wash binary
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: wash-x86_64-unknown-linux-musl
+          path: target/release/wash
+          retention-days: 1
 
   lint:
     runs-on: ubuntu-latest
@@ -124,28 +131,35 @@ jobs:
           cargo machete
 
   canary:
+    needs: check
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: write
       packages: write
+      actions: read
     uses: ./.github/workflows/docker-build-push.yml
     secrets: inherit
     with:
       push: true
       image: ghcr.io/qhliang/wash
+      binary-artifact: wash-x86_64-unknown-linux-musl
       tags: |
         type=raw,value=canary-v2
+        type=raw,value=custom-v1-alpha
 
   docker-release:
+    needs: check
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
       packages: write
+      actions: read
     uses: ./.github/workflows/docker-build-push.yml
     secrets: inherit
     with:
       push: true
       image: ghcr.io/qhliang/wash
+      binary-artifact: wash-x86_64-unknown-linux-musl
       tags: |
         type=semver,pattern={{version}},value=${{ github.ref_name }}
 
@@ -228,7 +242,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Download all artifacts
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: ./artifacts
           pattern: wash-*
@@ -248,3 +262,77 @@ jobs:
           token: ${{ github.token }}
           prerelease: false
           generate_release_notes: true
+
+  build-http-api:
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          rust-toolchain: stable
+          rust-targets: wasm32-wasip2
+
+      - name: Download wash binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: wash-x86_64-unknown-linux-musl
+          path: ./wash-bin
+
+      - name: Make wash executable
+        run: |
+          chmod +x ./wash-bin/wash
+          echo "WASH_BIN=$(pwd)/wash-bin/wash" >> "$GITHUB_ENV"
+
+      - name: Build wasm components
+        working-directory: examples/http-api-distributed
+        run: |
+          ${{ env.WASH_BIN }} build --skip-fetch
+
+      - name: Verify wasm artifacts
+        working-directory: examples/http-api-distributed
+        run: |
+          ls -lh target/wasm32-wasip2/release/http_api.wasm
+          ls -lh target/wasm32-wasip2/release/task_leet.wasm
+
+      - name: Login to GHCR
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install oras
+        uses: oras-project/setup-oras@38de303aac69abb66f3e6255b7198bff35f323e3 # v2.0.0
+
+      - name: Determine tag
+        id: meta
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "timestamp=$(date +%Y%m%d%H%M%S)" >> "$GITHUB_OUTPUT"
+
+      - name: Push http_api.wasm to GHCR
+        working-directory: examples/http-api-distributed
+        run: |
+          oras push ghcr.io/${{ github.repository_owner }}/http-api-wasm:${{ steps.meta.outputs.short_sha }} \
+            target/wasm32-wasip2/release/http_api.wasm:application/wasm
+          oras tag ghcr.io/${{ github.repository_owner }}/http-api-wasm:${{ steps.meta.outputs.short_sha }} latest
+
+      - name: Push task_leet.wasm to GHCR
+        working-directory: examples/http-api-distributed
+        run: |
+          oras push ghcr.io/${{ github.repository_owner }}/task-leet-wasm:${{ steps.meta.outputs.short_sha }} \
+            target/wasm32-wasip2/release/task_leet.wasm:application/wasm
+          oras tag ghcr.io/${{ github.repository_owner }}/task-leet-wasm:${{ steps.meta.outputs.short_sha }} latest
