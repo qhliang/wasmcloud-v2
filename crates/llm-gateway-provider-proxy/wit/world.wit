@@ -1,0 +1,8 @@
+package wasmcloud:llm-gateway-provider-proxy@0.1.0;
+
+world llm-gateway-provider-proxy {
+  import wasi:logging/logging@0.1.0-draft;
+  import wasmcloud:messaging/consumer@0.2.0;
+  import wasi:config/store@0.2.0-rc.1;
+  export custom:llm-gateway/chat@0.1.0;
+}
