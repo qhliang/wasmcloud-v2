@@ -12,6 +12,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [features]
+default = ["wasip3"]
 wasip3 = ["wash-runtime/wasip3"]
 
 [lints]
@@ -61,7 +62,7 @@ wit-component = { workspace = true }
 custom_plugin_kv = { path = "../custom_plugin_kv" }
 custom_plugin_blobstore = { path = "../custom_plugin_blobstore" }
 custom_plugin_cf_d1 = { path = "../custom_plugin_cf_d1" }
-custom_plugin_llm_gateway = { path = "../custom_plugin_llm_gateway" }
+custom_plugin_llm_gateway_provider = { path = "../custom_plugin_llm_gateway_provider" }
 custom_plugin_mail = { path = "../custom_plugin_mail" }
 custom_plugin_crontab = { path = "../custom_plugin_crontab" }
 custom_plugin_dingtalk_stream = { path = "../custom_plugin_dingtalk_stream" }

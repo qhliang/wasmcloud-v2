@@ -1885,7 +1885,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "custom_plugin_llm_gateway"
+name = "custom_plugin_llm_gateway_provider"
 version = "2.0.4"
 dependencies = [
  "anyhow",
@@ -1897,7 +1897,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
- "uuid",
  "wash-runtime",
  "wasmtime",
 ]
@@ -8917,7 +8916,7 @@ dependencies = [
  "custom_plugin_dingtalk_stream",
  "custom_plugin_feishu",
  "custom_plugin_kv",
- "custom_plugin_llm_gateway",
+ "custom_plugin_llm_gateway_provider",
  "custom_plugin_mail",
  "custom_plugin_telegram",
  "custom_plugin_wechat",

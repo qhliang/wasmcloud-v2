@@ -8,7 +8,7 @@ members = [
     "crates/custom_plugin_blobstore",
     "crates/custom_plugin_nats_utils",
     "crates/custom_plugin_cf_d1",
-    "crates/custom_plugin_llm_gateway",
+    "crates/custom_plugin_llm_gateway_provider",
     "crates/custom_plugin_mail",
     "crates/custom_plugin_crontab",
     "crates/custom_plugin_dingtalk_stream",

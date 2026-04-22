@@ -8,7 +8,7 @@
 //! ## Usage
 //!
 //! ```ignore
-//! use custom_plugin_llm_gateway::LlmGateway;
+//! use custom_plugin_llm_gateway_provider::LlmGateway;
 //! use wash_runtime::host::HostBuilder;
 //! use std::sync::Arc;
 //!
@@ -55,10 +55,6 @@ use wash_runtime::engine::workload::WorkloadItem;
 use wash_runtime::plugin::{HostPlugin, WorkloadTracker};
 use wash_runtime::wit::{WitInterface, WitWorld};
 
-mod anthropic_types;
-mod http_handler;
-mod openai_types;
-
 mod bindings {
     wasmtime::component::bindgen!({
         world: "llm-gateway",
@@ -76,7 +72,7 @@ use bindings::custom::llm_gateway::types::{
     LlmConfig, LlmError, StreamEnd as WitStreamEnd, TokenUsage,
 };
 
-const PLUGIN_ID: &str = "llm-gateway";
+const PLUGIN_ID: &str = "llm-gateway-provider";
 
 /// Host-side state for an active streaming chat response.
 /// Stored in the wasmtime ResourceTable and polled by `next()`.

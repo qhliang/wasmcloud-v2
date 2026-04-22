@@ -5,7 +5,7 @@ use clap::Args;
 use custom_plugin_blobstore::CustomBlobstore;
 use custom_plugin_cf_d1::CloudflareD1;
 use custom_plugin_kv::MultiBackendKeyValue;
-use custom_plugin_llm_gateway::LlmGateway;
+use custom_plugin_llm_gateway_provider::LlmGateway;
 use tracing::info;
 use wash_runtime::{
     engine::Engine,

@@ -1,10 +1,10 @@
 [package]
-name = "custom_plugin_llm_gateway"
+name = "custom_plugin_llm_gateway_provider"
 authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
-description = "Custom host plugin for LLM Gateway using genai multi-provider library"
+description = "Host plugin for LLM Gateway provider using genai multi-provider library"
 
 [lib]
 path = "src/lib.rs"
@@ -22,7 +22,6 @@ opentelemetry = { workspace = true, features = ["trace", "metrics"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 futures = { workspace = true }
-uuid = { workspace = true }
 
 wash-runtime = { path = "../wash-runtime" }
 
