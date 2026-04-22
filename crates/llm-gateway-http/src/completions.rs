@@ -4,12 +4,15 @@ use wstd::http::{Body, Request, Response, StatusCode};
 
 use crate::LOG_CTX;
 use crate::bindings::custom::llm_gateway::chat;
-use crate::bindings::custom::llm_gateway::types::{ChatMessage, ChatOptions, LlmError};
+use crate::bindings::custom::llm_gateway::types::{
+    ChatMessage, ChatOptions, ChatRole, ContentPart, LlmError, MessageContent as WitMessageContent,
+    StopReason as WitStopReason,
+};
 use crate::bindings::wasi::logging::logging::{Level, log};
 use crate::helpers;
 use crate::types::{
-    CompletionsChoice, CompletionsError, CompletionsErrorDetail, CompletionsMessage,
-    CompletionsRequest, CompletionsResponse, CompletionsResponseMessage, CompletionsUsage,
+    CompletionsChoice, CompletionsError, CompletionsErrorDetail, CompletionsRequest,
+    CompletionsResponse, CompletionsResponseMessage, CompletionsUsage,
 };
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -42,18 +45,6 @@ fn map_error_type(e: &LlmError) -> String {
     .to_string()
 }
 
-fn map_finish_reason(reason: &str) -> String {
-    match reason {
-        "stop" => "stop".to_string(),
-        "length" => "length".to_string(),
-        "content_filter" => "content_filter".to_string(),
-        other => other.to_string(),
-    }
-}
-
-fn extract_content(msg: &CompletionsMessage) -> String {
-    msg.content.as_deref().unwrap_or("").to_string()
-}
 
 pub async fn handle(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
     let chat_req: CompletionsRequest = match helpers::parse_json_body(&mut req).await {
@@ -101,9 +92,21 @@ pub async fn handle(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
     let messages: Vec<ChatMessage> = chat_req
         .messages
         .iter()
-        .map(|m| ChatMessage {
-            role: m.role.clone(),
-            content: extract_content(m),
+        .map(|m| {
+            let role = match m.role.as_str() {
+                "system" => ChatRole::System,
+                "assistant" => ChatRole::Assistant,
+                "tool" => ChatRole::Tool,
+                _ => ChatRole::User,
+            };
+            ChatMessage {
+                role,
+                content: WitMessageContent {
+                    parts: vec![ContentPart::Text(
+                        m.content.clone().unwrap_or_default(),
+                    )],
+                },
+            }
         })
         .collect();
 
@@ -115,13 +118,24 @@ pub async fn handle(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
 
     match chat::chat(&chat_req.model, &messages, Some(options), None) {
         Ok(response) => {
+            let content_text = response
+                .content
+                .parts
+                .iter()
+                .find_map(|p| match p {
+                    ContentPart::Text(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("")
+                .to_string();
+
             log(
                 Level::Info,
                 LOG_CTX,
                 &format!(
                     "completions ok: model={}, content_len={}",
                     response.model,
-                    response.content.len()
+                    content_text.len()
                 ),
             );
 
@@ -131,9 +145,15 @@ pub async fn handle(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
             let total_tokens = usage.map(|u| u.total_tokens).unwrap_or(0);
 
             let finish_reason = response
-                .finish_reason
-                .as_deref()
-                .map(map_finish_reason)
+                .stop_reason
+                .as_ref()
+                .map(|sr| match sr {
+                    WitStopReason::Completed(_) | WitStopReason::Other(_) => "stop".to_string(),
+                    WitStopReason::MaxTokens(_) => "length".to_string(),
+                    WitStopReason::ContentFilter(_) => "content_filter".to_string(),
+                    WitStopReason::ToolCall(_) => "tool_calls".to_string(),
+                    WitStopReason::StopSequence(_) => "stop".to_string(),
+                })
                 .unwrap_or_else(|| "stop".to_string());
 
             let result = CompletionsResponse {
@@ -144,7 +164,7 @@ pub async fn handle(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
                     index: 0,
                     message: CompletionsResponseMessage {
                         role: "assistant".to_string(),
-                        content: Some(response.content),
+                        content: Some(content_text),
                     },
                     finish_reason,
                 }],

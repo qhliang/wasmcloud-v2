@@ -1,5 +1,7 @@
 use crate::bindings::custom::llm_gateway::chat;
-use crate::bindings::custom::llm_gateway::types::{ChatMessage, ChatOptions};
+use crate::bindings::custom::llm_gateway::types::{
+    ChatMessage, ChatOptions, ChatRole, ContentPart, MessageContent,
+};
 use crate::bindings::wasi::logging::logging::{Level, log};
 use crate::helpers;
 use crate::templates;
@@ -50,9 +52,19 @@ pub async fn chat(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
     let messages: Vec<ChatMessage> = chat_req
         .messages
         .into_iter()
-        .map(|m| ChatMessage {
-            role: m.role,
-            content: m.content,
+        .map(|m| {
+            let role = match m.role.as_str() {
+                "system" => ChatRole::System,
+                "assistant" => ChatRole::Assistant,
+                "tool" => ChatRole::Tool,
+                _ => ChatRole::User,
+            };
+            ChatMessage {
+                role,
+                content: MessageContent {
+                    parts: vec![ContentPart::Text(m.content)],
+                },
+            }
         })
         .collect();
 
@@ -64,25 +76,35 @@ pub async fn chat(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
 
     match chat::chat(&chat_req.model, &messages, None, None) {
         Ok(response) => {
+            let content_text = response
+                .content
+                .parts
+                .iter()
+                .find_map(|p| match p {
+                    ContentPart::Text(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("");
+
             log(
                 Level::Info,
                 LOG_CTX,
                 &format!(
                     "LLM CHAT OK: model={}, content_len={}",
                     response.model,
-                    response.content.len()
+                    content_text.len()
                 ),
             );
 
             let json_result = serde_json::json!({
-                "content": response.content,
+                "content": content_text,
                 "model": response.model,
                 "usage": response.usage.map(|u| serde_json::json!({
                     "prompt_tokens": u.prompt_tokens,
                     "completion_tokens": u.completion_tokens,
                     "total_tokens": u.total_tokens,
                 })),
-                "finish_reason": response.finish_reason,
+                "stop_reason": response.stop_reason.as_ref().map(|sr| format!("{sr:?}")),
             });
 
             helpers::json_response(serde_json::to_string(&json_result)?)

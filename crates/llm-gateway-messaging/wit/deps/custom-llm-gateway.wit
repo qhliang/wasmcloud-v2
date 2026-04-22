@@ -1,95 +1,129 @@
 package custom:llm-gateway@0.1.0;
 
-/// Types used by components and providers of the LLM Gateway interface
+/// Types used by components and providers of the LLM Gateway interface.
+/// Mirrors genai's common message types for rich content support.
 interface types {
     /// Errors that can occur when calling LLM providers
     variant llm-error {
-        /// Invalid request (bad parameters, empty messages, etc.)
         invalid-request(string),
-        /// Authentication error (invalid API key, etc.)
         authentication-error(string),
-        /// Provider-side error (upstream API failure)
         provider-error(string),
-        /// Rate limit exceeded
         rate-limit-error(string),
-        /// Model not found or not available
         model-not-found(string),
-        /// Unexpected error
         unexpected(string),
+    }
+
+    /// Chat message role
+    enum chat-role {
+        system,
+        user,
+        assistant,
+        tool,
+    }
+
+    /// Source of a binary payload
+    variant binary-source {
+        url(string),
+        base64(string),
+    }
+
+    /// Binary content (images, PDFs, etc.)
+    record binary-part {
+        content-type: string,
+        source: binary-source,
+        name: option<string>,
+    }
+
+    /// A tool call returned by the model
+    record tool-call {
+        call-id: string,
+        fn-name: string,
+        /// JSON string of the function arguments
+        fn-arguments: string,
+    }
+
+    /// A tool response provided back to the model
+    record tool-response {
+        call-id: string,
+        content: string,
+    }
+
+    /// A single content segment in a chat message.
+    /// Mirrors genai's ContentPart. Omits ThoughtSignature,
+    /// ReasoningContent, and Custom variants (provider-internal).
+    variant content-part {
+        text(string),
+        binary(binary-part),
+        tool-call(tool-call),
+        tool-response(tool-response),
+    }
+
+    /// Message content is a list of content parts.
+    record message-content {
+        parts: list<content-part>,
     }
 
     /// A single message in a chat conversation
     record chat-message {
-        /// Role: "system", "user", or "assistant"
-        role: string,
-        /// Message content text
-        content: string,
+        role: chat-role,
+        content: message-content,
+    }
+
+    /// Reason the generation finished
+    variant stop-reason {
+        completed(string),
+        max-tokens(string),
+        tool-call(string),
+        content-filter(string),
+        stop-sequence(string),
+        other(string),
     }
 
     /// Token usage statistics
     record token-usage {
-        /// Number of tokens in the prompt
         prompt-tokens: u64,
-        /// Number of tokens in the completion
         completion-tokens: u64,
-        /// Total tokens used
         total-tokens: u64,
     }
 
     /// Response from a chat completion
     record chat-response {
-        /// The generated text content
-        content: string,
-        /// The model that was used (may differ from requested model)
+        content: message-content,
         model: string,
-        /// Token usage statistics, if available
+        stop-reason: option<stop-reason>,
         usage: option<token-usage>,
-        /// Reason the generation finished (e.g., "stop", "length")
-        finish-reason: option<string>,
     }
 
     /// Options for chat completion
     record chat-options {
-        /// Sampling temperature (0.0 - 2.0)
         temperature: option<f32>,
-        /// Maximum tokens to generate
         max-tokens: option<u32>,
-        /// Top-p sampling parameter
         top-p: option<f32>,
     }
 
     /// A single chunk of streamed chat content
     record chat-chunk {
-        /// The text content delta for this chunk
         content-delta: string,
     }
 
     /// Information provided when the stream ends
     record stream-end {
-        /// The model that was used
         model: string,
-        /// Token usage statistics, if available
         usage: option<token-usage>,
-        /// Reason the generation finished (e.g., "stop", "length")
-        finish-reason: option<string>,
+        stop-reason: option<stop-reason>,
     }
 
     /// Event emitted during a streaming chat response
     variant chat-stream-event {
-        /// A content chunk arrived
         chunk(chat-chunk),
-        /// The stream has completed
         end(stream-end),
-        /// An error occurred during streaming
         error(string),
     }
 
     /// Dynamic configuration for a single chat/streaming request.
     /// When provided, these values override the interface-level config.
     record llm-config {
-        /// API key for the LLM provider
         api-key: string,
-        /// Custom base URL (overrides interface config base_url)
         base-url: option<string>,
     }
 }
@@ -99,14 +133,6 @@ interface chat {
     use types.{llm-error, chat-message, chat-response, chat-options, llm-config};
 
     /// Execute a chat completion request.
-    ///
-    /// Sends a list of messages to the specified model and returns the
-    /// assistant's response. The model name determines which provider is
-    /// used (e.g., "gpt-4o-mini" for OpenAI, "claude-3-haiku" for Anthropic,
-    /// "gemini-2.0-flash" for Gemini, "deepseek-chat" for DeepSeek).
-    ///
-    /// When `config` is provided, its `api-key` and `base-url` override
-    /// the interface-level configuration for this request.
     chat: func(model: string, messages: list<chat-message>, options: option<chat-options>, config: option<llm-config>) -> result<chat-response, llm-error>;
 }
 
@@ -115,26 +141,12 @@ interface chat-streaming {
     use types.{llm-error, chat-message, chat-options, chat-stream-event, llm-config};
 
     /// A resource representing an ongoing streaming chat response.
-    /// Call `next()` repeatedly to receive events until the stream ends.
     resource chat-stream {
         /// Read the next batch of events from the stream.
-        ///
-        /// Returns a tuple of (events, ended) where:
-        /// - events: list of events since the last call
-        /// - ended: true if the stream has completed (no more events will follow)
-        ///
-        /// After ended=true, the guest should drop the resource.
         next: func() -> result<tuple<list<chat-stream-event>, bool>, llm-error>;
     }
 
     /// Start a streaming chat completion request.
-    ///
-    /// Returns a chat-stream resource that can be polled for events.
-    /// The stream is consumed by repeatedly calling `next()` on the
-    /// returned resource until it reports ended=true.
-    ///
-    /// When `config` is provided, its `api-key` and `base-url` override
-    /// the interface-level configuration for this request.
     chat-streaming: func(model: string, messages: list<chat-message>, options: option<chat-options>, config: option<llm-config>) -> result<chat-stream, llm-error>;
 }
 

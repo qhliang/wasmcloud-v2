@@ -2,7 +2,10 @@ use wstd::http::{Body, Request, Response, StatusCode};
 
 use crate::LOG_CTX;
 use crate::bindings::custom::llm_gateway::chat;
-use crate::bindings::custom::llm_gateway::types::{ChatMessage, ChatOptions, LlmError};
+use crate::bindings::custom::llm_gateway::types::{
+    ChatMessage, ChatOptions, ChatRole, ContentPart, LlmError, MessageContent as WitMessageContent,
+    StopReason as WitStopReason,
+};
 use crate::bindings::wasi::logging::logging::{Level, log};
 use crate::helpers;
 use crate::types::{
@@ -61,16 +64,6 @@ fn extract_text(content: &serde_json::Value) -> String {
     }
 }
 
-/// Map an OpenAI-style finish reason to an Anthropic-style stop reason.
-fn map_stop_reason(reason: &str) -> String {
-    match reason {
-        "stop" => "end_turn".to_string(),
-        "length" => "max_tokens".to_string(),
-        "content_filter" => "end_turn".to_string(),
-        other => other.to_string(),
-    }
-}
-
 /// Build the list of chat messages for the LLM gateway call.
 /// Handles the Anthropic `system` field by prepending it as a system message.
 fn build_chat_messages(req: &ResponsesRequest) -> Vec<ChatMessage> {
@@ -81,17 +74,27 @@ fn build_chat_messages(req: &ResponsesRequest) -> Vec<ChatMessage> {
         let system_text = extract_text(system);
         if !system_text.is_empty() {
             messages.push(ChatMessage {
-                role: "system".to_string(),
-                content: system_text,
+                role: ChatRole::System,
+                content: WitMessageContent {
+                    parts: vec![ContentPart::Text(system_text)],
+                },
             });
         }
     }
 
     for msg in &req.messages {
         let text = extract_text(&msg.content);
+        let role = match msg.role.as_str() {
+            "system" => ChatRole::System,
+            "assistant" => ChatRole::Assistant,
+            "tool" => ChatRole::Tool,
+            _ => ChatRole::User,
+        };
         messages.push(ChatMessage {
-            role: msg.role.clone(),
-            content: text,
+            role,
+            content: WitMessageContent {
+                parts: vec![ContentPart::Text(text)],
+            },
         });
     }
 
@@ -147,13 +150,24 @@ pub async fn handle(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
 
     match chat::chat(&resp_req.model, &messages, Some(options), None) {
         Ok(response) => {
+            let content_text = response
+                .content
+                .parts
+                .iter()
+                .find_map(|p| match p {
+                    ContentPart::Text(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("")
+                .to_string();
+
             log(
                 Level::Info,
                 LOG_CTX,
                 &format!(
                     "responses ok: model={}, content_len={}",
                     response.model,
-                    response.content.len()
+                    content_text.len()
                 ),
             );
 
@@ -169,9 +183,17 @@ pub async fn handle(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
                 .unwrap_or(0);
 
             let stop_reason = response
-                .finish_reason
-                .as_deref()
-                .map(map_stop_reason)
+                .stop_reason
+                .as_ref()
+                .map(|sr| match sr {
+                    WitStopReason::Completed(_) | WitStopReason::StopSequence(_) => {
+                        "end_turn".to_string()
+                    }
+                    WitStopReason::MaxTokens(_) => "max_tokens".to_string(),
+                    WitStopReason::ContentFilter(_) => "end_turn".to_string(),
+                    WitStopReason::ToolCall(_) => "tool_use".to_string(),
+                    WitStopReason::Other(_) => "end_turn".to_string(),
+                })
                 .unwrap_or_else(|| "end_turn".to_string());
 
             let result = ResponsesResponse {
@@ -181,7 +203,7 @@ pub async fn handle(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
                 model: response.model,
                 content: vec![ResponsesContentBlock {
                     block_type: "text".to_string(),
-                    text: Some(response.content),
+                    text: Some(content_text),
                 }],
                 stop_reason,
                 usage: ResponsesUsage {
