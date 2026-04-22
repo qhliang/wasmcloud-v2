@@ -90,6 +90,10 @@ jobs:
           NATS_INTEGRATION_TESTS: ${{ matrix.os == 'ubuntu-latest' && '1' || '' }}
         run: |
           cargo test --workspace
+      - name: Test with wasip3
+        run: |
+          cargo test -p wash-runtime --features wasip3
+
       - name: Upload wash binary
         if: matrix.os == 'ubuntu-latest'
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
@@ -125,7 +129,7 @@ jobs:
           cargo +nightly fmt -- --check
       - name: Lint
         run: |
-          cargo clippy --workspace
+          cargo clippy --workspace --features wasip3
       - name: Check for unused dependencies
         run: |
           cargo machete
@@ -223,7 +227,7 @@ jobs:
           cp target/${{ matrix.target }}/release/${{ matrix.bin }} ${{ matrix.artifact }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}

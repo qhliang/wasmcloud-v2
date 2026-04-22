@@ -161,17 +161,6 @@ async fn main() {
         );
     });
 
-    // Install rustls CryptoProvider before any TLS connections (required by rustls 0.23)
-    rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .map_err(|e| anyhow::anyhow!("failed to install crypto provider: {e:?}"))
-        .unwrap_or_else(|e| {
-            exit_with_output(
-                &mut stderr,
-                CommandOutput::error(format!("{e:?}"), None).with_output_kind(global_args.output),
-            );
-        });
-
     // Check if project path exists
     if !global_args.project_path.exists() {
         exit_with_output(

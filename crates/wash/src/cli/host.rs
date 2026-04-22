@@ -69,6 +69,18 @@ pub struct HostCommand {
     #[arg(long = "http-addr")]
     pub http_addr: Option<SocketAddr>,
 
+    /// Path to TLS certificate file for the HTTP server
+    #[arg(long = "tls-cert-path", requires = "tls_key_path")]
+    pub tls_cert_path: Option<PathBuf>,
+
+    /// Path to TLS private key file for the HTTP server
+    #[arg(long = "tls-key-path", requires = "tls_cert_path")]
+    pub tls_key_path: Option<PathBuf>,
+
+    /// Path to CA certificate file for mutual TLS on the HTTP server
+    #[arg(long = "tls-ca-path")]
+    pub tls_ca_path: Option<PathBuf>,
+
     /// Enable WASI WebGPU support
     #[cfg(not(target_os = "windows"))]
     #[arg(long = "wasi-webgpu", default_value_t = false)]
@@ -94,6 +106,11 @@ pub struct HostCommand {
     /// Enable WASI OpenTelemetry plugin
     #[arg(long = "wasi-otel", default_value_t = false)]
     pub wasi_otel: bool,
+
+    /// Enable WASIP3 support for components that target wasi@0.3 interfaces
+    #[cfg(feature = "wasip3")]
+    #[arg(long = "wasip3", env = "WASH_WASIP3", default_value_t = false)]
+    pub wasip3: bool,
 }
 
 impl CliCommand for HostCommand {
@@ -131,10 +148,15 @@ impl CliCommand for HostCommand {
             oci_cache_dir: self.oci_cache_dir.clone(),
         };
 
-        let engine = Engine::builder()
+        #[allow(unused_mut)]
+        let mut engine_builder = Engine::builder()
             .with_pooling_allocator(true)
-            .with_fuel_consumption(ctx.enable_meters())
-            .build()?;
+            .with_fuel_consumption(ctx.enable_meters());
+        #[cfg(feature = "wasip3")]
+        {
+            engine_builder = engine_builder.with_wasip3(self.wasip3);
+        }
+        let engine = engine_builder.build()?;
 
         let mut cluster_host_builder = wash_runtime::washlet::ClusterHostBuilder::default()
             .with_engine(engine)
@@ -214,9 +236,21 @@ impl CliCommand for HostCommand {
 
         if let Some(addr) = self.http_addr {
             let http_router = wash_runtime::host::http::DynamicRouter::default();
-            cluster_host_builder = cluster_host_builder.with_http_handler(Arc::new(
-                wash_runtime::host::http::HttpServer::new(http_router, addr).await?,
-            ));
+            let http_server = if let (Some(cert_path), Some(key_path)) =
+                (&self.tls_cert_path, &self.tls_key_path)
+            {
+                wash_runtime::host::http::HttpServer::new_with_tls(
+                    http_router,
+                    addr,
+                    cert_path,
+                    key_path,
+                    self.tls_ca_path.as_deref(),
+                )
+                .await?
+            } else {
+                wash_runtime::host::http::HttpServer::new(http_router, addr).await?
+            };
+            cluster_host_builder = cluster_host_builder.with_http_handler(Arc::new(http_server));
         }
 
         // Enable otel plugin

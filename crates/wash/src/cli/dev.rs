@@ -28,6 +28,10 @@ pub struct DevCommand {}
 
 impl CliCommand for DevCommand {
     async fn handle(&self, ctx: &CliContext) -> anyhow::Result<CommandOutput> {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .map_err(|e| anyhow::anyhow!(format!("failed to install crypto provider: {e:?}")))?;
+
         let project_dir = ctx.project_dir();
         info!(path = ?project_dir, "starting development session for project");
 
@@ -54,10 +58,15 @@ impl CliCommand for DevCommand {
             .clone()
             .unwrap_or_else(|| "0.0.0.0:8000".to_string());
 
-        let engine = Engine::builder()
+        #[allow(unused_mut)]
+        let mut engine_builder = Engine::builder()
             .with_pooling_allocator(true)
-            .with_fuel_consumption(ctx.enable_meters())
-            .build()?;
+            .with_fuel_consumption(ctx.enable_meters());
+        #[cfg(feature = "wasip3")]
+        {
+            engine_builder = engine_builder.with_wasip3(dev_config.wasip3);
+        }
+        let engine = engine_builder.build()?;
 
         let mut host_builder = Host::builder()
             .with_engine(engine)

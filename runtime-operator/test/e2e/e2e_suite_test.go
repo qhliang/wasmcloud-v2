@@ -50,6 +50,11 @@ var (
 
 	// helmChartPath points to the runtime-operator Helm chart relative to the project dir (runtime-operator/)
 	helmChartPath = "../charts/runtime-operator"
+
+	runtimeImageTag = "canary-v2"
+	// runtimeSupportsHostAliases indicates whether the runtime supports HostAliases,
+	// which is required for testing with EndpointSlices.
+	runtimeSupportsHostAliases = false
 )
 
 // TestE2E runs the end-to-end (e2e) test suite for the project. These tests execute in an isolated,
@@ -84,7 +89,7 @@ var _ = BeforeSuite(func() {
 		"--set", "gateway.image.tag=canary",
 		"--set", "gateway.service.type=NodePort",
 		"--set", "gateway.service.nodePort=30950",
-		"--set", "runtime.image.tag=canary-v2",
+		"--set", fmt.Sprintf("runtime.image.tag=%s", runtimeImageTag),
 		"--set", "runtime.hostGroups[0].name=default",
 		"--set", "runtime.hostGroups[0].replicas=1",
 		"--set", "runtime.hostGroups[0].service.type=ClusterIP",
