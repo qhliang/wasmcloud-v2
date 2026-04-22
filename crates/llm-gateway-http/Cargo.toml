@@ -1,0 +1,21 @@
+[package]
+name = "llm-gateway-http"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[workspace]
+
+[dependencies]
+wit-bindgen = "0.46.0"
+wstd = "0.6.3"
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+lto = true
+opt-level = "s"
+strip = true
