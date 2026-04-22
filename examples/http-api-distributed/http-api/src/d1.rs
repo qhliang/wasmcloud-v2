@@ -132,10 +132,7 @@ pub async fn batch(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
             log(
                 Level::Info,
                 LOG_CTX,
-                &format!(
-                    "D1 BATCH OK: {} statements(s) executed",
-                    results.len()
-                ),
+                &format!("D1 BATCH OK: {} statements(s) executed", results.len()),
             );
             let json_results: Vec<serde_json::Value> = results
                 .iter()

@@ -23,7 +23,7 @@ use wasmtime::component::Resource;
 
 use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use wash_runtime::engine::workload::WorkloadItem;
-use wash_runtime::plugin::{HostPlugin, WorkloadTracker};
+use wash_runtime::plugin::{HostPlugin, WorkloadTracker, find_interface};
 use wash_runtime::wit::{WitInterface, WitWorld};
 
 use custom_plugin_nats_utils::build_nats_connect_options;
@@ -932,11 +932,7 @@ impl HostPlugin for MultiBackendKeyValue {
         item: &mut WorkloadItem<'a>,
         interfaces: std::collections::HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
-        let keyvalue_interface = interfaces
-            .iter()
-            .find(|i| i.namespace == "wasi" && i.package == "keyvalue");
-
-        let Some(interface) = keyvalue_interface else {
+        let Some(interface) = find_interface(&interfaces, "wasi", "keyvalue") else {
             tracing::warn!(
                 "KV plugin requested for non-wasi:keyvalue interface(s): {:?}",
                 interfaces

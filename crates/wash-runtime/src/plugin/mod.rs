@@ -56,6 +56,20 @@ pub mod wasi_webgpu;
 
 pub mod config;
 
+/// Find the first interface matching the given namespace and package.
+///
+/// Returns `None` if no matching interface is found. This is the common
+/// pattern used by all custom plugins in `on_workload_item_bind`.
+pub fn find_interface<'a>(
+    interfaces: &'a std::collections::HashSet<crate::wit::WitInterface>,
+    namespace: &str,
+    package: &str,
+) -> Option<&'a crate::wit::WitInterface> {
+    interfaces
+        .iter()
+        .find(|i| i.namespace == namespace && i.package == package)
+}
+
 /// The [`HostPlugin`] trait provides an interface for implementing built-in plugins for the host.
 /// A plugin is primarily responsible for implementing a specific [`WitWorld`] as a collection of
 /// imports and exports that will be directly linked to the workload's [`wasmtime::component::Linker`].

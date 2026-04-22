@@ -52,7 +52,7 @@ use wasmtime::component::Resource;
 
 use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use wash_runtime::engine::workload::WorkloadItem;
-use wash_runtime::plugin::{HostPlugin, WorkloadTracker};
+use wash_runtime::plugin::{HostPlugin, WorkloadTracker, find_interface};
 use wash_runtime::wit::{WitInterface, WitWorld};
 
 mod bindings {
@@ -997,11 +997,7 @@ impl HostPlugin for LlmGateway {
         interfaces: HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
         // Find the llm-gateway interface
-        let llm_interface = interfaces
-            .iter()
-            .find(|i| i.namespace == "custom" && i.package == "llm-gateway");
-
-        let Some(interface) = llm_interface else {
+        let Some(interface) = find_interface(&interfaces, "custom", "llm-gateway") else {
             tracing::warn!(
                 "LlmGateway plugin requested for non-llm-gateway interface(s): {:?}",
                 interfaces

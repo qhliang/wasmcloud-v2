@@ -14,7 +14,7 @@ use tracing::{debug, instrument, warn};
 use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use wash_runtime::engine::workload::ResolvedWorkload;
 use wash_runtime::plugin::config::resolve_field;
-use wash_runtime::plugin::{HostPlugin, WorkloadTracker};
+use wash_runtime::plugin::{HostPlugin, WorkloadTracker, find_interface};
 use wash_runtime::wit::{WitInterface, WitWorld};
 use wasmtime::component::Resource;
 
@@ -1289,9 +1289,7 @@ impl HostPlugin for Feishu {
         item: &mut wash_runtime::engine::workload::WorkloadItem<'a>,
         interfaces: HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
-        let Some(interface) = interfaces
-            .iter()
-            .find(|i| i.namespace == "custom" && i.package == "feishu")
+        let Some(interface) = find_interface(&interfaces, "custom", "feishu")
         else {
             return Ok(());
         };

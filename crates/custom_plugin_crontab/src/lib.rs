@@ -41,6 +41,7 @@ use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use wash_runtime::engine::workload::{ResolvedWorkload, WorkloadItem};
 use wash_runtime::plugin::HostPlugin;
 use wash_runtime::plugin::WorkloadTracker;
+use wash_runtime::plugin::find_interface;
 use wash_runtime::wit::{WitInterface, WitWorld};
 
 mod bindings {
@@ -601,9 +602,7 @@ impl HostPlugin for Crontab {
         interfaces: HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
         // Only handle crontab interfaces
-        let Some(interface) = interfaces
-            .iter()
-            .find(|i| i.namespace == "custom" && i.package == "crontab")
+        let Some(interface) = find_interface(&interfaces, "custom", "crontab")
         else {
             return Ok(());
         };

@@ -19,7 +19,7 @@ use wasmtime::component::Resource;
 use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use wash_runtime::engine::workload::WorkloadItem;
 use wash_runtime::plugin::config::resolve_field;
-use wash_runtime::plugin::{HostPlugin, WorkloadTracker};
+use wash_runtime::plugin::{HostPlugin, WorkloadTracker, find_interface};
 use wash_runtime::wit::{WitInterface, WitWorld};
 
 mod bindings {
@@ -623,9 +623,7 @@ impl HostPlugin for CloudflareD1 {
         item: &mut WorkloadItem<'a>,
         interfaces: HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
-        let Some(interface) = interfaces
-            .iter()
-            .find(|i| i.namespace == "custom" && i.package == "cf-d1")
+        let Some(interface) = find_interface(&interfaces, "custom", "cf-d1")
         else {
             tracing::warn!(
                 "CloudflareD1 plugin requested for non-cf:d1 interface(s): {:?}",

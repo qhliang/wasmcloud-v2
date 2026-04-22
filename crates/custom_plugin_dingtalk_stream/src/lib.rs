@@ -42,6 +42,7 @@ use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use wash_runtime::engine::workload::{ResolvedWorkload, WorkloadItem};
 use wash_runtime::plugin::HostPlugin;
 use wash_runtime::plugin::WorkloadTracker;
+use wash_runtime::plugin::find_interface;
 use wash_runtime::plugin::config::resolve_field;
 use wash_runtime::wit::{WitInterface, WitWorld};
 
@@ -521,9 +522,7 @@ impl HostPlugin for DingTalk {
         item: &mut WorkloadItem<'a>,
         interfaces: HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
-        let Some(interface) = interfaces
-            .iter()
-            .find(|i| i.namespace == "custom" && i.package == "dingtalk-stream")
+        let Some(interface) = find_interface(&interfaces, "custom", "dingtalk-stream")
         else {
             return Ok(());
         };

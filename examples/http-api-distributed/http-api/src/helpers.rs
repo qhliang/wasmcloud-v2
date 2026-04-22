@@ -44,7 +44,11 @@ pub fn text_response(status: StatusCode, text: impl Into<Body>) -> anyhow::Resul
 
 pub fn query_params(uri: &wstd::http::Uri) -> HashMap<String, String> {
     uri.query()
-        .map(|q| url::form_urlencoded::parse(q.as_bytes()).into_owned().collect())
+        .map(|q| {
+            url::form_urlencoded::parse(q.as_bytes())
+                .into_owned()
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -56,7 +60,11 @@ pub async fn parse_json_body<T: DeserializeOwned>(req: &mut Request<Body>) -> an
 
 pub fn log_response(result: &anyhow::Result<Response<Body>>) {
     match result {
-        Ok(resp) => log(Level::Debug, "http-api", &format!("Response: {}", resp.status())),
+        Ok(resp) => log(
+            Level::Debug,
+            "http-api",
+            &format!("Response: {}", resp.status()),
+        ),
         Err(e) => log(Level::Error, "http-api", &format!("Error: {}", e)),
     }
 }

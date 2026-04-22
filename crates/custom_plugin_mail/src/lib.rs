@@ -19,7 +19,7 @@ use tokio::sync::RwLock;
 use tracing::debug;
 use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use wash_runtime::engine::workload::WorkloadItem;
-use wash_runtime::plugin::HostPlugin;
+use wash_runtime::plugin::{HostPlugin, find_interface};
 use wash_runtime::plugin::config::{resolve_field, resolve_optional_field};
 use wash_runtime::wit::{WitInterface, WitWorld};
 use wasmtime::component::Resource;
@@ -688,9 +688,7 @@ impl HostPlugin for Mail {
         component_handle: &mut WorkloadItem<'a>,
         interfaces: HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
-        let Some(interface) = interfaces
-            .iter()
-            .find(|i| i.namespace == "custom" && i.package == "mail")
+        let Some(interface) = find_interface(&interfaces, "custom", "mail")
         else {
             return Ok(());
         };

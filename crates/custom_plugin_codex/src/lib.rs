@@ -31,7 +31,7 @@ use etcetera::base_strategy::BaseStrategy;
 use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use wash_runtime::engine::workload::WorkloadItem;
 use wash_runtime::plugin::config::{resolve_field, resolve_optional_field};
-use wash_runtime::plugin::{HostPlugin, WorkloadTracker};
+use wash_runtime::plugin::{HostPlugin, WorkloadTracker, find_interface};
 use wash_runtime::wit::{WitInterface, WitWorld};
 
 use codex_process::{
@@ -1234,9 +1234,7 @@ impl HostPlugin for Codex {
         interfaces: HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
         // Only handle codex interfaces
-        let Some(interface) = interfaces
-            .iter()
-            .find(|i| i.namespace == "custom" && i.package == "codex")
+        let Some(interface) = find_interface(&interfaces, "custom", "codex")
         else {
             return Ok(());
         };

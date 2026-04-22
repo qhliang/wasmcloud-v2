@@ -21,8 +21,8 @@ mod llm;
 mod mail;
 mod r2;
 mod task;
-mod templates;
 mod telegram;
+mod templates;
 mod wechat;
 
 use bindings::wasi::logging::logging::{Level, log};
@@ -101,18 +101,18 @@ impl bindings::exports::custom::wechat::handler::Guest for CustomHandler {
 
         let prompt = msg.text_content.as_deref().unwrap_or("");
         if prompt.is_empty() {
-            log(Level::Warn, LOG_CTX, "WECHAT: empty message, skipping codex");
+            log(
+                Level::Warn,
+                LOG_CTX,
+                "WECHAT: empty message, skipping codex",
+            );
             return Ok(());
         }
 
         let reply = match codex::execute_for_chat(&msg.sender, prompt) {
             Ok(text) => text,
             Err(e) => {
-                log(
-                    Level::Error,
-                    LOG_CTX,
-                    &format!("WECHAT CODEX ERROR: {e}"),
-                );
+                log(Level::Error, LOG_CTX, &format!("WECHAT CODEX ERROR: {e}"));
                 format!("处理消息时出错: {e}")
             }
         };
@@ -122,7 +122,11 @@ impl bindings::exports::custom::wechat::handler::Guest for CustomHandler {
                 log(Level::Info, LOG_CTX, "WECHAT CODEX REPLY sent");
             }
             Err(e) => {
-                log(Level::Error, LOG_CTX, &format!("WECHAT CODEX REPLY failed: {:?}", e));
+                log(
+                    Level::Error,
+                    LOG_CTX,
+                    &format!("WECHAT CODEX REPLY failed: {:?}", e),
+                );
             }
         }
 

@@ -30,7 +30,7 @@ use wasmtime_wasi::p2::{
 
 use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use wash_runtime::engine::workload::WorkloadItem;
-use wash_runtime::plugin::{HostPlugin, WorkloadTracker};
+use wash_runtime::plugin::{HostPlugin, WorkloadTracker, find_interface};
 use wash_runtime::wit::{WitInterface, WitWorld};
 
 use custom_plugin_nats_utils::build_nats_connect_options;
@@ -474,11 +474,7 @@ impl HostPlugin for CustomBlobstore {
         item: &mut WorkloadItem<'a>,
         interfaces: HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
-        let blobstore_interface = interfaces
-            .iter()
-            .find(|i| i.namespace == "wasi" && i.package == "blobstore");
-
-        let Some(interface) = blobstore_interface else {
+        let Some(interface) = find_interface(&interfaces, "wasi", "blobstore") else {
             tracing::warn!(
                 "Blobstore plugin requested for non-wasi:blobstore interface(s): {:?}",
                 interfaces
