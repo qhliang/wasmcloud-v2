@@ -1,0 +1,128 @@
+version: 2.0.0-rc.7
+
+build:
+  command: cargo build --workspace --target wasm32-wasip2 --release
+  component_path: target/wasm32-wasip2/release/http_api.wasm
+
+dev:
+  wasi_keyvalue_cloudflare: x
+  wasi_blobstore_cloudflare: x
+  components:
+    - name: task-leet
+      file: target/wasm32-wasip2/release/task_leet.wasm
+    # llm-gateway-provider-proxy: replaces local provider with NATS-based remote proxy
+    # Build: cd crates/llm-gateway-provider-proxy && cargo build --target wasm32-wasip2 --release
+    - name: llm-gateway-provider-proxy
+      file: ../../../crates/llm-gateway-provider-proxy/target/wasm32-wasip2/release/llm_gateway_provider_proxy.wasm
+      config:
+        llm_request_subject: "llm-gateway.chat"
+        llm_request_timeout_ms: "30000"
+  host_interfaces:
+    - namespace: wasi
+      package: keyvalue
+      interfaces:
+        - store
+      config:
+        backend: cloudflare
+        account_id: YOUR_CF_ACCOUNT_ID
+        api_token: YOUR_CF_API_TOKEN
+        namespace_id: YOUR_CF_NAMESPACE_ID
+    - namespace: wasi
+      package: blobstore
+      interfaces:
+        - types
+        - container
+        - blobstore
+      config:
+        # Memory (default, no config needed)
+        # backend: memory
+
+        # S3 (Cloudflare R2)
+        backend: s3
+        root: "/"
+        bucket: YOUR_BUCKET_NAME
+        region: auto
+        endpoint: https://YOUR_CF_ACCOUNT_ID.r2.cloudflarestorage.com
+        access_key_id: YOUR_R2_ACCESS_KEY
+        secret_access_key: YOUR_R2_SECRET_KEY
+
+        # WebDAV
+        # backend: "webdav"
+        # endpoint: "https://dav.example.com/"
+        # username: "user"
+        # password: "pass"
+
+        # FTP
+        # backend: "ftp"
+        # endpoint: "ftp://ftp.example.com"
+        # username: "user"
+        # password: "pass"
+
+        # S3
+        # backend: "s3"
+        # bucket: "my-bucket"
+        # region: "us-east-1"
+        # endpoint: "https://s3.amazonaws.com"
+        # access_key_id: "xxx"
+        # secret_access_key: "xxx"
+
+        # Filesystem
+        # backend: "fs"
+        # root: "/tmp/blobstore"
+
+    - namespace: custom
+      package: cf-d1
+      interfaces:
+        - query
+      config:
+        account_id: YOUR_CF_ACCOUNT_ID
+        api_token: YOUR_CF_API_TOKEN
+        database_id: YOUR_D1_DATABASE_ID
+    - namespace: custom
+      package: dingtalk-stream
+      interfaces:
+        - sender
+      config:
+        client-id: YOUR_DINGTALK_CLIENT_ID
+        client-secret: YOUR_DINGTALK_CLIENT_SECRET
+    - namespace: custom
+      package: feishu
+      interfaces:
+        - sender
+      config:
+        app-id: YOUR_FEISHU_APP_ID
+        app-secret: YOUR_FEISHU_APP_SECRET
+    - namespace: custom
+      package: mail
+      interfaces:
+        - sender
+      config:
+        smtp-host: YOUR_SMTP_HOST
+        smtp-port: "587"
+        username: YOUR_SMTP_USERNAME
+        password: YOUR_SMTP_PASSWORD
+        default-from: YOUR_SENDER_EMAIL
+    - namespace: custom
+      package: codex
+      interfaces:
+        - executor
+        - session
+      config:
+        api_token: YOUR_CODEX_API_TOKEN
+        model: glm-5.1
+        codex_binary_path: "/usr/local/bin/codex"
+    - namespace: custom
+      package: wechat
+      interfaces:
+        - sender
+      config:
+        token: "YOUR_WECHAT_TOKEN"
+    - namespace: custom
+      package: telegram
+      interfaces:
+        - sender
+      config:
+        bot_token: "YOUR_TELEGRAM_BOT_TOKEN"
+
+new:
+  command: cargo fetch
