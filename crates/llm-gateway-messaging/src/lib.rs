@@ -99,10 +99,10 @@ impl bindings::exports::wasmcloud::messaging::handler::Guest for Component {
             .messages
             .iter()
             .map(|m| {
-                let role = match m.role.as_str() {
-                    "System" => ChatRole::System,
-                    "Assistant" => ChatRole::Assistant,
-                    "Tool" => ChatRole::Tool,
+                let role = match m.role.to_ascii_lowercase().as_str() {
+                    "system" => ChatRole::System,
+                    "assistant" => ChatRole::Assistant,
+                    "tool" => ChatRole::Tool,
                     _ => ChatRole::User,
                 };
                 let parts = match &m.content {
