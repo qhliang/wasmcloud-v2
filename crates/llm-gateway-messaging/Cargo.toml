@@ -10,6 +10,7 @@ crate-type = ["cdylib"]
 wit-bindgen = "0.46.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+llm-gateway-types = { path = "../llm-gateway-types" }
 
 [workspace]
 

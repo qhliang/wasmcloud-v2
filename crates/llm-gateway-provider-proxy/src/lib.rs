@@ -9,14 +9,15 @@ mod bindings {
     export!(Component);
 }
 
-use std::collections::BTreeMap;
-
 use bindings::custom::llm_gateway::types::{
     BinarySource, ChatMessage, ChatOptions, ChatResponse, ChatRole, ContentPart, LlmConfig,
     LlmError, MessageContent, StopReason, TokenUsage,
 };
 use bindings::exports::custom::llm_gateway::chat::Guest;
 use bindings::wasi::logging::logging::{Level, log};
+use llm_gateway_types::{
+    ChatOptionsJson, ChatResponseJson, ContentPartJson, ErrorReply, MessageContentJson,
+};
 
 const LOG_CTX: &str = "llm-gateway-proxy";
 const DEFAULT_SUBJECT: &str = "llm-gateway.chat";
@@ -24,89 +25,20 @@ const DEFAULT_TIMEOUT_MS: u32 = 30_000;
 
 struct Component;
 
-// --- Serde types matching llm-gateway-messaging JSON format ---
+// --- Request serialization type (proxy-specific) ---
 
 #[derive(serde::Serialize)]
 struct ChatRequest {
     model: String,
     messages: Vec<MessageOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    options: Option<OptionsOutput>,
+    options: Option<ChatOptionsJson>,
 }
 
 #[derive(serde::Serialize)]
 struct MessageOutput {
     role: String,
-    content: MessageContentOutput,
-}
-
-#[derive(serde::Serialize)]
-struct MessageContentOutput {
-    parts: Vec<ContentPartOutput>,
-}
-
-#[derive(serde::Serialize)]
-#[serde(untagged)]
-enum ContentPartOutput {
-    Text(String),
-}
-
-#[derive(serde::Serialize)]
-struct OptionsOutput {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    top_p: Option<f32>,
-}
-
-// --- Response parsing ---
-
-#[derive(serde::Deserialize)]
-struct ChatResponseInput {
-    content: MessageContentInput,
-    model: String,
-    #[serde(default)]
-    stop_reason: Option<StopReasonInput>,
-    #[serde(default)]
-    usage: Option<TokenUsageInput>,
-}
-
-#[derive(serde::Deserialize)]
-struct MessageContentInput {
-    parts: Vec<ContentPartInput>,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(untagged)]
-enum ContentPartInput {
-    Text(String),
-}
-
-#[derive(serde::Deserialize)]
-struct StopReasonInput {
-    #[serde(flatten)]
-    inner: BTreeMap<String, String>,
-}
-
-#[derive(serde::Deserialize)]
-struct TokenUsageInput {
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    total_tokens: u64,
-}
-
-#[derive(serde::Deserialize)]
-struct ErrorReply {
-    error: ErrorDetail,
-}
-
-#[derive(serde::Deserialize)]
-struct ErrorDetail {
-    #[serde(rename = "type")]
-    error_type: String,
-    message: String,
+    content: MessageContentJson,
 }
 
 impl Guest for Component {
@@ -149,28 +81,28 @@ impl Guest for Component {
                         ChatRole::Assistant => "Assistant".to_string(),
                         ChatRole::Tool => "Tool".to_string(),
                     },
-                    content: MessageContentOutput {
+                    content: MessageContentJson {
                         parts: m
                             .content
                             .parts
                             .iter()
                             .map(|p| match p {
-                                ContentPart::Text(s) => ContentPartOutput::Text(s.clone()),
+                                ContentPart::Text(s) => ContentPartJson::Text(s.clone()),
                                 ContentPart::Binary(b) => {
                                     let src = match &b.source {
                                         BinarySource::Url(u) => u.clone(),
                                         BinarySource::Base64(b64) => b64.clone(),
                                     };
-                                    ContentPartOutput::Text(format!(
+                                    ContentPartJson::Text(format!(
                                         "[binary:{}] {}",
                                         b.content_type, src
                                     ))
                                 }
-                                ContentPart::ToolCall(tc) => ContentPartOutput::Text(format!(
+                                ContentPart::ToolCall(tc) => ContentPartJson::Text(format!(
                                     "[tool_call:{}] {}",
                                     tc.fn_name, tc.fn_arguments
                                 )),
-                                ContentPart::ToolResponse(tr) => ContentPartOutput::Text(format!(
+                                ContentPart::ToolResponse(tr) => ContentPartJson::Text(format!(
                                     "[tool_response] {}",
                                     tr.content
                                 )),
@@ -179,7 +111,7 @@ impl Guest for Component {
                     },
                 })
                 .collect(),
-            options: options.map(|o| OptionsOutput {
+            options: options.map(|o| ChatOptionsJson {
                 temperature: o.temperature,
                 max_tokens: o.max_tokens,
                 top_p: o.top_p,
@@ -223,7 +155,7 @@ impl Guest for Component {
         }
 
         // Parse success response
-        let response: ChatResponseInput = serde_json::from_str(reply_str)
+        let response: ChatResponseJson = serde_json::from_str(reply_str)
             .map_err(|e| LlmError::Unexpected(format!("failed to parse response: {e}")))?;
 
         let content = MessageContent {
@@ -232,7 +164,7 @@ impl Guest for Component {
                 .parts
                 .into_iter()
                 .map(|p| match p {
-                    ContentPartInput::Text(s) => ContentPart::Text(s),
+                    ContentPartJson::Text(s) => ContentPart::Text(s),
                 })
                 .collect(),
         };

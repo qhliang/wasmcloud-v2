@@ -18,19 +18,23 @@ use bindings::custom::llm_gateway::types::{
 };
 use bindings::wasi::logging::logging::{Level, log};
 use bindings::wasmcloud::messaging::types::BrokerMessage;
+use llm_gateway_types::{
+    ChatOptionsJson, ChatResponseJson, ContentPartJson, ErrorDetail, ErrorReply, MessageContentJson,
+    StopReasonJson, TokenUsageJson,
+};
 
 const LOG_CTX: &str = "llm-gateway-msg";
 
 struct Component;
 
-// --- Serde types for JSON deserialization/serialization ---
+// --- Messaging-specific input types (backward-compat content parsing) ---
 
 #[derive(serde::Deserialize)]
 struct ChatRequest {
     model: String,
     messages: Vec<MessageInput>,
     #[serde(default)]
-    options: Option<OptionsInput>,
+    options: Option<ChatOptionsJson>,
 }
 
 #[derive(serde::Deserialize)]
@@ -47,70 +51,10 @@ enum MessageContentInput {
     Text(String),
 }
 
-/// Individual content part in incoming JSON.
 #[derive(serde::Deserialize)]
 #[serde(untagged)]
 enum ContentPartInput {
     Text(String),
-}
-
-#[derive(serde::Deserialize)]
-struct OptionsInput {
-    #[serde(default)]
-    temperature: Option<f32>,
-    #[serde(default)]
-    max_tokens: Option<u32>,
-    #[serde(default)]
-    top_p: Option<f32>,
-}
-
-// --- Output types (genai-compatible NATS JSON) ---
-
-#[derive(serde::Serialize)]
-struct ChatResponseOutput {
-    content: MessageContentOutput,
-    model: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stop_reason: Option<StopReasonOutput>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    usage: Option<TokenUsageOutput>,
-}
-
-#[derive(serde::Serialize)]
-struct MessageContentOutput {
-    parts: Vec<ContentPartOutput>,
-}
-
-#[derive(serde::Serialize)]
-#[serde(untagged)]
-enum ContentPartOutput {
-    Text(String),
-}
-
-/// Serializes as a single-key map, e.g. `{"Completed": "stop"}`.
-#[derive(serde::Serialize)]
-struct StopReasonOutput {
-    #[serde(flatten)]
-    inner: BTreeMap<String, String>,
-}
-
-#[derive(serde::Serialize)]
-struct TokenUsageOutput {
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    total_tokens: u64,
-}
-
-#[derive(serde::Serialize)]
-struct ErrorReply {
-    error: ErrorDetail,
-}
-
-#[derive(serde::Serialize)]
-struct ErrorDetail {
-    #[serde(rename = "type")]
-    error_type: String,
-    message: String,
 }
 
 impl bindings::exports::wasmcloud::messaging::handler::Guest for Component {
@@ -191,14 +135,14 @@ impl bindings::exports::wasmcloud::messaging::handler::Guest for Component {
 
         match chat::chat(&request.model, &messages, options, None) {
             Ok(response) => {
-                let output = ChatResponseOutput {
-                    content: MessageContentOutput {
+                let output = ChatResponseJson {
+                    content: MessageContentJson {
                         parts: response
                             .content
                             .parts
                             .into_iter()
                             .map(|p| match p {
-                                ContentPart::Text(s) => ContentPartOutput::Text(s),
+                                ContentPart::Text(s) => ContentPartJson::Text(s),
                                 ContentPart::Binary(BinaryPart {
                                     content_type,
                                     source,
@@ -208,7 +152,7 @@ impl bindings::exports::wasmcloud::messaging::handler::Guest for Component {
                                         BinarySource::Url(u) => u,
                                         BinarySource::Base64(b) => b,
                                     };
-                                    ContentPartOutput::Text(format!(
+                                    ContentPartJson::Text(format!(
                                         "[binary:{content_type}] {src}"
                                     ))
                                 }
@@ -217,14 +161,14 @@ impl bindings::exports::wasmcloud::messaging::handler::Guest for Component {
                                     fn_name,
                                     fn_arguments,
                                 }) => {
-                                    ContentPartOutput::Text(format!(
+                                    ContentPartJson::Text(format!(
                                         "[tool_call:{fn_name}] {fn_arguments}"
                                     ))
                                 }
                                 ContentPart::ToolResponse(ToolResponse {
                                     call_id: _,
                                     content: c,
-                                }) => ContentPartOutput::Text(format!("[tool_response] {c}")),
+                                }) => ContentPartJson::Text(format!("[tool_response] {c}")),
                             })
                             .collect(),
                     },
@@ -240,9 +184,9 @@ impl bindings::exports::wasmcloud::messaging::handler::Guest for Component {
                         };
                         let mut map = BTreeMap::new();
                         map.insert(key.to_string(), val);
-                        StopReasonOutput { inner: map }
+                        StopReasonJson { inner: map }
                     }),
-                    usage: response.usage.map(|u| TokenUsageOutput {
+                    usage: response.usage.map(|u| TokenUsageJson {
                         prompt_tokens: u.prompt_tokens,
                         completion_tokens: u.completion_tokens,
                         total_tokens: u.total_tokens,
