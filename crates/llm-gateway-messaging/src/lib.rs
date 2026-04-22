@@ -128,7 +128,7 @@ impl bindings::exports::wasmcloud::messaging::handler::Guest for Component {
         log(
             Level::Info,
             LOG_CTX,
-            &format!("calling chat with model: {}", request.model),
+            &format!("calling chat with model: {request_model}", request_model = request.model),
         );
 
         match chat::chat(&request.model, &messages, options, None) {

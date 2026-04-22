@@ -147,8 +147,9 @@ impl CliCommand for DevCommand {
         debug!("Cloudflare D1 plugin enabled");
 
         // Enable LLM gateway plugin
-        host_builder =
-            host_builder.with_plugin(Arc::new(custom_plugin_llm_gateway_provider::LlmGateway::new()))?;
+        host_builder = host_builder.with_plugin(Arc::new(
+            custom_plugin_llm_gateway_provider::LlmGateway::new(),
+        ))?;
         debug!("LLM gateway plugin enabled");
 
         // Enable crontab plugin
