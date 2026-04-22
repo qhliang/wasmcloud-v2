@@ -10,6 +10,13 @@ dev:
   components:
     - name: task-leet
       file: target/wasm32-wasip2/release/task_leet.wasm
+    # llm-gateway-provider-proxy: replaces local provider with NATS-based remote proxy
+    # Build: cd crates/llm-gateway-provider-proxy && cargo build --target wasm32-wasip2 --release
+    - name: llm-gateway-provider-proxy
+      file: ../../../crates/llm-gateway-provider-proxy/target/wasm32-wasip2/release/llm_gateway_provider_proxy.wasm
+      config:
+        llm_request_subject: "llm-gateway.chat"
+        llm_request_timeout_ms: "30000"
   #   - name: cf-r2
   #     file: target/wasm32-wasip2/release/cf_r2.wasm
   #     config:
@@ -85,17 +92,18 @@ dev:
         account_id: 4e4a9cbc00e5e3a6c07597fb44cf7be4
         api_token: cfut_MYnNBIzZZBjgrcTMt0ZXrbNBocs2BU2bRvubOF8Qa345f31d
         database_id: 1995ea7e-d2b1-42ab-9556-82dbd8a5b6e9
-    - namespace: custom
-      package: llm-gateway
-      interfaces:
-        - chat
-        # - chat-streaming
-      config:
-        provider: openai-compat
-        base_url: https://openrouter.ai/api/v1/
-        # base_url: https://openrouter.ai/api/v1/chat/completions
-        model_name: z-ai/glm-4.5-air:free
-        api_key: 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
+    # Replaced by llm-gateway-provider-proxy component (NATS-based remote proxy)
+    # - namespace: custom
+    #   package: llm-gateway
+    #   interfaces:
+    #     - chat
+    #     # - chat-streaming
+    #   config:
+    #     provider: openai-compat
+    #     base_url: https://openrouter.ai/api/v1/
+    #     # base_url: https://openrouter.ai/api/v1/chat/completions
+    #     model_name: z-ai/glm-4.5-air:free
+    #     api_key: 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
     - namespace: custom
       package: dingtalk-stream
       interfaces:
