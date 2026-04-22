@@ -68,8 +68,10 @@ mod bindings {
 }
 
 use bindings::custom::llm_gateway::types::{
-    ChatChunk, ChatMessage, ChatOptions as WitChatOptions, ChatResponse, ChatStreamEvent,
-    LlmConfig, LlmError, StreamEnd as WitStreamEnd, TokenUsage,
+    BinaryPart, BinarySource, ChatChunk, ChatMessage, ChatOptions as WitChatOptions, ChatResponse,
+    ChatRole, ChatStreamEvent, ContentPart, LlmConfig, LlmError,
+    MessageContent as WitMessageContent, StopReason, StreamEnd as WitStreamEnd, TokenUsage,
+    ToolCall, ToolResponse,
 };
 
 const PLUGIN_ID: &str = "llm-gateway-provider";
@@ -416,21 +418,70 @@ fn extract_config(
 // Type conversion helpers
 // ============================================================================
 
-pub(crate) fn to_genai_role(role: &str) -> genai::chat::ChatRole {
+pub(crate) fn to_genai_role(role: ChatRole) -> genai::chat::ChatRole {
+    match role {
+        ChatRole::System => genai::chat::ChatRole::System,
+        ChatRole::User => genai::chat::ChatRole::User,
+        ChatRole::Assistant => genai::chat::ChatRole::Assistant,
+        ChatRole::Tool => genai::chat::ChatRole::Tool,
+    }
+}
+
+/// Convert a string role from preset prompts to genai ChatRole.
+/// Preset prompts are configured as JSON with string roles.
+fn to_genai_role_from_str(role: &str) -> genai::chat::ChatRole {
     match role {
         "system" => genai::chat::ChatRole::System,
         "assistant" => genai::chat::ChatRole::Assistant,
+        "tool" => genai::chat::ChatRole::Tool,
         _ => genai::chat::ChatRole::User,
+    }
+}
+
+fn to_genai_content_part(part: ContentPart) -> genai::chat::ContentPart {
+    match part {
+        ContentPart::Text(s) => genai::chat::ContentPart::Text(s),
+        ContentPart::Binary(b) => genai::chat::ContentPart::Binary(genai::chat::Binary {
+            content_type: b.content_type,
+            source: match b.source {
+                BinarySource::Url(u) => genai::chat::BinarySource::Url(u),
+                BinarySource::Base64(b64) => {
+                    genai::chat::BinarySource::Base64(std::sync::Arc::from(b64.as_str()))
+                }
+            },
+            name: b.name,
+        }),
+        ContentPart::ToolCall(tc) => genai::chat::ContentPart::ToolCall(genai::chat::ToolCall {
+            call_id: tc.call_id,
+            fn_name: tc.fn_name,
+            fn_arguments: serde_json::from_str(&tc.fn_arguments).unwrap_or(serde_json::Value::Null),
+            thought_signatures: None,
+        }),
+        ContentPart::ToolResponse(tr) => {
+            genai::chat::ContentPart::ToolResponse(genai::chat::ToolResponse {
+                call_id: tr.call_id,
+                content: tr.content,
+            })
+        }
     }
 }
 
 fn to_genai_messages(messages: Vec<ChatMessage>) -> Vec<GenaiChatMessage> {
     messages
         .into_iter()
-        .map(|m| match to_genai_role(&m.role) {
-            genai::chat::ChatRole::System => GenaiChatMessage::system(&m.content),
-            genai::chat::ChatRole::Assistant => GenaiChatMessage::assistant(&m.content),
-            _ => GenaiChatMessage::user(&m.content),
+        .map(|m| {
+            let role = to_genai_role(m.role);
+            let parts: Vec<genai::chat::ContentPart> = m
+                .content
+                .parts
+                .into_iter()
+                .map(to_genai_content_part)
+                .collect();
+            GenaiChatMessage {
+                role,
+                content: genai::chat::MessageContent::from_parts(parts),
+                options: None,
+            }
         })
         .collect()
 }
@@ -468,6 +519,53 @@ fn build_chat_options(
     }
 
     opts
+}
+
+fn to_wit_stop_reason(reason: genai::chat::StopReason) -> StopReason {
+    match reason {
+        genai::chat::StopReason::Completed(s) => StopReason::Completed(s),
+        genai::chat::StopReason::MaxTokens(s) => StopReason::MaxTokens(s),
+        genai::chat::StopReason::ToolCall(s) => StopReason::ToolCall(s),
+        genai::chat::StopReason::ContentFilter(s) => StopReason::ContentFilter(s),
+        genai::chat::StopReason::StopSequence(s) => StopReason::StopSequence(s),
+        genai::chat::StopReason::Other(s) => StopReason::Other(s),
+    }
+}
+
+fn to_wit_message_content(mc: genai::chat::MessageContent) -> WitMessageContent {
+    WitMessageContent {
+        parts: mc
+            .into_parts()
+            .into_iter()
+            .map(to_wit_content_part)
+            .collect(),
+    }
+}
+
+fn to_wit_content_part(part: genai::chat::ContentPart) -> ContentPart {
+    match part {
+        genai::chat::ContentPart::Text(s) => ContentPart::Text(s),
+        genai::chat::ContentPart::Binary(b) => ContentPart::Binary(BinaryPart {
+            content_type: b.content_type,
+            source: match b.source {
+                genai::chat::BinarySource::Url(u) => BinarySource::Url(u),
+                genai::chat::BinarySource::Base64(b64) => BinarySource::Base64(b64.to_string()),
+            },
+            name: b.name,
+        }),
+        genai::chat::ContentPart::ToolCall(tc) => ContentPart::ToolCall(ToolCall {
+            call_id: tc.call_id,
+            fn_name: tc.fn_name,
+            fn_arguments: serde_json::to_string(&tc.fn_arguments)
+                .unwrap_or_else(|_| "null".to_string()),
+        }),
+        genai::chat::ContentPart::ToolResponse(tr) => ContentPart::ToolResponse(ToolResponse {
+            call_id: tr.call_id,
+            content: tr.content,
+        }),
+        // Skip provider-internal variants (ThoughtSignature, ReasoningContent, Custom)
+        _ => ContentPart::Text(String::new()),
+    }
 }
 
 fn to_llm_error(err: genai::Error) -> LlmError {
@@ -591,7 +689,7 @@ impl<'a> bindings::custom::llm_gateway::chat::Host for ActiveCtx<'a> {
 
         // Add preset system prompts
         for prompt in &interface_config.system_prompts {
-            match to_genai_role(&prompt.role) {
+            match to_genai_role_from_str(&prompt.role) {
                 genai::chat::ChatRole::System => {
                     all_messages.push(GenaiChatMessage::system(&prompt.content));
                 }
@@ -625,7 +723,8 @@ impl<'a> bindings::custom::llm_gateway::chat::Host for ActiveCtx<'a> {
         };
 
         // Convert response
-        let content = chat_res.first_text().unwrap_or("").to_string();
+        let wit_content = to_wit_message_content(chat_res.content);
+        let wit_stop_reason = chat_res.stop_reason.map(to_wit_stop_reason);
         let response_model = chat_res.model_iden.model_name.to_string();
         let usage = TokenUsage {
             prompt_tokens: chat_res.usage.prompt_tokens.unwrap_or(0) as u64,
@@ -636,17 +735,17 @@ impl<'a> bindings::custom::llm_gateway::chat::Host for ActiveCtx<'a> {
         debug!(
             workload_id = %workload_id,
             model = %response_model,
-            content_len = content.len(),
+            content_parts = wit_content.parts.len(),
             prompt_tokens = usage.prompt_tokens,
             completion_tokens = usage.completion_tokens,
             "LLM chat request completed"
         );
 
         Ok(Ok(ChatResponse {
-            content,
+            content: wit_content,
             model: response_model,
+            stop_reason: wit_stop_reason,
             usage: Some(usage),
-            finish_reason: None,
         }))
     }
 }
@@ -756,7 +855,7 @@ impl<'a> bindings::custom::llm_gateway::chat_streaming::Host for ActiveCtx<'a> {
         // Build chat request: prepend preset prompts, then user messages
         let mut all_messages = Vec::new();
         for prompt in &interface_config.system_prompts {
-            match to_genai_role(&prompt.role) {
+            match to_genai_role_from_str(&prompt.role) {
                 genai::chat::ChatRole::System => {
                     all_messages.push(GenaiChatMessage::system(&prompt.content));
                 }
@@ -836,13 +935,13 @@ impl<'a> bindings::custom::llm_gateway::chat_streaming::HostChatStream for Activ
                             total_tokens: u.total_tokens.unwrap_or(0) as u64,
                         });
 
-                        let finish_reason =
-                            stream_end.captured_stop_reason.map(|r| format!("{r:?}"));
+                        let wit_stop_reason =
+                            stream_end.captured_stop_reason.map(to_wit_stop_reason);
 
                         events.push(ChatStreamEvent::End(WitStreamEnd {
                             model,
                             usage,
-                            finish_reason,
+                            stop_reason: wit_stop_reason,
                         }));
                         ended = true;
                         handle.ended = true;
@@ -1007,18 +1106,20 @@ mod tests {
     #[test]
     fn test_to_genai_role() {
         assert!(matches!(
-            to_genai_role("system"),
+            to_genai_role(ChatRole::System),
             genai::chat::ChatRole::System
         ));
         assert!(matches!(
-            to_genai_role("assistant"),
+            to_genai_role(ChatRole::Assistant),
             genai::chat::ChatRole::Assistant
         ));
-        assert!(matches!(to_genai_role("user"), genai::chat::ChatRole::User));
-        assert!(matches!(to_genai_role("tool"), genai::chat::ChatRole::User));
         assert!(matches!(
-            to_genai_role("unknown"),
+            to_genai_role(ChatRole::User),
             genai::chat::ChatRole::User
+        ));
+        assert!(matches!(
+            to_genai_role(ChatRole::Tool),
+            genai::chat::ChatRole::Tool
         ));
     }
 
@@ -1026,16 +1127,22 @@ mod tests {
     fn test_to_genai_messages() {
         let messages = vec![
             ChatMessage {
-                role: "system".to_string(),
-                content: "You are helpful".to_string(),
+                role: ChatRole::System,
+                content: WitMessageContent {
+                    parts: vec![ContentPart::Text("You are helpful".to_string())],
+                },
             },
             ChatMessage {
-                role: "user".to_string(),
-                content: "Hello".to_string(),
+                role: ChatRole::User,
+                content: WitMessageContent {
+                    parts: vec![ContentPart::Text("Hello".to_string())],
+                },
             },
             ChatMessage {
-                role: "assistant".to_string(),
-                content: "Hi there".to_string(),
+                role: ChatRole::Assistant,
+                content: WitMessageContent {
+                    parts: vec![ContentPart::Text("Hi there".to_string())],
+                },
             },
         ];
         let genai_msgs = to_genai_messages(messages);
