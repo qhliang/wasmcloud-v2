@@ -3,7 +3,7 @@ use wstd::http::{Body, Request, Response, StatusCode};
 use crate::LOG_CTX;
 use crate::bindings::custom::llm_gateway::chat;
 use crate::bindings::custom::llm_gateway::types::{
-    ChatMessage, ChatOptions, ChatRole, ContentPart, LlmError, MessageContent as WitMessageContent,
+    ChatMessage, ChatOptions, ChatRole, ContentPart, MessageContent as WitMessageContent,
     StopReason as WitStopReason,
 };
 use crate::bindings::wasi::logging::logging::{Level, log};
@@ -13,35 +13,6 @@ use crate::types::{
     ResponsesResponse, ResponsesUsage,
 };
 
-static MSG_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-fn generate_msg_id() -> String {
-    let id = MSG_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("msg_{id:016x}")
-}
-
-fn map_error_status(e: &LlmError) -> StatusCode {
-    match e {
-        LlmError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
-        LlmError::AuthenticationError(_) => StatusCode::UNAUTHORIZED,
-        LlmError::ProviderError(_) => StatusCode::BAD_GATEWAY,
-        LlmError::RateLimitError(_) => StatusCode::TOO_MANY_REQUESTS,
-        LlmError::ModelNotFound(_) => StatusCode::NOT_FOUND,
-        LlmError::Unexpected(_) => StatusCode::INTERNAL_SERVER_ERROR,
-    }
-}
-
-fn map_error_type(e: &LlmError) -> String {
-    match e {
-        LlmError::InvalidRequest(_) => "invalid_request_error",
-        LlmError::AuthenticationError(_) => "authentication_error",
-        LlmError::ProviderError(_) => "api_error",
-        LlmError::RateLimitError(_) => "rate_limit_error",
-        LlmError::ModelNotFound(_) => "not_found_error",
-        LlmError::Unexpected(_) => "api_error",
-    }
-    .to_string()
-}
 
 /// Extract text content from an Anthropic-style message.
 /// Anthropic `content` can be a plain string or an array of content blocks.
@@ -197,7 +168,7 @@ pub async fn handle(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
                 .unwrap_or_else(|| "end_turn".to_string());
 
             let result = ResponsesResponse {
-                id: generate_msg_id(),
+                id: helpers::generate_id("msg_"),
                 response_type: "message".to_string(),
                 role: "assistant".to_string(),
                 model: response.model,
@@ -217,10 +188,10 @@ pub async fn handle(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
         Err(e) => {
             log(Level::Error, LOG_CTX, &format!("responses error: {e:?}"));
 
-            let status = map_error_status(&e);
+            let status = helpers::map_error_status(&e);
             let err = ResponsesError {
                 error: ResponsesErrorDetail {
-                    error_type: map_error_type(&e),
+                    error_type: helpers::map_error_type(&e),
                     message: Some(format!("{e:?}")),
                 },
             };

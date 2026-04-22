@@ -1,11 +1,9 @@
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use wstd::http::{Body, Request, Response, StatusCode};
 
 use crate::LOG_CTX;
 use crate::bindings::custom::llm_gateway::chat;
 use crate::bindings::custom::llm_gateway::types::{
-    ChatMessage, ChatOptions, ChatRole, ContentPart, LlmError, MessageContent as WitMessageContent,
+    ChatMessage, ChatOptions, ChatRole, ContentPart, MessageContent as WitMessageContent,
     StopReason as WitStopReason,
 };
 use crate::bindings::wasi::logging::logging::{Level, log};
@@ -14,36 +12,6 @@ use crate::types::{
     CompletionsChoice, CompletionsError, CompletionsErrorDetail, CompletionsRequest,
     CompletionsResponse, CompletionsResponseMessage, CompletionsUsage,
 };
-
-static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
-
-fn generate_id() -> String {
-    let id = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{id:016x}")
-}
-
-fn map_error_status(e: &LlmError) -> StatusCode {
-    match e {
-        LlmError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
-        LlmError::AuthenticationError(_) => StatusCode::UNAUTHORIZED,
-        LlmError::ProviderError(_) => StatusCode::BAD_GATEWAY,
-        LlmError::RateLimitError(_) => StatusCode::TOO_MANY_REQUESTS,
-        LlmError::ModelNotFound(_) => StatusCode::NOT_FOUND,
-        LlmError::Unexpected(_) => StatusCode::INTERNAL_SERVER_ERROR,
-    }
-}
-
-fn map_error_type(e: &LlmError) -> String {
-    match e {
-        LlmError::InvalidRequest(_) => "invalid_request_error",
-        LlmError::AuthenticationError(_) => "authentication_error",
-        LlmError::ProviderError(_) => "server_error",
-        LlmError::RateLimitError(_) => "rate_limit_error",
-        LlmError::ModelNotFound(_) => "invalid_request_error",
-        LlmError::Unexpected(_) => "server_error",
-    }
-    .to_string()
-}
 
 
 pub async fn handle(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
@@ -157,7 +125,7 @@ pub async fn handle(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
                 .unwrap_or_else(|| "stop".to_string());
 
             let result = CompletionsResponse {
-                id: format!("chatcmpl-{}", generate_id()),
+                id: helpers::generate_id("chatcmpl-"),
                 object: "chat.completion",
                 model: response.model,
                 choices: vec![CompletionsChoice {
@@ -180,13 +148,13 @@ pub async fn handle(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
         Err(e) => {
             log(Level::Error, LOG_CTX, &format!("completions error: {e:?}"));
 
-            let status = map_error_status(&e);
+            let status = helpers::map_error_status(&e);
             let err = CompletionsError {
                 error: CompletionsErrorDetail {
                     code: None,
                     message: Some(format!("{e:?}")),
                     param: None,
-                    r#type: Some(map_error_type(&e)),
+                    r#type: Some(helpers::map_error_type(&e)),
                 },
             };
 
