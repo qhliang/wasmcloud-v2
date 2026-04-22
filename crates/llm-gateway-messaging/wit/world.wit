@@ -1,0 +1,8 @@
+package wasmcloud:llm-gateway-messaging@0.1.0;
+
+world llm-gateway-messaging {
+    import wasi:logging/logging@0.1.0-draft;
+    import wasmcloud:messaging/consumer@0.2.0;
+    import custom:llm-gateway/chat@0.1.0;
+    export wasmcloud:messaging/handler@0.2.0;
+}
