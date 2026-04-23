@@ -1,4 +1,4 @@
-# llm-gateway-provider-proxy 设计
+# llm-gateway-messaging-proxy 设计
 
 ## 背景
 
@@ -8,7 +8,7 @@
 
 ## 目标
 
-创建 `llm-gateway-provider-proxy` wasm component，让没有本地 provider plugin 的 wasmCloud host 上的 component 也能通过 `custom:llm-gateway/chat` WIT 接口调用远端 LLM。
+创建 `llm-gateway-messaging-proxy` wasm component，让没有本地 provider plugin 的 wasmCloud host 上的 component 也能通过 `custom:llm-gateway/chat` WIT 接口调用远端 LLM。
 
 ## 架构
 
@@ -21,7 +21,7 @@ Host B (无 provider)
                 │ WIT call
                 ▼
 ┌─────────────────────────────────────────┐
-│  llm-gateway-provider-proxy (wasm)      │
+│  llm-gateway-messaging-proxy (wasm)      │
 │  导出 custom:llm-gateway/chat            │
 │  导入 wasmcloud:messaging/consumer       │
 │                                          │
@@ -41,17 +41,17 @@ Host B (无 provider)
 
 ## 制品
 
-### llm-gateway-provider-proxy（wasm component，新建）
+### llm-gateway-messaging-proxy（wasm component，新建）
 
-**位置**: `crates/llm-gateway-provider-proxy/`
+**位置**: `crates/llm-gateway-messaging-proxy/`
 
 **目标平台**: `wasm32-wasip2`
 
 **WIT world**:
 ```wit
-package wasmcloud:llm-gateway-provider-proxy@0.1.0;
+package wasmcloud:llm-gateway-messaging-proxy@0.1.0;
 
-world llm-gateway-provider-proxy {
+world llm-gateway-messaging-proxy {
   import wasi:logging/logging@0.1.0-draft;
   import wasmcloud:messaging/consumer@0.2.0;
   export custom:llm-gateway/chat@0.1.0;
@@ -100,7 +100,7 @@ world llm-gateway-provider-proxy {
 
 **代码结构**:
 ```
-crates/llm-gateway-provider-proxy/
+crates/llm-gateway-messaging-proxy/
 ├── Cargo.toml
 ├── wit/
 │   ├── world.wit

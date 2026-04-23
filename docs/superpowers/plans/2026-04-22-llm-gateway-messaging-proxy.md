@@ -1,8 +1,8 @@
-# llm-gateway-provider-proxy 实现计划
+# llm-gateway-messaging-proxy 实现计划
 
 ## Task 1: 创建 scaffolding
 
-**文件**: `crates/llm-gateway-provider-proxy/`（新建）
+**文件**: `crates/llm-gateway-messaging-proxy/`（新建）
 
 - `Cargo.toml` — wit-bindgen 0.46.0, serde, serde_json, edition 2024, cdylib
 - `wit/world.wit` — 导入 wasi:logging, wasmcloud:messaging/consumer, wasi:config/store; 导出 custom:llm-gateway/chat

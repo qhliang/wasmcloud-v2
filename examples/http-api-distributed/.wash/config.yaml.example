@@ -10,10 +10,10 @@ dev:
   components:
     - name: task-leet
       file: target/wasm32-wasip2/release/task_leet.wasm
-    # llm-gateway-provider-proxy: replaces local provider with NATS-based remote proxy
-    # Build: cd crates/llm-gateway-provider-proxy && cargo build --target wasm32-wasip2 --release
-    - name: llm-gateway-provider-proxy
-      file: ../../../crates/llm-gateway-provider-proxy/target/wasm32-wasip2/release/llm_gateway_provider_proxy.wasm
+    # llm-gateway-messaging-proxy: replaces local provider with NATS-based remote proxy
+    # Build: cd crates/llm-gateway-messaging-proxy && cargo build --target wasm32-wasip2 --release
+    - name: llm-gateway-messaging-proxy
+      file: ../../../crates/llm-gateway-messaging-proxy/target/wasm32-wasip2/release/llm_gateway_messaging_proxy.wasm
       config:
         llm_request_subject: "llm-gateway.chat"
         llm_request_timeout_ms: "30000"

@@ -2,7 +2,7 @@ mod bindings {
     use crate::Component;
 
     wit_bindgen::generate!({
-        world: "llm-gateway-provider-proxy",
+        world: "llm-gateway-messaging-proxy",
         generate_all,
     });
 
