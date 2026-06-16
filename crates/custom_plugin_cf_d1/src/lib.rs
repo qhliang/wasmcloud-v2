@@ -623,8 +623,7 @@ impl HostPlugin for CloudflareD1 {
         item: &mut WorkloadItem<'a>,
         interfaces: HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
-        let Some(interface) = find_interface(&interfaces, "custom", "cf-d1")
-        else {
+        let Some(interface) = find_interface(&interfaces, "custom", "cf-d1") else {
             tracing::warn!(
                 "CloudflareD1 plugin requested for non-cf:d1 interface(s): {:?}",
                 interfaces

@@ -1234,8 +1234,7 @@ impl HostPlugin for Codex {
         interfaces: HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
         // Only handle codex interfaces
-        let Some(interface) = find_interface(&interfaces, "custom", "codex")
-        else {
+        let Some(interface) = find_interface(&interfaces, "custom", "codex") else {
             return Ok(());
         };
 

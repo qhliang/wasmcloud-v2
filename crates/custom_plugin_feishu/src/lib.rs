@@ -1289,8 +1289,7 @@ impl HostPlugin for Feishu {
         item: &mut wash_runtime::engine::workload::WorkloadItem<'a>,
         interfaces: HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
-        let Some(interface) = find_interface(&interfaces, "custom", "feishu")
-        else {
+        let Some(interface) = find_interface(&interfaces, "custom", "feishu") else {
             return Ok(());
         };
 

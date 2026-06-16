@@ -503,8 +503,7 @@ impl HostPlugin for Wechat {
         item: &mut WorkloadItem<'a>,
         interfaces: HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
-        let Some(interface) = find_interface(&interfaces, "custom", "wechat")
-        else {
+        let Some(interface) = find_interface(&interfaces, "custom", "wechat") else {
             return Ok(());
         };
 

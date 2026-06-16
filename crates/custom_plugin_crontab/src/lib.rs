@@ -602,8 +602,7 @@ impl HostPlugin for Crontab {
         interfaces: HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
         // Only handle crontab interfaces
-        let Some(interface) = find_interface(&interfaces, "custom", "crontab")
-        else {
+        let Some(interface) = find_interface(&interfaces, "custom", "crontab") else {
             return Ok(());
         };
 

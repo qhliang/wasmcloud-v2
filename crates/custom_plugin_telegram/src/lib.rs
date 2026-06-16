@@ -381,8 +381,7 @@ impl HostPlugin for Telegram {
         item: &mut wash_runtime::engine::workload::WorkloadItem<'a>,
         interfaces: HashSet<WitInterface>,
     ) -> anyhow::Result<()> {
-        let Some(interface) = find_interface(&interfaces, "custom", "telegram")
-        else {
+        let Some(interface) = find_interface(&interfaces, "custom", "telegram") else {
             return Ok(());
         };
 
