@@ -18,7 +18,6 @@ worktrees/
 
 # AI things
 .claude
-CLAUDE.md
 
 # WIT dependencies (fetched by wash build / build scripts)
 examples/*/wit/deps/
