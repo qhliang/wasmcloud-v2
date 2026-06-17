@@ -9,16 +9,15 @@ use anyhow::{Context, Result};
 use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 use tokio::time::timeout;
 
+use custom_plugin_blobstore::CustomBlobstore;
+use custom_plugin_kv::MultiBackendKeyValue;
 use wash_runtime::{
     engine::Engine,
     host::{
         HostApi, HostBuilder,
         http::{DevRouter, HttpServer},
     },
-    plugin::{
-        wasi_blobstore::InMemoryBlobstore, wasi_config::DynamicConfig,
-        wasi_keyvalue::InMemoryKeyValue, wasi_logging::TracingLogger,
-    },
+    plugin::{wasi_config::DynamicConfig, wasi_logging::TracingLogger},
     types::{Component, LocalResources, Workload, WorkloadStartRequest},
     wit::WitInterface,
 };
@@ -84,8 +83,8 @@ async fn start_host_with_tls(
     let host = HostBuilder::new()
         .with_engine(engine)
         .with_http_handler(Arc::new(http_server))
-        .with_plugin(Arc::new(InMemoryBlobstore::new(None)))?
-        .with_plugin(Arc::new(InMemoryKeyValue::new()))?
+        .with_plugin(Arc::new(CustomBlobstore::default()))?
+        .with_plugin(Arc::new(MultiBackendKeyValue::default()))?
         .with_plugin(Arc::new(TracingLogger::default()))?
         .with_plugin(Arc::new(DynamicConfig::default()))?
         .build()?;
