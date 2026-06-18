@@ -299,6 +299,16 @@ jobs:
           chmod +x ./wash-bin/wash
           echo "WASH_BIN=$(pwd)/wash-bin/wash" >> "$GITHUB_ENV"
 
+      - name: Create minimal wash config
+        working-directory: examples/http-api-distributed
+        run: |
+          mkdir -p .wash
+          cat > .wash/config.yaml <<'EOF'
+          build:
+            command: cargo build --workspace --target wasm32-wasip2 --release
+            component_path: target/wasm32-wasip2/release/http_api.wasm
+          EOF
+
       - name: Build wasm components
         working-directory: examples/http-api-distributed
         run: |
