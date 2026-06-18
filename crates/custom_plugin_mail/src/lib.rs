@@ -20,7 +20,7 @@ use tracing::debug;
 use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use wash_runtime::engine::workload::WorkloadItem;
 use wash_runtime::plugin::config::{resolve_field, resolve_optional_field};
-use wash_runtime::plugin::{HostPlugin, find_interface};
+use wash_runtime::plugin::{HostPlugin, WitInterfaces};
 use wash_runtime::wit::{WitInterface, WitWorld};
 use wasmtime::component::Resource;
 
@@ -111,7 +111,7 @@ impl<'a> bindings::custom::mail::sender::HostMailClient for ActiveCtx<'a> {
         &mut self,
         config: Option<MailConfig>,
     ) -> wasmtime::Result<Resource<MailClientHandle>> {
-        let Some(plugin) = self.get_plugin::<Mail>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<Mail>(PLUGIN_ID) else {
             return Err(wasmtime::Error::msg("mail plugin not available"));
         };
 
@@ -686,9 +686,9 @@ impl HostPlugin for Mail {
     async fn on_workload_item_bind<'a>(
         &self,
         component_handle: &mut WorkloadItem<'a>,
-        interfaces: HashSet<WitInterface>,
+        interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
-        let Some(interface) = find_interface(&interfaces, "custom", "mail") else {
+        let Some(interface) = interfaces.get("custom", "mail", &[]) else {
             return Ok(());
         };
 
@@ -721,7 +721,7 @@ impl HostPlugin for Mail {
     async fn on_workload_unbind(
         &self,
         workload_id: &str,
-        _interfaces: HashSet<WitInterface>,
+        _interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
         self.tracker.write().await.remove(workload_id);
         debug!(workload_id = %workload_id, "Mail plugin unbound");

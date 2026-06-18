@@ -29,7 +29,7 @@ use crate::{
         ctx::{ActiveCtx, SharedCtx, extract_active_ctx},
         workload::WorkloadItem,
     },
-    plugin::HostPlugin,
+    plugin::{HostPlugin, WitInterfaces},
     wit::{WitInterface, WitWorld},
 };
 
@@ -48,32 +48,42 @@ type ConfigMap = HashMap<Arc<str>, HashMap<String, String>>;
 ///
 /// This plugin implements the WASI config interface, allowing components to
 /// retrieve configuration values and environment variables at runtime. Each
-/// component gets isolated access to its own configuration scope.
-#[derive(Clone, Default)]
+/// component gets an isolated view: the workload-scoped `wasi:config`
+/// interface config layered with its own `LocalResources.config` (and, with
+/// `copy_environment`, its `LocalResources.environment`).
+///
+/// Construct via [`DynamicConfig::builder`] (or [`Default::default`]) so new
+/// optional knobs land without breaking callers.
+///
+/// # Examples
+///
+/// ```
+/// use wash_runtime::plugin::wasi_config::DynamicConfig;
+///
+/// let _plugin = DynamicConfig::builder().copy_environment(true).build();
+/// ```
+#[derive(Clone, Default, bon::Builder)]
 pub struct DynamicConfig {
+    /// When `true`, the component's `LocalResources.environment` is merged
+    /// into the per-component `wasi:config/store` view at bind time,
+    /// surfacing workload env vars to components as both env vars and
+    /// config entries without further plumbing.
+    #[builder(default)]
     copy_environment: bool,
-    /// A map of configuration from component id to key-value pairs
+    /// Per-component-id key-value store. Always starts empty; not part of
+    /// the builder surface.
+    #[builder(skip)]
     config: Arc<RwLock<ConfigMap>>,
 }
 
-impl DynamicConfig {
-    pub fn new(copy_environment: bool) -> Self {
-        Self {
-            copy_environment,
-            ..Default::default()
-        }
-    }
-}
-
 impl<'a> bindings::wasi::config::store::Host for ActiveCtx<'a> {
-    #[instrument(skip(self))]
+    #[instrument(name = "wasi.config.get", skip(self))]
     async fn get(
         &mut self,
         key: String,
     ) -> wasmtime::Result<Result<Option<String>, bindings::wasi::config::store::Error>> {
-        let Some(plugin) = self.get_plugin::<DynamicConfig>(WASI_CONFIG_ID) else {
-            return Ok(Ok(None));
-        };
+        let plugin = self.try_get_plugin::<DynamicConfig>(WASI_CONFIG_ID)?;
+
         let config_guard = plugin.config.read().await;
         config_guard
             .get(&*self.component_id)
@@ -81,13 +91,12 @@ impl<'a> bindings::wasi::config::store::Host for ActiveCtx<'a> {
             .map_or(Ok(Ok(None)), |v| Ok(Ok(Some(v))))
     }
 
-    #[instrument(skip(self))]
+    #[instrument(name = "wasi.config.get_all", skip(self))]
     async fn get_all(
         &mut self,
     ) -> wasmtime::Result<Result<Vec<(String, String)>, bindings::wasi::config::store::Error>> {
-        let Some(plugin) = self.get_plugin::<DynamicConfig>(WASI_CONFIG_ID) else {
-            return Ok(Ok(vec![]));
-        };
+        let plugin = self.try_get_plugin::<DynamicConfig>(WASI_CONFIG_ID)?;
+
         let config_guard = plugin.config.read().await;
         let entries = config_guard
             .get(&*self.component_id)
@@ -112,12 +121,10 @@ impl HostPlugin for DynamicConfig {
     async fn on_workload_item_bind<'a>(
         &self,
         component_handle: &mut WorkloadItem<'a>,
-        interfaces: std::collections::HashSet<crate::wit::WitInterface>,
+        interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
         // Find the "wasi:config/store" interface, if present
-        let Some(interface) = interfaces.iter().find(|i| {
-            i.namespace == "wasi" && i.package == "config" && i.interfaces.contains("store")
-        }) else {
+        let Some(interface) = interfaces.get("wasi", "config", &["store"]) else {
             // Log a warning if the requested interfaces are not wasi:config/store
             tracing::warn!(
                 "WasiConfig plugin requested for non-wasi:config/store interface(s): {:?}",
@@ -132,8 +139,15 @@ impl HostPlugin for DynamicConfig {
             extract_active_ctx,
         )?;
 
+        // Per-component view, later wins on key conflicts: interface
+        // config, then `LocalResources.config`, then (with
+        // `copy_environment`) the environment.
         let component_config = {
             let mut config_map = interface.config.clone();
+
+            for (key, value) in component_handle.local_resources().config.iter() {
+                config_map.insert(key.clone(), value.clone());
+            }
 
             if self.copy_environment {
                 for (key, value) in component_handle.local_resources().environment.iter() {

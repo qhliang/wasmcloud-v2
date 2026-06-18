@@ -6,6 +6,11 @@
 //! 3. Verifying that the http-counter can use the blobstore-filesystem implementation
 //! 4. Testing the component resolution system that links them together
 
+// The test plugin's trait impl panics on an unexpected context to fail the test
+// loudly; that's in a trait method, not a `#[test]` fn, so the clippy.toml
+// in-tests allow doesn't cover it.
+#![allow(clippy::panic)]
+
 use anyhow::{Context, Result};
 use std::{
     collections::{HashMap, HashSet},
@@ -24,7 +29,7 @@ use wash_runtime::{
         HostApi, HostBuilder,
         http::{DevRouter, HttpServer},
     },
-    plugin::{HostPlugin, wasi_config::DynamicConfig},
+    plugin::{HostPlugin, WitInterfaces, wasi_config::DynamicConfig},
     types::{Component, LocalResources, Workload, WorkloadStartRequest},
     wit::{WitInterface, WitWorld},
 };
@@ -56,7 +61,7 @@ pub struct PerComponentInfo {
 #[derive(Default)]
 pub struct CustomLogging {
     tracker: Mutex<HashMap<String, PerComponentInfo>>,
-    prev_ctx_id: Mutex<Option<String>>,
+    prev_ctx_id: Mutex<Option<Arc<str>>>,
 }
 
 impl<'a> bindings::wasi::logging::logging::Host for ActiveCtx<'a> {
@@ -66,9 +71,7 @@ impl<'a> bindings::wasi::logging::logging::Host for ActiveCtx<'a> {
         context: String,
         message: String,
     ) -> wasmtime::Result<()> {
-        let plugin = self
-            .get_plugin::<CustomLogging>("logging")
-            .ok_or_else(|| wasmtime::format_err!("failed to get plugin"))?;
+        let plugin = self.try_get_plugin::<CustomLogging>("logging")?;
 
         let per_component_info = plugin
             .tracker
@@ -77,29 +80,24 @@ impl<'a> bindings::wasi::logging::logging::Host for ActiveCtx<'a> {
             .get(&*self.component_id)
             .cloned();
 
-        if !per_component_info.is_some_and(|info| info.workload_id == &*self.workload_id) {
+        if per_component_info.is_none_or(|info| info.workload_id != *self.workload_id) {
             return Err(wasmtime::format_err!("workload ID mismatch"));
         }
 
         let prev_ctx_id = plugin.prev_ctx_id.lock().await.clone();
-        match (prev_ctx_id, &self.id) {
-            (Some(prev_ctx_id), ctx_id) => {
-                if prev_ctx_id == *ctx_id {
-                    panic!("same context");
-                }
-            }
-            (_, _) => {}
+        if prev_ctx_id.as_ref() == Some(&self.id) {
+            panic!("same context");
         }
 
         *plugin.prev_ctx_id.lock().await = Some(self.id.clone());
 
         match level {
-            Level::Critical => tracing::error!(id = &self.id, context, "{message}"),
-            Level::Error => tracing::error!(id = &self.id, context, "{message}"),
-            Level::Warn => tracing::warn!(id = &self.id, context, "{message}"),
-            Level::Info => tracing::info!(id = &self.id, context, "{message}"),
-            Level::Debug => tracing::debug!(id = &self.id, context, "{message}"),
-            Level::Trace => tracing::trace!(id = &self.id, context, "{message}"),
+            Level::Critical => tracing::error!(id = &*self.id, context, "{message}"),
+            Level::Error => tracing::error!(id = &*self.id, context, "{message}"),
+            Level::Warn => tracing::warn!(id = &*self.id, context, "{message}"),
+            Level::Info => tracing::info!(id = &*self.id, context, "{message}"),
+            Level::Debug => tracing::debug!(id = &*self.id, context, "{message}"),
+            Level::Trace => tracing::trace!(id = &*self.id, context, "{message}"),
         }
         Ok(())
     }
@@ -121,21 +119,12 @@ impl HostPlugin for CustomLogging {
     async fn on_workload_item_bind<'a>(
         &self,
         workload_handle: &mut WorkloadItem<'a>,
-        interfaces: std::collections::HashSet<wash_runtime::wit::WitInterface>,
+        interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
-        // Ensure exactly one interface: "wasi:logging/logging"
-        let mut iter = interfaces.iter();
-        let Some(interface) = iter.next() else {
-            anyhow::bail!("No interfaces provided; expected wasi:logging/logging");
-        };
-        if iter.next().is_some()
-            || interface.namespace != "wasi"
-            || interface.package != "logging"
-            || !interface.interfaces.contains("logging")
-        {
+        // Ensure the expected interface is present: "wasi:logging/logging"
+        if !interfaces.contains("wasi", "logging", &["logging"]) {
             anyhow::bail!(
-                "Expected exactly one interface: wasi:logging/logging, got: {:?}",
-                interfaces
+                "Expected exactly one interface: wasi:logging/logging, got: {interfaces:?}"
             );
         }
 
@@ -176,8 +165,8 @@ async fn test_inter_component_call() -> Result<()> {
     let http_plugin = HttpServer::new(DevRouter::default(), "127.0.0.1:0".parse()?).await?;
     let addr = http_plugin.addr();
 
-    // Create keyvalue plugin for counter persistence (multi-backend)
-    let keyvalue_plugin = custom_plugin_kv::MultiBackendKeyValue::new();
+    // Create keyvalue plugin for counter persistence (still using built-in)
+    let keyvalue_plugin = custom_plugin_kv::MultiBackendKeyValue::default();
 
     // Create logging plugin
     let logging_plugin = CustomLogging::default();
@@ -299,12 +288,11 @@ async fn test_inter_component_call() -> Result<()> {
     .context("Failed to make first request")?;
 
     let status = response.status();
-    println!("First Response Status: {}", status);
+    println!("First Response Status: {status}");
 
     assert!(
         status.is_success(),
-        "First request failed with status {}",
-        status,
+        "First request failed with status {status}",
     );
 
     Ok(())

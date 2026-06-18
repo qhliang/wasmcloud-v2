@@ -30,7 +30,7 @@ use wasmtime_wasi::p2::{
 
 use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use wash_runtime::engine::workload::WorkloadItem;
-use wash_runtime::plugin::{HostPlugin, WorkloadTracker, find_interface};
+use wash_runtime::plugin::{HostPlugin, WitInterfaces, WorkloadTracker};
 use wash_runtime::wit::{WitInterface, WitWorld};
 
 use custom_plugin_nats_utils::build_nats_connect_options;
@@ -472,9 +472,9 @@ impl HostPlugin for CustomBlobstore {
     async fn on_workload_item_bind<'a>(
         &self,
         item: &mut WorkloadItem<'a>,
-        interfaces: HashSet<WitInterface>,
+        interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
-        let Some(interface) = find_interface(&interfaces, "wasi", "blobstore") else {
+        let Some(interface) = interfaces.get("wasi", "blobstore", &[]) else {
             tracing::warn!(
                 "Blobstore plugin requested for non-wasi:blobstore interface(s): {:?}",
                 interfaces
@@ -521,7 +521,7 @@ impl HostPlugin for CustomBlobstore {
     async fn on_workload_unbind(
         &self,
         workload_id: &str,
-        _interfaces: HashSet<WitInterface>,
+        _interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
         self.tracker
             .write()
@@ -542,7 +542,7 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         &mut self,
         name: ContainerName,
     ) -> wasmtime::Result<Result<Resource<String>, BlobstoreError>> {
-        let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
             return Ok(Err(format!(
                 "blobstore plugin not available for component '{}'",
                 self.component_id
@@ -587,7 +587,7 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         &mut self,
         name: ContainerName,
     ) -> wasmtime::Result<Result<Resource<String>, BlobstoreError>> {
-        let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
             return Ok(Err(format!(
                 "blobstore plugin not available for component '{}'",
                 self.component_id
@@ -616,7 +616,7 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         &mut self,
         name: ContainerName,
     ) -> wasmtime::Result<Result<bool, BlobstoreError>> {
-        let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
             return Ok(Err(format!(
                 "blobstore plugin not available for component '{}'",
                 self.component_id
@@ -648,7 +648,7 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         &mut self,
         name: ContainerName,
     ) -> wasmtime::Result<Result<(), BlobstoreError>> {
-        let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
             return Ok(Err(format!(
                 "blobstore plugin not available for component '{}'",
                 self.component_id
@@ -693,7 +693,7 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         src: ObjectId,
         dest: ObjectId,
     ) -> wasmtime::Result<Result<(), BlobstoreError>> {
-        let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
             return Ok(Err(format!(
                 "blobstore plugin not available for component '{}'",
                 self.component_id
@@ -732,7 +732,7 @@ impl<'a> bindings::wasi::blobstore::blobstore::Host for ActiveCtx<'a> {
         src: ObjectId,
         dest: ObjectId,
     ) -> wasmtime::Result<Result<(), BlobstoreError>> {
-        let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
             return Ok(Err(format!(
                 "blobstore plugin not available for component '{}'",
                 self.component_id
@@ -805,11 +805,11 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
             object = name,
             start = start,
             end = end,
-            workload_id = self.id,
+            workload_id = %self.id,
             "Getting object data"
         );
 
-        let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
             return Ok(Err(format!(
                 "blobstore plugin not available for component '{}'",
                 self.component_id
@@ -871,7 +871,7 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
         debug!(
             container = container_name,
             object = name,
-            workload_id = self.id,
+            workload_id = %self.id,
             "Initiating write_data for object"
         );
 
@@ -894,7 +894,7 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
     ) -> wasmtime::Result<Result<Resource<StreamObjectNamesHandle>, ContainerError>> {
         let container_name = self.table.get(&container)?;
 
-        let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
             return Ok(Err(format!(
                 "blobstore plugin not available for component '{}'",
                 self.component_id
@@ -950,7 +950,7 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
     ) -> wasmtime::Result<Result<(), ContainerError>> {
         let container_name = self.table.get(&container)?;
 
-        let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
             return Ok(Err(format!(
                 "blobstore plugin not available for component '{}'",
                 self.component_id
@@ -986,7 +986,7 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
     ) -> wasmtime::Result<Result<(), ContainerError>> {
         let container_name = self.table.get(&container)?;
 
-        let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
             return Ok(Err(format!(
                 "blobstore plugin not available for component '{}'",
                 self.component_id
@@ -1024,7 +1024,7 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
     ) -> wasmtime::Result<Result<bool, ContainerError>> {
         let container_name = self.table.get(&container)?;
 
-        let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
             return Ok(Err(format!(
                 "blobstore plugin not available for component '{}'",
                 self.component_id
@@ -1058,7 +1058,7 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
     ) -> wasmtime::Result<Result<ObjectMetadata, ContainerError>> {
         let container_name = self.table.get(&container)?;
 
-        let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
             return Ok(Err(format!(
                 "blobstore plugin not available for component '{}'",
                 self.component_id
@@ -1103,7 +1103,7 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
     ) -> wasmtime::Result<Result<(), ContainerError>> {
         let container_name = self.table.get(&container)?;
 
-        let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
             return Ok(Err(format!(
                 "blobstore plugin not available for component '{}'",
                 self.component_id
@@ -1134,7 +1134,7 @@ impl<'a> bindings::wasi::blobstore::container::HostContainer for ActiveCtx<'a> {
 
     async fn drop(&mut self, rep: Resource<String>) -> wasmtime::Result<()> {
         debug!(
-            workload_id = self.id,
+            workload_id = %self.id,
             resource_id = ?rep,
             "Dropping container resource"
         );
@@ -1195,7 +1195,7 @@ impl<'a> bindings::wasi::blobstore::container::HostStreamObjectNames for ActiveC
 
     async fn drop(&mut self, rep: Resource<StreamObjectNamesHandle>) -> wasmtime::Result<()> {
         debug!(
-            workload_id = self.id,
+            workload_id = %self.id,
             resource_id = ?rep,
             "Dropping StreamObjectNames resource"
         );
@@ -1210,7 +1210,7 @@ impl<'a> bindings::wasi::blobstore::container::HostStreamObjectNames for ActiveC
 
 impl<'a> bindings::wasi::blobstore::types::HostOutgoingValue for ActiveCtx<'a> {
     async fn new_outgoing_value(&mut self) -> wasmtime::Result<Resource<OutgoingValueHandle>> {
-        debug!(workload_id = self.id, "Creating new OutgoingValue");
+        debug!(workload_id = %self.id, "Creating new OutgoingValue");
 
         let handle = OutgoingValueHandle {
             pipe: MemoryOutputPipe::new(10 * 1024 * 1024), // 10MB max
@@ -1221,7 +1221,7 @@ impl<'a> bindings::wasi::blobstore::types::HostOutgoingValue for ActiveCtx<'a> {
         match self.table.push(handle) {
             Ok(resource) => {
                 debug!(
-                    workload_id = self.id,
+                    workload_id = %self.id,
                     resource_id = ?resource,
                     "Successfully pushed OutgoingValueHandle to resource table"
                 );
@@ -1229,7 +1229,7 @@ impl<'a> bindings::wasi::blobstore::types::HostOutgoingValue for ActiveCtx<'a> {
             }
             Err(e) => {
                 debug!(
-                    workload_id = self.id,
+                    workload_id = %self.id,
                     error = e.to_string(),
                     "Failed to push OutgoingValueHandle to resource table"
                 );
@@ -1243,13 +1243,13 @@ impl<'a> bindings::wasi::blobstore::types::HostOutgoingValue for ActiveCtx<'a> {
         outgoing_value: Resource<OutgoingValueHandle>,
     ) -> wasmtime::Result<Result<Resource<bindings::wasi::io0_2_1::streams::OutputStream>, ()>>
     {
-        debug!(workload_id = self.id, "outgoing_value_write_body called");
+        debug!(workload_id = %self.id, "outgoing_value_write_body called");
 
         let handle = match self.table.get_mut(&outgoing_value) {
             Ok(h) => h,
             Err(e) => {
                 debug!(
-                    workload_id = self.id,
+                    workload_id = %self.id,
                     error = e.to_string(),
                     "Failed to get OutgoingValueHandle from table"
                 );
@@ -1262,7 +1262,7 @@ impl<'a> bindings::wasi::blobstore::types::HostOutgoingValue for ActiveCtx<'a> {
         match self.table.push(boxed) {
             Ok(stream) => {
                 debug!(
-                    workload_id = self.id,
+                    workload_id = %self.id,
                     stream_resource_id = ?stream,
                     "Successfully pushed OutputStream to resource table"
                 );
@@ -1270,7 +1270,7 @@ impl<'a> bindings::wasi::blobstore::types::HostOutgoingValue for ActiveCtx<'a> {
             }
             Err(e) => {
                 debug!(
-                    workload_id = self.id,
+                    workload_id = %self.id,
                     error = e.to_string(),
                     "Failed to push OutputStream to resource table"
                 );
@@ -1283,7 +1283,7 @@ impl<'a> bindings::wasi::blobstore::types::HostOutgoingValue for ActiveCtx<'a> {
         &mut self,
         outgoing_value: Resource<OutgoingValueHandle>,
     ) -> wasmtime::Result<Result<(), BlobstoreError>> {
-        debug!(workload_id = self.id, "finish() called for OutgoingValue");
+        debug!(workload_id = %self.id, "finish() called for OutgoingValue");
 
         let handle = self.table.delete(outgoing_value)?;
 
@@ -1296,7 +1296,7 @@ impl<'a> bindings::wasi::blobstore::types::HostOutgoingValue for ActiveCtx<'a> {
         if let (Some(container_name), Some(object_name)) =
             (&handle.container_name, &handle.object_name)
         {
-            let Some(plugin) = self.get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
+            let Ok(plugin) = self.try_get_plugin::<CustomBlobstore>(PLUGIN_ID) else {
                 return Ok(Err(format!(
                     "blobstore plugin not available for component '{}'",
                     self.component_id
@@ -1341,7 +1341,7 @@ impl<'a> bindings::wasi::blobstore::types::HostOutgoingValue for ActiveCtx<'a> {
             );
         } else {
             debug!(
-                workload_id = self.id,
+                workload_id = %self.id,
                 "finish() called without container/object names set"
             );
         }
@@ -1351,7 +1351,7 @@ impl<'a> bindings::wasi::blobstore::types::HostOutgoingValue for ActiveCtx<'a> {
 
     async fn drop(&mut self, rep: Resource<OutgoingValueHandle>) -> wasmtime::Result<()> {
         debug!(
-            workload_id = self.id,
+            workload_id = %self.id,
             resource_id = ?rep,
             "Dropping OutgoingValue resource"
         );
@@ -1370,7 +1370,7 @@ impl<'a> bindings::wasi::blobstore::types::HostIncomingValue for ActiveCtx<'a> {
         let data = self.table.delete(incoming_value)?;
 
         debug!(
-            workload_id = self.id,
+            workload_id = %self.id,
             data_size = data.len(),
             "incoming_value_consume_sync returning data"
         );
@@ -1387,7 +1387,7 @@ impl<'a> bindings::wasi::blobstore::types::HostIncomingValue for ActiveCtx<'a> {
         let data = self.table.get(&incoming_value)?;
 
         debug!(
-            workload_id = self.id,
+            workload_id = %self.id,
             data_size = data.len(),
             "incoming_value_consume_async creating MemoryInputPipe with data"
         );
@@ -1396,7 +1396,7 @@ impl<'a> bindings::wasi::blobstore::types::HostIncomingValue for ActiveCtx<'a> {
         let stream = self.table.push(stream)?;
 
         debug!(
-            workload_id = self.id,
+            workload_id = %self.id,
             "incoming_value_consume_async created stream resource"
         );
 
@@ -1413,7 +1413,7 @@ impl<'a> bindings::wasi::blobstore::types::HostIncomingValue for ActiveCtx<'a> {
 
     async fn drop(&mut self, rep: Resource<IncomingValueHandle>) -> wasmtime::Result<()> {
         debug!(
-            workload_id = self.id,
+            workload_id = %self.id,
             resource_id = ?rep,
             "Dropping IncomingValue resource"
         );

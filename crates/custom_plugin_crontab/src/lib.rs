@@ -41,7 +41,7 @@ use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use wash_runtime::engine::workload::{ResolvedWorkload, WorkloadItem};
 use wash_runtime::plugin::HostPlugin;
 use wash_runtime::plugin::WorkloadTracker;
-use wash_runtime::plugin::find_interface;
+use wash_runtime::plugin::WitInterfaces;
 use wash_runtime::wit::{WitInterface, WitWorld};
 
 mod bindings {
@@ -129,7 +129,7 @@ impl<'a> bindings::custom::crontab::scheduler::Host for ActiveCtx<'a> {
             }
         };
 
-        let Some(plugin) = self.get_plugin::<Crontab>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<Crontab>(PLUGIN_ID) else {
             return Ok(Err(ScheduleError::Internal(
                 "crontab plugin not available".to_string(),
             )));
@@ -186,7 +186,7 @@ impl<'a> bindings::custom::crontab::scheduler::Host for ActiveCtx<'a> {
         name: String,
         delay_ms: u64,
     ) -> wasmtime::Result<Result<(), ScheduleError>> {
-        let Some(plugin) = self.get_plugin::<Crontab>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<Crontab>(PLUGIN_ID) else {
             return Ok(Err(ScheduleError::Internal(
                 "crontab plugin not available".to_string(),
             )));
@@ -247,7 +247,7 @@ impl<'a> bindings::custom::crontab::scheduler::Host for ActiveCtx<'a> {
 
     #[instrument(skip_all, fields(name = %name))]
     async fn remove(&mut self, name: String) -> wasmtime::Result<Result<(), ScheduleError>> {
-        let Some(plugin) = self.get_plugin::<Crontab>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<Crontab>(PLUGIN_ID) else {
             return Ok(Err(ScheduleError::Internal(
                 "crontab plugin not available".to_string(),
             )));
@@ -277,7 +277,7 @@ impl<'a> bindings::custom::crontab::scheduler::Host for ActiveCtx<'a> {
     }
 
     async fn list_schedules(&mut self) -> wasmtime::Result<Result<Vec<String>, ScheduleError>> {
-        let Some(plugin) = self.get_plugin::<Crontab>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<Crontab>(PLUGIN_ID) else {
             return Ok(Err(ScheduleError::Internal(
                 "crontab plugin not available".to_string(),
             )));
@@ -599,10 +599,10 @@ impl HostPlugin for Crontab {
     async fn on_workload_item_bind<'a>(
         &self,
         item: &mut WorkloadItem<'a>,
-        interfaces: HashSet<WitInterface>,
+        interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
         // Only handle crontab interfaces
-        let Some(interface) = find_interface(&interfaces, "custom", "crontab") else {
+        let Some(interface) = interfaces.get("custom", "crontab", &[]) else {
             return Ok(());
         };
 
@@ -734,7 +734,7 @@ impl HostPlugin for Crontab {
     async fn on_workload_unbind(
         &self,
         workload_id: &str,
-        _interfaces: HashSet<WitInterface>,
+        _interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
         let workload_cleanup = |_| async {};
         let component_cleanup = |component_data: ComponentData| async move {

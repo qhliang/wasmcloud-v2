@@ -51,23 +51,50 @@ pub mod wasi_otel;
 
 pub mod wasmcloud_messaging;
 
-#[cfg(all(feature = "wasi-webgpu", not(target_os = "windows")))]
+#[cfg(all(
+    feature = "wasi-webgpu",
+    not(target_os = "windows"),
+    not(target_arch = "s390x")
+))]
 pub mod wasi_webgpu;
 
 pub mod config;
 
-/// Find the first interface matching the given namespace and package.
-///
-/// Returns `None` if no matching interface is found. This is the common
-/// pattern used by all custom plugins in `on_workload_item_bind`.
-pub fn find_interface<'a>(
-    interfaces: &'a std::collections::HashSet<crate::wit::WitInterface>,
-    namespace: &str,
-    package: &str,
-) -> Option<&'a crate::wit::WitInterface> {
-    interfaces
-        .iter()
-        .find(|i| i.namespace == namespace && i.package == package)
+/// A wrapper around a [`std::collections::HashSet`] of [`crate::wit::WitInterface`] that provides convenience methods for looking up interfaces by namespace, package, and set of interfaces.
+#[derive(Debug)]
+pub struct WitInterfaces<'a> {
+    inner: &'a std::collections::HashSet<crate::wit::WitInterface>,
+}
+
+impl<'a> WitInterfaces<'a> {
+    /// Wraps a borrowed set of [`crate::wit::WitInterface`]s.
+    pub fn new(inner: &'a std::collections::HashSet<crate::wit::WitInterface>) -> Self {
+        Self { inner }
+    }
+
+    /// Returns an iterator over the wrapped [`crate::wit::WitInterface`]s.
+    pub fn iter(&self) -> impl Iterator<Item = &'a crate::wit::WitInterface> + 'a {
+        self.inner.iter()
+    }
+
+    /// Returns the [`crate::wit::WitInterface`] that matches the given namespace, package, and set of interfaces, if one exists.
+    pub fn get(
+        &self,
+        namespace: &str,
+        package: &str,
+        interfaces: &[&str],
+    ) -> Option<&crate::wit::WitInterface> {
+        self.inner.iter().find(|interface| {
+            interface.namespace == namespace
+                && interface.package == package
+                && interfaces.iter().all(|i| interface.interfaces.contains(*i))
+        })
+    }
+
+    /// Returns `true` if the given namespace, package, and set of interfaces are contained within this collection of [`crate::wit::WitInterface`]s.
+    pub fn contains(&self, namespace: &str, package: &str, interfaces: &[&str]) -> bool {
+        self.get(namespace, package, interfaces).is_some()
+    }
 }
 
 /// The [`HostPlugin`] trait provides an interface for implementing built-in plugins for the host.
@@ -153,7 +180,7 @@ pub trait HostPlugin: std::any::Any + Send + Sync + 'static {
     async fn on_workload_bind(
         &self,
         _workload: &UnresolvedWorkload,
-        _interfaces: std::collections::HashSet<crate::wit::WitInterface>,
+        _interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
         Ok(())
     }
@@ -176,7 +203,7 @@ pub trait HostPlugin: std::any::Any + Send + Sync + 'static {
     async fn on_workload_item_bind<'a>(
         &self,
         _item: &mut WorkloadItem<'a>,
-        _interfaces: std::collections::HashSet<crate::wit::WitInterface>,
+        _interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
         Ok(())
     }
@@ -224,7 +251,7 @@ pub trait HostPlugin: std::any::Any + Send + Sync + 'static {
     async fn on_workload_unbind(
         &self,
         _workload_id: &str,
-        _interfaces: std::collections::HashSet<crate::wit::WitInterface>,
+        _interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
         Ok(())
     }

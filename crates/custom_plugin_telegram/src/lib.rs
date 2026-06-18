@@ -14,7 +14,7 @@ use tracing::{debug, instrument, warn};
 use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use wash_runtime::engine::workload::ResolvedWorkload;
 use wash_runtime::plugin::config::resolve_field;
-use wash_runtime::plugin::{HostPlugin, WorkloadTracker, find_interface};
+use wash_runtime::plugin::{HostPlugin, WitInterfaces, WorkloadTracker};
 use wash_runtime::wit::{WitInterface, WitWorld};
 use wasmtime::component::Resource;
 
@@ -101,7 +101,7 @@ impl<'a> bindings::custom::telegram::sender::HostTelegramBot for ActiveCtx<'a> {
         &mut self,
         _config: Option<TelegramConfig>,
     ) -> wasmtime::Result<Resource<TelegramBotHandle>> {
-        let Some(plugin) = self.get_plugin::<Telegram>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<Telegram>(PLUGIN_ID) else {
             return Err(wasmtime::Error::msg("telegram plugin not available"));
         };
 
@@ -379,9 +379,9 @@ impl HostPlugin for Telegram {
     async fn on_workload_item_bind<'a>(
         &self,
         item: &mut wash_runtime::engine::workload::WorkloadItem<'a>,
-        interfaces: HashSet<WitInterface>,
+        interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
-        let Some(interface) = find_interface(&interfaces, "custom", "telegram") else {
+        let Some(interface) = interfaces.get("custom", "telegram", &[]) else {
             return Ok(());
         };
 
@@ -464,7 +464,7 @@ impl HostPlugin for Telegram {
     async fn on_workload_unbind(
         &self,
         workload_id: &str,
-        _interfaces: HashSet<WitInterface>,
+        _interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
         self.tracker
             .write()

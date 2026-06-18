@@ -24,6 +24,10 @@ const (
 	hostHeartbeatTimeout  = 5 * time.Second
 	hostReconcileInterval = 1 * time.Minute
 	hostFinalizerName     = "runtime.wasmcloud.dev/host-finalizer"
+	// workloadByHostIDIndex indexes Workloads by their Status.HostID so
+	// the host finalizer can fan out to assigned workloads without
+	// scanning every Workload in the cluster.
+	workloadByHostIDIndex = "status.hostId"
 )
 
 // HostReconciler reconciles a Host object
@@ -34,6 +38,10 @@ type HostReconciler struct {
 	UnreachableTimeout time.Duration
 	CPUThreshold       float64
 	MemoryThreshold    float64
+	// OperatorNamespace is the namespace the operator itself runs in. Every
+	// Host object is created here regardless of where the underlying host
+	// pod runs; tenant attribution lives on the Host's Environment field.
+	OperatorNamespace string
 
 	reconciler condition.AnyConditionedReconciler
 }
@@ -86,16 +94,19 @@ func (r *HostReconciler) reconcileReady(_ context.Context, host *runtimev1alpha1
 // waiting for the unhealthy-workload grace period to expire.
 // +kubebuilder:rbac:groups=runtime.wasmcloud.dev,resources=workloads,verbs=get;list;delete
 func (r *HostReconciler) finalize(ctx context.Context, host *runtimev1alpha1.Host) error {
+	// Indexed list keyed on Status.HostID avoids scanning every Workload
+	// in the cluster when a host is finalized. The list is cluster-wide
+	// because Workloads live in tenant namespaces while Hosts live in the
+	// operator's namespace.
 	workloadList := &runtimev1alpha1.WorkloadList{}
-	if err := r.List(ctx, workloadList); err != nil {
+	if err := r.List(ctx, workloadList,
+		client.MatchingFields{workloadByHostIDIndex: host.HostID},
+	); err != nil {
 		return err
 	}
 
 	for i := range workloadList.Items {
 		workload := &workloadList.Items[i]
-		if workload.Status.HostID != host.HostID {
-			continue
-		}
 		if workload.DeletionTimestamp != nil {
 			continue
 		}
@@ -137,10 +148,29 @@ func (r *HostReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.reconciler = reconciler
 
 	statusUpdater := &hostStatusUpdater{
-		bus:    r.Bus,
-		client: r.Client,
+		bus:               r.Bus,
+		client:            r.Client,
+		operatorNamespace: r.OperatorNamespace,
 	}
 	if err := mgr.Add(statusUpdater); err != nil {
+		return err
+	}
+
+	// Index Workloads by Status.HostID so finalize can fan out to all
+	// workloads assigned to a host via a direct field-indexed list rather
+	// than scanning every Workload in the cluster.
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&runtimev1alpha1.Workload{},
+		workloadByHostIDIndex,
+		func(obj client.Object) []string {
+			workload, ok := obj.(*runtimev1alpha1.Workload)
+			if !ok || workload.Status.HostID == "" {
+				return nil
+			}
+			return []string{workload.Status.HostID}
+		},
+	); err != nil {
 		return err
 	}
 
@@ -153,6 +183,8 @@ func (r *HostReconciler) SetupWithManager(mgr ctrl.Manager) error {
 type hostStatusUpdater struct {
 	bus    wasmbus.Bus
 	client client.Client
+	// operatorNamespace is the namespace every Host object is created in.
+	operatorNamespace string
 }
 
 func (h *hostStatusUpdater) Start(ctx context.Context) error {
@@ -161,32 +193,40 @@ func (h *hostStatusUpdater) Start(ctx context.Context) error {
 		return err
 	}
 
+	log := ctrl.LoggerFrom(ctx).WithName("host-status-updater")
+
 	subscription.Handle(func(msg *wasmbus.Message) {
 		var req runtimev2.HostHeartbeat
 		if err := protojson.Unmarshal(msg.Data, &req); err != nil {
-			fmt.Println("Failed to decode heartbeat message:", err)
+			log.Error(err, "failed to decode heartbeat message")
 			return
 		}
 
+		// Every Host object lives in the operator's own namespace. Tenant
+		// attribution is recorded on the Host's Environment field,
+		// populated verbatim from req.Environment — the heartbeat is the
+		// source of truth and is not validated against cluster state.
 		host := &runtimev1alpha1.Host{
 			ObjectMeta: metav1.ObjectMeta{
-				Name: req.FriendlyName,
+				Name:      req.FriendlyName,
+				Namespace: h.operatorNamespace,
 			},
 		}
 
 		// CreateOrUpdate handles spec and metadata (labels, HostID, Hostname,
-		// HTTPPort). The mutate func sets these fields so they are applied on
-		// both create and update paths (c.Get overwrites the pre-populated
-		// struct for existing objects).
+		// HTTPPort, Environment). The mutate func sets these fields so they
+		// are applied on both create and update paths (c.Get overwrites the
+		// pre-populated struct for existing objects).
 		_, err := controllerutil.CreateOrUpdate(ctx, h.client, host, func() error {
 			host.Labels = req.GetLabels()
 			host.HostID = req.Id
 			host.Hostname = req.Hostname
 			host.HTTPPort = req.HttpPort
+			host.Environment = req.GetEnvironment()
 			return nil
 		})
 		if err != nil {
-			fmt.Println("Failed to create or update Host resource:", err)
+			log.Error(err, "failed to create or update Host resource", "host", req.FriendlyName, "hostID", req.Id)
 			return
 		}
 
@@ -198,7 +238,7 @@ func (h *hostStatusUpdater) Start(ctx context.Context) error {
 		base := host.DeepCopy()
 		host.Status.LastSeen = metav1.Now()
 		if err := h.client.Status().Patch(ctx, host, client.MergeFrom(base)); err != nil {
-			fmt.Println("Failed to update Host status:", err)
+			log.Error(err, "failed to update Host status", "host", req.FriendlyName, "hostID", req.Id)
 		}
 	})
 

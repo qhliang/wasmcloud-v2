@@ -42,7 +42,7 @@ async fn setup() -> Result<TestHarness> {
         .try_init()
         .ok();
 
-    let container = GenericImage::new("nats", "2-alpine")
+    let container = GenericImage::new("nats", "2.12.8-alpine")
         .with_exposed_port(4222.tcp())
         .with_wait_for(WaitFor::message_on_stderr("Server is ready"))
         .with_cmd(["-js"])
@@ -100,7 +100,7 @@ async fn setup() -> Result<TestHarness> {
                     namespace: "wasi".to_string(),
                     package: "http".to_string(),
                     interfaces: ["incoming-handler".to_string()].into_iter().collect(),
-                    version: Some(semver::Version::parse("0.2.2").unwrap()),
+                    version: Some(semver::Version::new(0, 2, 2)),
                     config: {
                         let mut config = HashMap::new();
                         config.insert("host".to_string(), "foo".to_string());
@@ -118,7 +118,9 @@ async fn setup() -> Result<TestHarness> {
                     ]
                     .into_iter()
                     .collect(),
-                    version: Some(semver::Version::parse("0.2.0-draft").unwrap()),
+                    version: Some(
+                        semver::Version::parse("0.2.0-draft").expect("valid semver version"),
+                    ),
                     config: {
                         let mut config = HashMap::new();
                         config.insert("backend".to_string(), "nats".to_string());

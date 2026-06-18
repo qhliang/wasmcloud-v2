@@ -6,34 +6,18 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use anyhow::{Context, Result};
-use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::Path, time::Duration};
 use tokio::time::timeout;
 
-use custom_plugin_blobstore::CustomBlobstore;
-use custom_plugin_kv::MultiBackendKeyValue;
 use wash_runtime::{
-    engine::Engine,
-    host::{
-        HostApi, HostBuilder,
-        http::{DevRouter, HttpServer},
-    },
-    plugin::{wasi_config::DynamicConfig, wasi_logging::TracingLogger},
-    types::{Component, LocalResources, Workload, WorkloadStartRequest},
-    wit::WitInterface,
+    host::HostApi,
+    types::{LocalResources, WorkloadStartRequest},
 };
 
-const HTTP_COUNTER_WASM: &[u8] = include_bytes!("wasm/http_counter.wasm");
+mod common;
+use common::{component_workload_request, http_counter_host_interfaces, start_host_with_tls};
 
-/// Ensure the rustls CryptoProvider is installed exactly once per process.
-fn init_crypto() {
-    use std::sync::Once;
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        rustls::crypto::aws_lc_rs::default_provider()
-            .install_default()
-            .expect("failed to install crypto provider");
-    });
-}
+const HTTP_COUNTER_WASM: &[u8] = include_bytes!("wasm/http_counter.wasm");
 
 /// Generate a self-signed certificate and private key for `localhost`,
 /// write them to a temp directory, and return the paths.
@@ -64,133 +48,33 @@ fn build_tls_client(cert_path: &Path) -> Result<reqwest::Client> {
         .context("failed to build TLS client")
 }
 
-/// Start a host with TLS-enabled HTTP server and the standard set of plugins.
-async fn start_host_with_tls(
-    cert_path: &Path,
-    key_path: &Path,
-) -> Result<(std::net::SocketAddr, impl HostApi)> {
-    let engine = Engine::builder().build()?;
-    let http_server = HttpServer::new_with_tls(
-        DevRouter::default(),
-        "127.0.0.1:0".parse()?,
-        cert_path,
-        key_path,
-        None,
+fn http_counter_request(host_header: &str) -> WorkloadStartRequest {
+    component_workload_request(
+        "http-counter.wasm",
+        "http-counter-tls",
+        HTTP_COUNTER_WASM,
+        LocalResources {
+            memory_limit_mb: 256,
+            cpu_limit: 1,
+            config: HashMap::from([
+                ("test_key".to_string(), "test_value".to_string()),
+                ("counter_enabled".to_string(), "true".to_string()),
+            ]),
+            environment: HashMap::new(),
+            volume_mounts: vec![],
+            // http-counter calls example.com
+            allowed_hosts: vec!["example.com".parse().unwrap()].into(),
+        },
+        http_counter_host_interfaces(host_header),
     )
-    .await?;
-    let bound_addr = http_server.addr();
-
-    let host = HostBuilder::new()
-        .with_engine(engine)
-        .with_http_handler(Arc::new(http_server))
-        .with_plugin(Arc::new(CustomBlobstore::default()))?
-        .with_plugin(Arc::new(MultiBackendKeyValue::default()))?
-        .with_plugin(Arc::new(TracingLogger::default()))?
-        .with_plugin(Arc::new(DynamicConfig::default()))?
-        .build()?;
-
-    let host = host.start().await.context("Failed to start host")?;
-    Ok((bound_addr, host))
-}
-
-/// Standard host interfaces for the http-counter component.
-fn http_counter_host_interfaces(http_host_config: &str) -> Vec<WitInterface> {
-    vec![
-        WitInterface {
-            namespace: "wasi".to_string(),
-            package: "http".to_string(),
-            interfaces: ["incoming-handler".to_string()].into_iter().collect(),
-            version: Some(semver::Version::parse("0.2.2").unwrap()),
-            config: {
-                let mut config = HashMap::new();
-                config.insert("host".to_string(), http_host_config.to_string());
-                config
-            },
-            name: None,
-        },
-        WitInterface {
-            namespace: "wasi".to_string(),
-            package: "blobstore".to_string(),
-            interfaces: [
-                "blobstore".to_string(),
-                "container".to_string(),
-                "types".to_string(),
-            ]
-            .into_iter()
-            .collect(),
-            version: Some(semver::Version::parse("0.2.0-draft").unwrap()),
-            config: HashMap::new(),
-            name: None,
-        },
-        WitInterface {
-            namespace: "wasi".to_string(),
-            package: "keyvalue".to_string(),
-            interfaces: ["store".to_string(), "atomics".to_string()]
-                .into_iter()
-                .collect(),
-            version: Some(semver::Version::parse("0.2.0-draft").unwrap()),
-            config: HashMap::new(),
-            name: None,
-        },
-        WitInterface {
-            namespace: "wasi".to_string(),
-            package: "logging".to_string(),
-            interfaces: ["logging".to_string()].into_iter().collect(),
-            version: Some(semver::Version::parse("0.1.0-draft").unwrap()),
-            config: HashMap::new(),
-            name: None,
-        },
-        WitInterface {
-            namespace: "wasi".to_string(),
-            package: "config".to_string(),
-            interfaces: ["store".to_string()].into_iter().collect(),
-            version: Some(semver::Version::parse("0.2.0-rc.1").unwrap()),
-            config: HashMap::new(),
-            name: None,
-        },
-    ]
-}
-
-fn http_counter_workload_request(http_host_config: &str) -> WorkloadStartRequest {
-    WorkloadStartRequest {
-        workload_id: uuid::Uuid::new_v4().to_string(),
-        workload: Workload {
-            namespace: "test".to_string(),
-            name: "http-counter-tls".to_string(),
-            annotations: HashMap::new(),
-            service: None,
-            components: vec![Component {
-                name: "http-counter.wasm".to_string(),
-                digest: None,
-                bytes: bytes::Bytes::from_static(HTTP_COUNTER_WASM),
-                local_resources: LocalResources {
-                    memory_limit_mb: 256,
-                    cpu_limit: 1,
-                    config: HashMap::from([
-                        ("test_key".to_string(), "test_value".to_string()),
-                        ("counter_enabled".to_string(), "true".to_string()),
-                    ]),
-                    environment: HashMap::new(),
-                    volume_mounts: vec![],
-                    allowed_hosts: Default::default(),
-                },
-                pool_size: 1,
-                max_invocations: 100,
-            }],
-            host_interfaces: http_counter_host_interfaces(http_host_config),
-            volumes: vec![],
-        },
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_https_request_succeeds() -> Result<()> {
-    init_crypto();
-
     let (_dir, cert_path, key_path) = generate_test_certs()?;
     let (addr, host) = start_host_with_tls(&cert_path, &key_path).await?;
 
-    let req = http_counter_workload_request("foo");
+    let req = http_counter_request("foo");
     host.workload_start(req)
         .await
         .context("Failed to start http-counter workload")?;
@@ -252,8 +136,6 @@ async fn test_https_request_succeeds() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_https_rejects_plain_http() -> Result<()> {
-    init_crypto();
-
     let (_dir, cert_path, key_path) = generate_test_certs()?;
     let (addr, _host) = start_host_with_tls(&cert_path, &key_path).await?;
 

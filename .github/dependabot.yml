@@ -1,0 +1,85 @@
+version: 2
+updates:
+  # Each example and template is its own workspace (outside the root
+  # members list), so they need to be listed alongside "/" for dependabot
+  # to reach them. Grouped under all-cargo so wash + example + template
+  # bumps land in one PR.
+  - package-ecosystem: "cargo"
+    directories:
+      - "/"
+      - "/examples/blobby"
+      - "/examples/grpc-hello-world"
+      - "/examples/otel-config"
+      - "/examples/qrcode"
+      - "/templates/http-api-with-distributed-workloads"
+      - "/templates/http-client"
+      - "/templates/http-handler"
+      - "/templates/http-hello-world"
+      - "/templates/http-kv-handler"
+      - "/templates/service-tcp"
+    schedule:
+      interval: "weekly"
+    target-branch: "main"
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+      semver-minor-days: 7
+      semver-patch-days: 3
+    groups:
+      all-cargo:
+        patterns:
+          - "*"
+
+  # Go modules - one PR for runtime-gateway + runtime-operator
+  - package-ecosystem: "gomod"
+    directories:
+      - "/runtime-gateway"
+      - "/runtime-operator"
+    schedule:
+      interval: "weekly"
+    target-branch: "main"
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
+      semver-minor-days: 7
+      semver-patch-days: 3
+    groups:
+      all-go:
+        patterns:
+          - "*"
+
+  # GitHub Actions - single PR for root workflows + in-tree actions
+  - package-ecosystem: "github-actions"
+    directories:
+      - "/"
+      - "/.github/actions/build-rust-example"
+      - "/.github/actions/helm-publish"
+      - "/.github/actions/lint-go"
+      - "/.github/actions/no-diff"
+      - "/.github/actions/setup-go"
+      - "/.github/actions/setup-rust"
+    schedule:
+      interval: "weekly"
+    target-branch: "main"
+    cooldown:
+      default-days: 7
+    groups:
+      all-github-actions:
+        patterns:
+          - "*"
+
+  # Docker base images - single PR for all Dockerfiles
+  - package-ecosystem: "docker"
+    directories:
+      - "/"
+      - "/runtime-gateway"
+      - "/runtime-operator"
+    schedule:
+      interval: "weekly"
+    target-branch: "main"
+    cooldown:
+      default-days: 7
+    groups:
+      all-docker:
+        patterns:
+          - "*"

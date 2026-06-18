@@ -1,0 +1,570 @@
+name: release-tag
+
+# Once the release-train PR has merged AND the canary builds on the merge
+# commit have succeeded, this workflow:
+#   1. Promotes (build-once) each canary container image: retags
+#      `ghcr.io/wasmcloud/<image>:sha-<merge-sha>` as `X.Y.Z`. Same
+#      manifest digest, no rebuild — the bytes that passed canary CI are
+#      the bytes users pull at the release tag. Note: OCI image tags use
+#      the bare semver (no `v` prefix) per the convention users expect
+#      from `docker pull`; the git tag and GitHub Release still use
+#      `vX.Y.Z`.
+#   2. Re-attests the promoted manifest digest so SLSA provenance covers
+#      the release tag (and not just the sha-prefixed canary).
+#   3. Downloads the canary-binaries artifacts produced by wash.yml on the
+#      merge commit, attests them, and creates the GitHub Release directly
+#      with those exact bytes attached (no rebuild on tag).
+#   4. Pushes the immutable annotated `vX.Y.Z` git tag at the merge commit.
+#      That tag triggers the remaining tag-listening workflows (charts
+#      release, runtime-operator go-module-tag, wash homebrew + winget
+#      updates).
+#
+# Why workflow_run on release-train:
+#   - Avoids running on every closed PR repo-wide.
+#   - release-train.yml waits for the PR to actually merge before exiting,
+#     so by the time this workflow fires the merge commit is on main.
+#
+# workflow_dispatch is a recovery hatch. Dispatch manually with
+# `sha=<merge-sha>` once canary builds on that SHA are green — when sha
+# is passed, verify-head reads the version from Cargo.toml at that sha
+# and skips the version-bump check, so the recovery path works against
+# any SHA whose Cargo.toml carries the version we want to release. The
+# automatic path (workflow_run from release-train) instead requires
+# HEAD's Cargo.toml workspace version to differ from HEAD~1's, which is
+# the canonical "this commit is a release" signal. Every downstream
+# step is idempotent against pre-existing tags and manifests.
+#
+# Idempotency:
+#   - If an X.Y.Z OCI tag already exists at GHCR, the retag step skips it
+#     (immutability — never overwrite a published release).
+#   - If the git tag already exists on origin, the tag step is a no-op.
+#   - Re-running this workflow is safe: each step is idempotent.
+
+on:  # zizmor: ignore[dangerous-triggers]
+  # workflow_run is required: this workflow must fire after release-train
+  # finishes merging the release PR. The job's `if:` requires
+  # `workflow_run.conclusion == 'success'`, the verify-head step refuses
+  # to proceed unless HEAD's commit subject matches `release: vX.Y.Z`,
+  # and every downstream step is idempotent against pre-existing tags
+  # and image manifests.
+  workflow_run:
+    workflows: [release-train]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Release commit SHA on main to tag (defaults to HEAD)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # workflow_run fills workflow_run.id; workflow_dispatch falls back to run_id
+  # so a manual recovery dispatch still gets a unique concurrency slot.
+  group: release-tag-${{ github.event.workflow_run.id || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    needs: gate
+    if: needs.gate.outputs.run == 'true' && (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: write
+      packages: write
+      # For re-attesting the promoted release manifest digest.
+      id-token: write
+      attestations: write
+      # actions/attest writes an org-level artifact storage record in
+      # addition to the Sigstore/Rekor/registry attestation. Without this
+      # the attestation still succeeds but the action emits a noisy
+      # "Failed to create storage record" warning per subject.
+      artifact-metadata: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # workflow_run / workflow_dispatch without a sha → main HEAD.
+          # workflow_dispatch with sha → that exact release commit (recovery).
+          ref: ${{ inputs.sha || 'main' }}
+          # PAT so the tag push triggers the downstream tag-listening workflows.
+          token: ${{ secrets.WASMCLOUD_BOT_PAT }}
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "wasmcloud-bot"
+          git config user.email "wasmcloud-bot@users.noreply.github.com"
+
+      - name: Verify HEAD and read version
+        id: ver
+        env:
+          INPUT_SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          echo "STAGE=verify-head" >> "${GITHUB_ENV}"
+          MERGE_SHA=$(git rev-parse HEAD)
+          read_ws_version() {
+            local src="$1"
+            if [[ "${src}" == "HEAD" ]]; then
+              cat Cargo.toml
+            else
+              git show "${src}:Cargo.toml"
+            fi | awk -F'"' '
+              /^\[workspace\.package\]/ { in_pkg = 1; next }
+              /^\[/ && !/^\[workspace\.package\]/ { in_pkg = 0 }
+              in_pkg && /^version = "/ { print $2; exit }
+            '
+          }
+          WS_VERSION=$(read_ws_version HEAD)
+          if [[ -z "${WS_VERSION}" ]]; then
+            echo "could not read [workspace.package] version from Cargo.toml at HEAD" >&2
+            exit 1
+          fi
+          if [[ -n "${INPUT_SHA}" ]]; then
+            # Manual recovery dispatch — caller explicitly chose this sha
+            # (re-tagging an older release after a downstream step failed
+            # mid-promotion, or finalizing a release whose canary build
+            # was driven via workflow_dispatch on wash.yml). Trust them.
+            echo "manual dispatch with sha=${INPUT_SHA} — using Cargo.toml v${WS_VERSION}"
+            VERSION="${WS_VERSION}"
+          else
+            # Automatic path (workflow_run from release-train). Require
+            # HEAD to bump the workspace version vs its parent — that's
+            # the canonical "this commit is a release" signal, replacing
+            # the older "subject starts with release: v" convention.
+            PREV_VERSION=$(read_ws_version HEAD~1 2>/dev/null || true)
+            if [[ "${WS_VERSION}" == "${PREV_VERSION}" ]]; then
+              echo "HEAD does not bump [workspace.package].version (still ${PREV_VERSION}) — refusing to tag" >&2
+              exit 1
+            fi
+            VERSION="${WS_VERSION}"
+          fi
+          {
+            echo "version=${VERSION}"
+            echo "tag=v${VERSION}"
+            # OCI image tag uses the bare semver (no `v`) — that's the
+            # convention users expect from `docker pull <img>:X.Y.Z`. The
+            # git tag, GitHub Release, and Go module tag keep the `v` per
+            # Go module / git convention.
+            echo "image_tag=${VERSION}"
+            echo "sha=${MERGE_SHA}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Wait for canary builds on the merge commit
+        env:
+          GH_TOKEN: ${{ secrets.WASMCLOUD_BOT_PAT }}
+          MERGE_SHA: ${{ steps.ver.outputs.sha }}
+        run: |
+          set -euo pipefail
+          echo "STAGE=wait-for-canary" >> "${GITHUB_ENV}"
+          # Each of these workflows publishes a sha-prefixed canary image
+          # (wash, runtime-gateway, runtime-operator) or a chart canary that
+          # we'll repackage on tag (charts).
+          REQUIRED=("wash" "runtime-operator" "runtime-gateway" "charts")
+          # Global deadline across all required workflows. wash.yml's matrix
+          # check is ~45 min and canary-binaries is capped at 90 min, so
+          # the longest serial path on the merge commit's wash run is ~135
+          # min. 150 min gives headroom for queue + retries on top of that.
+          DEADLINE=$(( SECONDS + 9000 ))
+          for WF in "${REQUIRED[@]}"; do
+            echo "waiting for ${WF} on ${MERGE_SHA}..."
+            while (( SECONDS < DEADLINE )); do
+              # List ALL runs of this workflow on this commit (a re-run
+              # could have created multiple). Pick the newest *completed*
+              # run; if any completed run for this commit is `success`,
+              # we're done. If the only completed runs are failures, fail
+              # loudly. If none are completed yet, keep polling.
+              RUNS=$(gh run list \
+                --workflow "${WF}.yml" \
+                --commit "${MERGE_SHA}" \
+                --limit 20 \
+                --json databaseId,status,conclusion)
+              SUCCESS=$(echo "${RUNS}" | jq -r '[.[] | select(.status == "completed" and .conclusion == "success")] | length')
+              if [[ "${SUCCESS}" -gt 0 ]]; then
+                echo "${WF}: success"
+                break
+              fi
+              # All runs completed and none succeeded → failed.
+              ANY_INCOMPLETE=$(echo "${RUNS}" | jq -r '[.[] | select(.status != "completed")] | length')
+              ANY_RUN=$(echo "${RUNS}" | jq -r 'length')
+              if (( ANY_RUN > 0 && ANY_INCOMPLETE == 0 )); then
+                FAIL_CONCLUSIONS=$(echo "${RUNS}" | jq -r '[.[].conclusion] | join(",")')
+                echo "${WF}: all runs completed, none succeeded (conclusions: ${FAIL_CONCLUSIONS}) — refusing to tag" >&2
+                exit 1
+              fi
+              sleep 20
+            done
+            if (( SECONDS >= DEADLINE )); then
+              echo "timed out waiting for ${WF} on ${MERGE_SHA}" >&2
+              exit 1
+            fi
+          done
+          echo "all canary builds green on ${MERGE_SHA} — safe to promote"
+
+      - name: Login to ghcr.io
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Promote canary container images to release tag
+        id: promote
+        env:
+          MERGE_SHA: ${{ steps.ver.outputs.sha }}
+          IMAGE_TAG: ${{ steps.ver.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          echo "STAGE=promote-images" >> "${GITHUB_ENV}"
+          # Build-once-promote: each image was pushed by its canary workflow
+          # as `sha-<full-sha>` and validated by the corresponding canary
+          # tests. Retagging via `imagetools create` against the sha-pinned
+          # source preserves the multi-arch manifest.
+          declare -A IMAGES=(
+            [wash]="ghcr.io/wasmcloud/wash"
+            [gateway]="ghcr.io/wasmcloud/runtime-gateway"
+            [operator]="ghcr.io/wasmcloud/runtime-operator"
+          )
+          for KEY in wash gateway operator; do
+            IMG="${IMAGES[${KEY}]}"
+            # Three outcomes: tag exists (skip), manifest unknown
+            # (promote), any other error (abort with the captured stderr).
+            if INSPECT_OUT=$(docker buildx imagetools inspect "${IMG}:${IMAGE_TAG}" --format '{{json .Manifest}}' 2>&1); then
+              echo "${IMG}:${IMAGE_TAG} already exists — skipping (immutable)"
+              DST=$(echo "${INSPECT_OUT}" | jq -r .digest)
+            elif echo "${INSPECT_OUT}" | grep -qiE 'manifest unknown|no such manifest|not found|MANIFEST_UNKNOWN'; then
+              SRC="${IMG}:sha-${MERGE_SHA}"
+              echo "promoting ${SRC} -> ${IMG}:${IMAGE_TAG}"
+              SRC_DIGEST=$(docker buildx imagetools inspect "${SRC}" --format '{{json .Manifest}}' | jq -r .digest)
+              docker buildx imagetools create --tag "${IMG}:${IMAGE_TAG}" "${IMG}@${SRC_DIGEST}"
+              DST=$(docker buildx imagetools inspect "${IMG}:${IMAGE_TAG}" --format '{{json .Manifest}}' | jq -r .digest)
+              if [[ "${DST}" != "${SRC_DIGEST}" ]]; then
+                echo "WARN: retag digest (${DST}) differs from canary source (${SRC_DIGEST}) — same content, different manifest envelope. Attestation below covers ${DST}." >&2
+              fi
+            else
+              echo "destination check for ${IMG}:${IMAGE_TAG} failed — refusing to promote" >&2
+              echo "${INSPECT_OUT}" >&2
+              exit 1
+            fi
+            echo "${KEY}_digest=${DST}" >> "${GITHUB_OUTPUT}"
+          done
+
+      # actions/attest-build-provenance takes a single subject per invocation,
+      # so unroll one step per image. Each attestation links the released
+      # manifest digest to this workflow run (Sigstore-signed via Fulcio,
+      # verifiable with `gh attestation verify oci://<image>:<tag>`).
+      - name: Attest wash release manifest
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-name: ghcr.io/wasmcloud/wash
+          subject-digest: ${{ steps.promote.outputs.wash_digest }}
+          push-to-registry: true
+
+      - name: Attest runtime-gateway release manifest
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-name: ghcr.io/wasmcloud/runtime-gateway
+          subject-digest: ${{ steps.promote.outputs.gateway_digest }}
+          push-to-registry: true
+
+      - name: Attest runtime-operator release manifest
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-name: ghcr.io/wasmcloud/runtime-operator
+          subject-digest: ${{ steps.promote.outputs.operator_digest }}
+          push-to-registry: true
+
+      - name: Download canary-binaries artifacts from wash.yml run
+        id: bins
+        env:
+          GH_TOKEN: ${{ secrets.WASMCLOUD_BOT_PAT }}
+          MERGE_SHA: ${{ steps.ver.outputs.sha }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          echo "STAGE=download-binaries" >> "${GITHUB_ENV}"
+          # The wash.yml canary-binaries matrix produced one artifact per
+          # target on the merge commit's run. Pick the newest *successful*
+          # completed run — re-runs or stuck runs would otherwise let us
+          # download from the wrong workflow run.
+          RUN_ID=$(gh run list \
+            --workflow wash.yml \
+            --commit "${MERGE_SHA}" \
+            --limit 20 \
+            --json databaseId,status,conclusion \
+            --jq 'map(select(.status == "completed" and .conclusion == "success")) | .[0].databaseId // empty')
+          if [[ -z "${RUN_ID}" ]]; then
+            echo "no successful wash.yml run found for ${MERGE_SHA}" >&2
+            exit 1
+          fi
+          # Require every canary-binaries matrix entry to be success.
+          # The wash.yml run conclusion can be "success" even when
+          # canary-binaries was skipped — confirm via the jobs API.
+          JOBS_JSON=$(gh api "repos/${GH_REPO}/actions/runs/${RUN_ID}/jobs" --paginate)
+          TOTAL=$(echo "${JOBS_JSON}" | jq -r '[.jobs[] | select(.name | startswith("canary-binaries"))] | length')
+          OK=$(echo "${JOBS_JSON}" | jq -r '[.jobs[] | select((.name | startswith("canary-binaries")) and .conclusion == "success")] | length')
+          if (( TOTAL == 0 )); then
+            echo "wash.yml run ${RUN_ID} has no canary-binaries jobs. Check the check/lint/e2e gates for failures." >&2
+            exit 1
+          fi
+          if (( OK != TOTAL )); then
+            echo "wash.yml run ${RUN_ID}: only ${OK}/${TOTAL} canary-binaries matrix entries succeeded" >&2
+            echo "${JOBS_JSON}" | jq '.jobs[] | select(.name | startswith("canary-binaries")) | {name, conclusion}' >&2
+            exit 1
+          fi
+          mkdir -p ./artifacts
+          # Narrow patterns to the per-target binary artifacts only.
+          # A bare `wash-*` also matches `wash-image-tarball-*` /
+          # `wash-image-digest-*` (kept around for canary-publish), and
+          # those include 0-byte digest marker files that GH's release-
+          # asset API rejects with "size must be greater than or equal
+          # to 1" when the GitHub Release upload step runs them through.
+          gh run download "${RUN_ID}" --dir ./artifacts \
+            --pattern 'wash-x86_64-*' \
+            --pattern 'wash-aarch64-*' \
+            --pattern 'wash-s390x-*'
+          echo "run_id=${RUN_ID}" >> "${GITHUB_OUTPUT}"
+          echo "--- downloaded ---"
+          find ./artifacts -type f | sort
+
+      - name: Attest binary build provenance
+        id: attest_bins
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: "./artifacts/*/wash*"
+
+      # Stage the Sigstore bundle alongside the binaries so it is also
+      # uploaded as a GitHub Release asset. Duplicate of the Attestations
+      # API / Rekor / registry publication above. The asset form lets
+      # users without `gh` CLI verify with cosign and surfaces signing to
+      # tools that scan release assets (e.g. OpenSSF Scorecard's
+      # Signed-Releases check).
+      #
+      # Verify with:
+      #   cosign verify-blob-attestation \
+      #     --bundle wash.sigstore.json \
+      #     --certificate-identity-regexp 'https://github\.com/wasmCloud/wasmCloud/' \
+      #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      #     wash-x86_64-unknown-linux-gnu
+      - name: Stage attestation bundle for release upload
+        env:
+          BUNDLE_PATH: ${{ steps.attest_bins.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          mkdir -p ./artifacts/attestations
+          cp "${BUNDLE_PATH}" ./artifacts/attestations/wash.sigstore.json
+          ls -la ./artifacts/attestations/
+
+      - name: Push immutable release tag
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          MERGE_SHA: ${{ steps.ver.outputs.sha }}
+        run: |
+          set -euo pipefail
+          echo "STAGE=push-tag" >> "${GITHUB_ENV}"
+          # Idempotent: skip if the tag already exists on origin.
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "tag ${TAG} already exists on origin — leaving it (immutable)"
+            exit 0
+          fi
+          # Annotated tag pinned to the validated merge commit. Never
+          # force-push.
+          git tag -a "${TAG}" "${MERGE_SHA}" -m "Release ${TAG}"
+          git push origin "${TAG}"
+
+      - name: Push runtime-operator Go module tag
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          MERGE_SHA: ${{ steps.ver.outputs.sha }}
+        run: |
+          set -euo pipefail
+          echo "STAGE=go-module-tag" >> "${GITHUB_ENV}"
+          # Go module consumers fetch `runtime-operator/vX.Y.Z`. Sequenced
+          # after the main vX.Y.Z tag (and after canary validation) so
+          # consumers never see a Go module tag whose corresponding image
+          # promotion is incomplete.
+          GO_TAG="runtime-operator/${TAG}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${GO_TAG}" >/dev/null 2>&1; then
+            echo "tag ${GO_TAG} already exists on origin — leaving it (immutable)"
+            exit 0
+          fi
+          git tag -a "${GO_TAG}" "${MERGE_SHA}" -m "Release ${GO_TAG}"
+          git push origin "${GO_TAG}"
+
+      - name: Generate release notes
+        # Picks the previous wasmCloud release tag and pins it as
+        # `previous_tag_name` on the generate-notes API call, so the
+        # auto-detect doesn't pull in tags from unrelated namespaces
+        # (wash-cli-v…, runtime-operator/v…, control-interface-v…).
+        # Body is written to release-notes.md and passed via body_path
+        # below. See .github/scripts/generate-release-notes.mjs.
+        env:
+          GH_TOKEN: ${{ secrets.WASMCLOUD_BOT_PAT }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          MERGE_SHA: ${{ steps.ver.outputs.sha }}
+        run: node .github/scripts/generate-release-notes.mjs
+
+      - name: Set stage — create-release
+        run: echo "STAGE=create-release" >> "${GITHUB_ENV}"
+
+      - name: Create GitHub Release with promoted binaries
+        # The tag now exists on origin (pushed above). action-gh-release
+        # finds the existing tag and attaches the canary-built binaries.
+        # Pre-releases (tag contains "-", e.g. v2.1.0-rc.1) are marked as
+        # prerelease so `gh release list` and the GitHub UI don't surface
+        # them as the "latest" release.
+        #
+        # `body_path` points at the notes computed above; `generate_release_notes`
+        # would auto-pick previous_tag from across every tag namespace in
+        # the repo, which is wrong for this repo's tag layout.
+        #
+        # zizmor flags this as `superfluous-actions` (could use `gh release
+        # create` directly). Keeping the action: it's SHA-pinned, and a
+        # shell equivalent has to re-implement idempotent re-run handling,
+        # glob fail-on-empty, and prerelease detection — ~25 lines of bash
+        # on a release-critical step.
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0  # zizmor: ignore[superfluous-actions]
+        with:
+          name: ${{ steps.ver.outputs.tag }}
+          tag_name: ${{ steps.ver.outputs.tag }}
+          target_commitish: ${{ steps.ver.outputs.sha }}
+          body_path: release-notes.md
+          files: |
+            ./artifacts/*/*
+          token: ${{ secrets.WASMCLOUD_BOT_PAT }}
+          prerelease: ${{ contains(steps.ver.outputs.tag, '-') }}
+          fail_on_unmatched_files: true
+
+      # Package-manager publishing (homebrew + winget) is best-effort: the
+      # release is already shipped above (tag pushed, images promoted, GH
+      # release created). A failure here should not fail the run state or
+      # suppress the success Slack — re-run the step or republish manually.
+      - name: Dispatch Homebrew tap update
+        # Run after the GitHub Release exists so the formula update can
+        # fetch the binaries and their attestations. Skipped for pre-
+        # releases — the homebrew tap formula tracks stable releases only.
+        if: ${{ !contains(steps.ver.outputs.tag, '-') }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.WASMCLOUD_BOT_PAT }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          echo "STAGE=homebrew" >> "${GITHUB_ENV}"
+          gh api repos/wasmCloud/homebrew-wasmcloud/dispatches \
+            -f event_type=brew-formula-update \
+            -f "client_payload[tag_version]=${VERSION}"
+
+      - name: Dispatch docs version bump
+        # Notifies wasmCloud/wasmcloud.com to bump WASMCLOUD_VERSION in
+        # src/wasmcloud-version.ts and open a PR. Skipped for pre-releases
+        # — the docs always reflect the latest stable. Mirrors the
+        # Homebrew dispatch pattern above; the receiving workflow is
+        # update-version.yml in wasmCloud/wasmcloud.com.
+        if: ${{ !contains(steps.ver.outputs.tag, '-') }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.WASMCLOUD_BOT_PAT }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          echo "STAGE=docs-version-bump" >> "${GITHUB_ENV}"
+          gh api repos/wasmCloud/wasmcloud.com/dispatches \
+            -f event_type=wasmcloud-release \
+            -f "client_payload[version]=${VERSION}"
+
+      - name: Set stage — winget
+        if: ${{ !contains(steps.ver.outputs.tag, '-') }}
+        run: echo "STAGE=winget" >> "${GITHUB_ENV}"
+
+      - name: Update winget package
+        # Skip pre-releases (e.g. -rc.1). action reads the GH Release for
+        # the .zip installers, so it must run after the Release exists.
+        # Best-effort: a missing wasmCloud/winget-pkgs fork or a transient
+        # action failure should not poison a release that's already out.
+        if: ${{ !contains(steps.ver.outputs.tag, '-') }}
+        continue-on-error: true
+        uses: vedantmgoyal9/winget-releaser@4ffc7888bffd451b357355dc214d43bb9f23917e # v2
+        with:
+          identifier: wasmCloud.wash
+          version: ${{ steps.ver.outputs.version }}
+          installers-regex: '\.zip$'
+          release-tag: ${{ steps.ver.outputs.tag }}
+          token: ${{ secrets.WASMCLOUD_BOT_PAT }}
+
+      - name: Notify Slack — release published
+        if: success()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_RELEASE_WEBHOOK_URL }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          if [[ -z "${SLACK_WEBHOOK_URL}" ]]; then
+            echo "SLACK_RELEASE_WEBHOOK_URL not set — skipping notification"
+            exit 0
+          fi
+          TEXT=":rocket: release ${TAG} promoted from canary digest and tagged: ${REPO_URL}/releases/tag/${TAG}"
+          curl -sSf -X POST -H 'Content-Type: application/json' \
+            --data "$(jq -nc --arg text "${TEXT}" '{text: $text}')" \
+            "${SLACK_WEBHOOK_URL}"
+
+      - name: Notify Slack — release-tag failed
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_RELEASE_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          STAGE: ${{ env.STAGE }}
+        run: |
+          if [[ -z "${SLACK_WEBHOOK_URL}" ]]; then
+            echo "SLACK_RELEASE_WEBHOOK_URL not set — skipping notification"
+            exit 0
+          fi
+          TEXT=":x: release-tag failed for ${TAG:-?} at stage \`${STAGE:-unknown}\` — Run: ${RUN_URL}"
+          curl -sSf -X POST -H 'Content-Type: application/json' \
+            --data "$(jq -nc --arg text "${TEXT}" '{text: $text}')" \
+            "${SLACK_WEBHOOK_URL}"
+
+  gate:
+    # Mirror release-train's ISO-week parity gate. workflow_run fires on
+    # every release-train completion — including off-cycle weeks where
+    # release-train's own gate skipped the release job (skipped jobs roll
+    # up as `success`, so workflow_run still triggers). Without this gate,
+    # release-tag fires every Tuesday and fails noisily in verify-head.
+    # workflow_dispatch always proceeds — both when release-tag itself is
+    # dispatched (recovery hatch) and when the triggering release-train
+    # was dispatched (off-cycle patch). The latter is the only signal we
+    # have that the upstream was a manual run; without it, an off-cycle
+    # dispatch on an even-parity week would silently skip promote.
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.gate.outputs.run }}
+    steps:
+      - name: ISO-week parity gate
+        id: gate
+        env:
+          UPSTREAM_EVENT: ${{ github.event.workflow_run.event }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" || "${UPSTREAM_EVENT}" == "workflow_dispatch" ]]; then
+            echo "manual dispatch (this workflow or upstream release-train) — bypassing every-two-weeks gate"
+            echo "run=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          # Keep TRAIN_PARITY in sync with release-train.yml. To re-anchor
+          # (e.g. to dodge a holiday), flip both files together.
+          TRAIN_PARITY=1 # 1 = odd ISO weeks; 0 = even ISO weeks
+          WEEK=$(date -u +%V)
+          if (( WEEK % 2 == TRAIN_PARITY )); then
+            echo "ISO week ${WEEK} matches parity ${TRAIN_PARITY} — release-tag runs"
+            echo "run=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "ISO week ${WEEK} does not match parity ${TRAIN_PARITY} — skipping (every-two-weeks cadence)"
+            echo "run=false" >> "${GITHUB_OUTPUT}"
+          fi

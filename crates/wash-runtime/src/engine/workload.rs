@@ -8,7 +8,10 @@ use std::{
     time::Duration,
 };
 
-use crate::sockets::{self, SocketAddrUse, loopback};
+use crate::{
+    plugin::WitInterfaces,
+    sockets::{self, SocketAddrUse, loopback},
+};
 use anyhow::{Context as _, bail, ensure};
 use tokio::{sync::RwLock, task::JoinHandle, time::timeout};
 use tracing::{Instrument, debug, error, info, instrument, trace, warn};
@@ -18,6 +21,8 @@ use wasmtime::component::{
 use wasmtime_wasi::p2::bindings::CommandPre;
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtxBuilder};
 
+#[cfg(feature = "wasi-tls")]
+use crate::engine::ctx::SharedTlsProvider;
 use crate::{
     engine::{
         ctx::{Ctx, SharedCtx},
@@ -35,6 +40,10 @@ type BoundPluginWithInterfaces = (
     HashSet<WitInterface>,
     Vec<String>,
 );
+
+/// Shared slot holding the most recently instantiated component, keyed by its id.
+/// Used while resolving inter-component imports.
+type SharedInstanceSlot = Arc<RwLock<Option<(Arc<str>, Instance)>>>;
 
 /// Metadata associated with components and services within a workload.
 #[derive(Clone)]
@@ -464,7 +473,7 @@ impl DerefMut for WorkloadService {
 /// A `ResolvedWorkload` contains all components that have been validated,
 /// bound to plugins, and had their dependencies resolved. This is the final
 /// state of a workload before execution.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ResolvedWorkload {
     /// The unique identifier of the workload, created with [uuid::Uuid::new_v4]
     id: Arc<str>,
@@ -481,6 +490,31 @@ pub struct ResolvedWorkload {
     service: Option<WorkloadService>,
     /// The requested host [`WitInterface`]s to resolve this workload
     host_interfaces: Vec<WitInterface>,
+    /// TLS provider override for `wasi:tls` client connections in this workload.
+    #[cfg(feature = "wasi-tls")]
+    tls_provider: Option<SharedTlsProvider>,
+}
+
+impl std::fmt::Debug for ResolvedWorkload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut s = f.debug_struct("ResolvedWorkload");
+        s.field("id", &self.id)
+            .field("name", &self.name)
+            .field("namespace", &self.namespace)
+            .field("host_interfaces", &self.host_interfaces)
+            .field("has_service", &self.service.is_some())
+            .field(
+                "component_count",
+                &self
+                    .components
+                    .try_read()
+                    .map(|g| g.len() as isize)
+                    .unwrap_or(-1),
+            );
+        #[cfg(feature = "wasi-tls")]
+        s.field("tls_provider", &self.tls_provider.is_some());
+        s.finish_non_exhaustive()
+    }
 }
 
 impl ResolvedWorkload {
@@ -619,39 +653,36 @@ impl ResolvedWorkload {
 
     #[instrument(name="link_components", skip_all, fields(workload.id = self.id.as_ref(), workload.name = self.name.as_ref(), workload.namespace = self.namespace.as_ref()))]
     async fn link_components(&mut self) -> anyhow::Result<()> {
-        // A map from component ID to its exported interfaces
-        let mut interface_map: HashMap<String, Arc<str>> = HashMap::new();
-
-        // Determine available component exports to link to the rest of the workload
+        // Collect each component's exported component-instance interfaces.
+        let mut component_exports: Vec<(Arc<str>, Vec<String>)> = Vec::new();
         for c in self.components.read().await.values() {
-            let exported_instances = c.component_exports()?;
-            for (name, item) in exported_instances {
+            let mut names = Vec::new();
+            for (name, item) in c.component_exports()? {
                 // TODO(#11): It's probably a good idea to skip registering wasi@0.2 interfaces
-                match name.split_once('@') {
-                    Some(("wasmcloud:wash/plugin", _)) | None
-                        if name == "wasmcloud:wash/plugin" =>
-                    {
-                        trace!(name, "skipping internal plugin export");
-                        continue;
-                    }
-                    _ => {}
+                if name == "wasmcloud:wash/plugin" || name.starts_with("wasmcloud:wash/plugin@") {
+                    trace!(name, "skipping internal plugin export");
+                    continue;
                 }
                 if let ComponentItem::ComponentInstance(_) = item {
-                    // Register the interface name to the component key
-                    if interface_map.contains_key(&name) {
-                        anyhow::bail!(
-                            "another component already implements the interface '{name}'"
-                        );
-                    }
-                    trace!(name, "registering component export for linking");
-                    interface_map.insert(name.clone(), Arc::from(c.id()));
+                    names.push(name);
                 } else {
                     warn!(name, "exported item is not a component instance, skipping");
                 }
             }
+            component_exports.push((Arc::from(c.id()), names));
         }
 
-        self.resolve_workload_imports(&interface_map).await?;
+        // Build the export→component map for intra-workload linking. An
+        // interface exported by more than one component is left out of the map
+        // and tracked as ambiguous; it only causes an error if a component
+        // actually imports it (host-invoked exports such as
+        // `wasmcloud:messaging/handler` or `wasi:http/incoming-handler` are
+        // consumed by host plugins, never imported intra-workload, so multiple
+        // exporters are fine).
+        let (interface_map, ambiguous_exports) = build_export_map(&component_exports);
+
+        self.resolve_workload_imports(&interface_map, &ambiguous_exports)
+            .await?;
 
         Ok(())
     }
@@ -666,6 +697,7 @@ impl ResolvedWorkload {
     async fn resolve_workload_imports(
         &mut self,
         interface_map: &HashMap<String, Arc<str>>,
+        ambiguous_exports: &HashSet<String>,
     ) -> anyhow::Result<()> {
         // Build a dependency graph: for each component, track which other components it imports from
         let mut dependencies: HashMap<Arc<str>, HashSet<Arc<str>>> = HashMap::new();
@@ -677,8 +709,21 @@ impl ResolvedWorkload {
                 let ty = component.metadata.component.component_type();
                 for (import_name, import_item) in ty.imports(component.metadata.component.engine())
                 {
-                    if matches!(import_item, ComponentItem::ComponentInstance(_))
-                        && let Some(exporter_id) = interface_map.get(import_name)
+                    if !matches!(import_item, ComponentItem::ComponentInstance(_)) {
+                        continue;
+                    }
+                    // An interface exported by multiple components can't be
+                    // resolved to a single provider for an intra-workload
+                    // import — that's the genuine ambiguity the link check
+                    // guards against.
+                    if ambiguous_exports.contains(import_name) {
+                        anyhow::bail!(
+                            "component '{component_id}' imports interface '{import_name}', \
+                             which is exported by multiple components in the workload; \
+                             cannot disambiguate the provider"
+                        );
+                    }
+                    if let Some(exporter_id) = interface_map.get(import_name)
                         && exporter_id != component_id
                     {
                         // This import is provided by another component in the workload
@@ -773,7 +818,7 @@ impl ResolvedWorkload {
         let ty = component.component_type();
         let imports: Vec<_> = ty.imports(component.engine()).collect();
 
-        let instance: Arc<RwLock<Option<(String, Instance)>>> = Arc::default();
+        let instance: SharedInstanceSlot = Arc::default();
         for (import_name, import_item) in imports.into_iter() {
             match import_item {
                 ComponentItem::ComponentInstance(import_instance_ty) => {
@@ -1144,6 +1189,11 @@ impl ResolvedWorkload {
             ctx_builder = ctx_builder.with_plugins(plugins.clone());
         }
 
+        #[cfg(feature = "wasi-tls")]
+        if let Some(provider) = self.tls_provider.clone() {
+            ctx_builder = ctx_builder.with_tls_provider(provider);
+        }
+
         Ok(ctx_builder.build())
     }
 
@@ -1231,7 +1281,10 @@ impl ResolvedWorkload {
                         .cloned()
                         .collect::<std::collections::HashSet<_>>();
 
-                    if let Err(e) = plugin.on_workload_unbind(self.id(), bound_interfaces).await {
+                    if let Err(e) = plugin
+                        .on_workload_unbind(self.id(), WitInterfaces::new(&bound_interfaces))
+                        .await
+                    {
                         warn!(
                             plugin_id,
                             component_id = component.id(),
@@ -1289,6 +1342,9 @@ pub struct UnresolvedWorkload {
     service: Option<WorkloadService>,
     /// All [`WorkloadComponent`]s in the workload
     components: HashMap<Arc<str>, WorkloadComponent>,
+    /// TLS provider override for `wasi:tls` client connections in this workload.
+    #[cfg(feature = "wasi-tls")]
+    tls_provider: Option<SharedTlsProvider>,
 }
 
 impl UnresolvedWorkload {
@@ -1326,6 +1382,28 @@ impl UnresolvedWorkload {
                 })
                 .collect(),
             host_interfaces,
+            #[cfg(feature = "wasi-tls")]
+            tls_provider: None,
+        }
+    }
+
+    /// Override the TLS provider used for `wasi:tls` client connections in this workload.
+    ///
+    /// Use this to plug in an alternative TLS backend, install a custom root
+    /// certificate store (corporate CAs, certificate pinning), or integrate
+    /// with HSM-backed key material.
+    #[cfg(feature = "wasi-tls")]
+    pub fn with_tls_provider(mut self, provider: SharedTlsProvider) -> Self {
+        self.tls_provider = Some(provider);
+        self
+    }
+
+    /// Apply an optional TLS provider override. No-op when `None`.
+    #[cfg(feature = "wasi-tls")]
+    pub fn maybe_with_tls_provider(self, provider: Option<SharedTlsProvider>) -> Self {
+        match provider {
+            Some(p) => self.with_tls_provider(p),
+            None => self,
         }
     }
 
@@ -1462,7 +1540,7 @@ impl UnresolvedWorkload {
 
                 // Call on_workload_bind with the workload and all matched interfaces
                 if let Err(e) = p
-                    .on_workload_bind(self, plugin_matched_interfaces.clone())
+                    .on_workload_bind(self, WitInterfaces::new(&plugin_matched_interfaces))
                     .instrument(bind_span)
                     .await
                 {
@@ -1480,7 +1558,7 @@ impl UnresolvedWorkload {
                             "calling on_workload_unbind for cleanup after bind failure"
                         );
                         if let Err(cleanup_err) = bound_plugin
-                            .on_workload_unbind(self.id(), bound_interfaces.clone())
+                            .on_workload_unbind(self.id(), WitInterfaces::new(bound_interfaces))
                             .await
                         {
                             warn!(
@@ -1524,7 +1602,10 @@ impl UnresolvedWorkload {
                         plugin_id = plugin_id,
                     );
                     if let Err(e) = p
-                        .on_workload_item_bind(&mut workload_item, matching_interfaces.clone())
+                        .on_workload_item_bind(
+                            &mut workload_item,
+                            WitInterfaces::new(&matching_interfaces),
+                        )
                         .instrument(item_bind_span)
                         .await
                     {
@@ -1543,7 +1624,7 @@ impl UnresolvedWorkload {
                                 "calling on_workload_unbind for cleanup after component bind failure"
                             );
                             if let Err(cleanup_err) = bound_plugin
-                                .on_workload_unbind(self.id(), bound_interfaces.clone())
+                                .on_workload_unbind(self.id(), WitInterfaces::new(bound_interfaces))
                                 .await
                             {
                                 warn!(
@@ -1662,6 +1743,8 @@ impl UnresolvedWorkload {
             service: self.service,
             host_interfaces: self.host_interfaces,
             http_handler: http_handler.clone(),
+            #[cfg(feature = "wasi-tls")]
+            tls_provider: self.tls_provider,
         };
 
         // Link components before plugin resolution
@@ -1677,7 +1760,7 @@ impl UnresolvedWorkload {
 
         // Notify plugins of the resolved workload
         for (plugin, component_ids) in bound_plugins.iter() {
-            trace!(
+            debug!(
                 plugin_id = plugin.id(),
                 component_count = component_ids.len(),
                 "notifying plugin of resolved workload"
@@ -1756,6 +1839,44 @@ impl UnresolvedWorkload {
 /// # Returns
 /// A vector of component IDs in topological order (dependencies first), or an error
 /// if a circular dependency is detected.
+/// Builds the export→component map used to wire intra-workload component
+/// imports. An interface exported by exactly one component is registered for
+/// linking; an interface exported by more than one component is "ambiguous" —
+/// left out of the map and returned in the second set instead.
+///
+/// Ambiguity is not an error on its own: host-invoked exports (e.g.
+/// `wasmcloud:messaging/handler`, `wasi:http/incoming-handler`) are consumed
+/// by host plugins and never imported by another component, so multiple
+/// exporters are expected. The importer side ([`resolve_workload_imports`])
+/// errors only if a component actually imports an ambiguous interface.
+fn build_export_map(
+    component_exports: &[(Arc<str>, Vec<String>)],
+) -> (HashMap<String, Arc<str>>, HashSet<String>) {
+    let mut interface_map: HashMap<String, Arc<str>> = HashMap::new();
+    let mut ambiguous: HashSet<String> = HashSet::new();
+
+    for (component_id, names) in component_exports {
+        for name in names {
+            if ambiguous.contains(name) {
+                continue;
+            }
+            if interface_map.remove(name).is_some() {
+                // A second exporter for this interface: mark it ambiguous.
+                trace!(
+                    name,
+                    "interface exported by multiple components; deferring to import side"
+                );
+                ambiguous.insert(name.clone());
+            } else {
+                trace!(name, "registering component export for linking");
+                interface_map.insert(name.clone(), component_id.clone());
+            }
+        }
+    }
+
+    (interface_map, ambiguous)
+}
+
 fn topological_sort_components(
     dependencies: &HashMap<Arc<str>, HashSet<Arc<str>>>,
 ) -> anyhow::Result<Vec<Arc<str>>> {
@@ -1808,10 +1929,7 @@ fn topological_sort_components(
             .filter(|id| !result.contains(id))
             .map(|id| id.as_ref())
             .collect();
-        bail!(
-            "circular dependency detected among components: {:?}",
-            unprocessed
-        );
+        bail!("circular dependency detected among components: {unprocessed:?}");
     }
 
     Ok(result)
@@ -1836,8 +1954,8 @@ impl AsRef<str> for IdFlavor {
 impl std::fmt::Display for IdFlavor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            IdFlavor::Component(id) => write!(f, "Component({})", id),
-            IdFlavor::Service(id) => write!(f, "Service({})", id),
+            IdFlavor::Component(id) => write!(f, "Component({id})"),
+            IdFlavor::Service(id) => write!(f, "Service({id})"),
         }
     }
 }
@@ -1932,7 +2050,7 @@ mod tests {
         async fn on_workload_bind(
             &self,
             _workload: &UnresolvedWorkload,
-            interfaces: HashSet<WitInterface>,
+            interfaces: WitInterfaces<'_>,
         ) -> anyhow::Result<()> {
             self.on_workload_bind_count.fetch_add(1, Ordering::SeqCst);
             self.call_records.lock().unwrap().push(CallRecord {
@@ -1947,7 +2065,7 @@ mod tests {
         async fn on_workload_item_bind<'a>(
             &self,
             item: &mut WorkloadItem<'a>,
-            interfaces: HashSet<WitInterface>,
+            interfaces: WitInterfaces<'_>,
         ) -> anyhow::Result<()> {
             self.on_workload_item_bind_count
                 .fetch_add(1, Ordering::SeqCst);
@@ -2069,6 +2187,85 @@ mod tests {
             #[cfg(feature = "wasip3")]
             false,
         )
+    }
+
+    /// Every built-in plugin must actually bind the interface it advertises in its
+    /// `world()`. The bind hooks pick which interfaces to serve by matching
+    /// namespace / package / interface-name strings against the requested set, so a
+    /// wrong literal (a package typo, or a config key passed where an interface name
+    /// is expected) makes the plugin silently no-op instead of registering its host
+    /// functions. This guards that whole class of regression: feed each plugin an
+    /// interface it is designed to serve, then assert the first bind registers host
+    /// functions. Because a second bind of the same interface on the same linker
+    /// conflicts, a plugin that no-op'd (never touched the linker) is caught by the
+    /// second bind wrongly succeeding.
+    #[cfg(all(
+        feature = "wasmcloud-postgres",
+        feature = "wasi-blobstore",
+        feature = "wasi-keyvalue"
+    ))]
+    #[tokio::test]
+    async fn builtin_plugins_bind_their_declared_interfaces() {
+        use crate::plugin::wasmcloud_postgres::WasmcloudPostgres;
+        // wasmcloud:postgres carries the target database as interface config, not as
+        // an interface name; the plugin reads it after matching on package.
+        let mut postgres_iface =
+            WitInterface::from("wasmcloud:postgres/types,query,prepared@0.1.1-draft");
+        postgres_iface
+            .config
+            .insert("database".to_string(), "testdb".to_string());
+        let cases: Vec<(Arc<dyn HostPlugin>, WitInterface)> = vec![
+            (
+                Arc::new(WasmcloudPostgres::new("postgres://user:pass@localhost:5432/db").unwrap())
+                    as Arc<dyn HostPlugin>,
+                postgres_iface,
+            ),
+        ];
+        // A minimal empty component is enough: the bind hooks only mutate the linker.
+        let build_component = || {
+            let engine = wasmtime::Engine::default();
+            let linker = Linker::new(&engine);
+            // Minimal empty component: magic "\0asm" + component version + layer.
+            let component =
+                Component::new(&engine, [0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00]).unwrap();
+            WorkloadComponent::new(
+                "workload-bind".to_string(),
+                "test-workload-bind".to_string(),
+                "test-namespace".to_string(),
+                "test-component".to_string(),
+                component,
+                linker,
+                Vec::new(),
+                LocalResources::default(),
+                Arc::default(),
+                #[cfg(feature = "wasip3")]
+                false,
+            )
+        };
+        for (plugin, iface) in cases {
+            let id = plugin.id();
+            let set: HashSet<WitInterface> = std::iter::once(iface).collect();
+            let mut component = build_component();
+            let mut item = WorkloadItem::Component(&mut component);
+            plugin
+                .on_workload_item_bind(&mut item, WitInterfaces::new(&set))
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("plugin `{id}` failed to bind its declared interface: {e}")
+                });
+            // The first bind registered the plugin's host functions, so binding the
+            // same interface again on the same linker must conflict. If the plugin
+            // silently no-op'd (e.g. a matcher typo), it never touched the linker and
+            // this second bind wrongly succeeds.
+            let rebind = plugin
+                .on_workload_item_bind(&mut item, WitInterfaces::new(&set))
+                .await;
+            assert!(
+                rebind.is_err(),
+                "plugin `{id}` silently no-op'd on its declared interface instead of \
+                     registering host functions"
+            );
+        }
     }
 
     /// Tests basic plugin binding with one plugin and one component.
@@ -2352,6 +2549,59 @@ mod tests {
     /// Tests topological sort with a chain dependency: A -> B -> C
     /// Expected order: C, B, A (or any valid topological order)
     #[test]
+    fn build_export_map_registers_unique_exports() {
+        let exports = vec![
+            (
+                Arc::from("comp-a") as Arc<str>,
+                vec!["wasi:http/incoming-handler".to_string()],
+            ),
+            (
+                Arc::from("comp-b") as Arc<str>,
+                vec!["custom:pkg/iface".to_string()],
+            ),
+        ];
+        let (map, ambiguous) = build_export_map(&exports);
+        assert_eq!(
+            map.get("custom:pkg/iface").map(|c| c.as_ref()),
+            Some("comp-b")
+        );
+        assert!(ambiguous.is_empty());
+    }
+
+    #[test]
+    fn build_export_map_marks_duplicate_exports_ambiguous() {
+        // Two workers exporting the same handler interface: ambiguous, and
+        // dropped from the resolvable map (only an importer would error).
+        let exports = vec![
+            (
+                Arc::from("task-leet") as Arc<str>,
+                vec!["wasmcloud:messaging/handler@0.2.0".to_string()],
+            ),
+            (
+                Arc::from("task-reverse") as Arc<str>,
+                vec!["wasmcloud:messaging/handler@0.2.0".to_string()],
+            ),
+        ];
+        let (map, ambiguous) = build_export_map(&exports);
+        assert!(!map.contains_key("wasmcloud:messaging/handler@0.2.0"));
+        assert!(ambiguous.contains("wasmcloud:messaging/handler@0.2.0"));
+    }
+
+    #[test]
+    fn build_export_map_three_exporters_stay_ambiguous() {
+        // A third exporter must not accidentally re-register the interface.
+        let iface = "wasmcloud:messaging/handler@0.2.0".to_string();
+        let exports = vec![
+            (Arc::from("a") as Arc<str>, vec![iface.clone()]),
+            (Arc::from("b") as Arc<str>, vec![iface.clone()]),
+            (Arc::from("c") as Arc<str>, vec![iface.clone()]),
+        ];
+        let (map, ambiguous) = build_export_map(&exports);
+        assert!(!map.contains_key(&iface));
+        assert!(ambiguous.contains(&iface));
+    }
+
+    #[test]
     fn test_topological_sort_chain() {
         let a: Arc<str> = Arc::from("component-a");
         let b: Arc<str> = Arc::from("component-b");
@@ -2447,8 +2697,7 @@ mod tests {
         let result = topological_sort_components(&dependencies);
         assert!(
             result.is_err(),
-            "Should detect circular dependency: {:?}",
-            result
+            "Should detect circular dependency: {result:?}"
         );
     }
 

@@ -43,7 +43,7 @@ use wash_runtime::engine::workload::{ResolvedWorkload, WorkloadItem};
 use wash_runtime::plugin::HostPlugin;
 use wash_runtime::plugin::WorkloadTracker;
 use wash_runtime::plugin::config::resolve_field;
-use wash_runtime::plugin::find_interface;
+use wash_runtime::plugin::WitInterfaces;
 use wash_runtime::wit::{WitInterface, WitWorld};
 
 mod bindings {
@@ -132,7 +132,7 @@ impl<'a> bindings::custom::dingtalk_stream::sender::HostDingtalkClient for Activ
         &mut self,
         _config: Option<DingtalkConfig>,
     ) -> wasmtime::Result<Resource<DingtalkClientHandle>> {
-        let Some(plugin) = self.get_plugin::<DingTalk>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<DingTalk>(PLUGIN_ID) else {
             return Err(wasmtime::Error::msg("dingtalk-stream plugin not available"));
         };
 
@@ -520,9 +520,9 @@ impl HostPlugin for DingTalk {
     async fn on_workload_item_bind<'a>(
         &self,
         item: &mut WorkloadItem<'a>,
-        interfaces: HashSet<WitInterface>,
+        interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
-        let Some(interface) = find_interface(&interfaces, "custom", "dingtalk-stream") else {
+        let Some(interface) = interfaces.get("custom", "dingtalk-stream", &[]) else {
             return Ok(());
         };
 
@@ -625,7 +625,7 @@ impl HostPlugin for DingTalk {
     async fn on_workload_unbind(
         &self,
         workload_id: &str,
-        _interfaces: HashSet<WitInterface>,
+        _interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
         self.tracker
             .write()

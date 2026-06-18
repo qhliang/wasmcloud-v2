@@ -8,12 +8,9 @@ mod bindings {
 
 use anyhow::Context as _;
 use bindings::wasmcloud::messaging::consumer;
-
 use serde::Deserialize;
-use wstd::{
-    http::{Body, Request, Response, StatusCode},
-    time::Duration,
-};
+use wstd::http::{Body, Request, Response, StatusCode};
+use wstd::time::Duration;
 
 static UI_HTML: &str = include_str!("../ui.html");
 
@@ -50,9 +47,11 @@ async fn create_task(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
         .await
         .context("failed to parse body")?;
 
+    // The worker name selects the subject (`tasks.{worker}`), which routes to
+    // the worker subscribed to it (see `.wash/config.yaml`).
     let subject = format!(
         "tasks.{}",
-        task_request.worker.unwrap_or_else(|| "default".to_string())
+        task_request.worker.unwrap_or_else(|| "leet".to_string())
     );
 
     let body = task_request.payload.into_bytes();

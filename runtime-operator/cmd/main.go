@@ -18,7 +18,9 @@ package main
 
 import (
 	"crypto/tls"
+	"errors"
 	"flag"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -78,6 +80,8 @@ func main() {
 		memoryBackpressureThreshold float64
 		disableArtifactController   bool
 		watchNamespaces             string
+		hostNamespaces              string
+		allowSharedHosts            bool
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8081", "The address the metrics endpoint binds to. "+
@@ -113,7 +117,29 @@ func main() {
 		&watchNamespaces,
 		"watch-namespaces",
 		"",
-		"Comma-separated list of namespaces to watch. If empty, watches all namespaces.",
+		"Comma-separated list of namespaces to watch for WorkloadDeployment-side resources "+
+			"(artifacts, workloads, workloadreplicasets, workloaddeployments + the "+
+			"services/endpointslices/configmaps/secrets/events the workload reconcilers touch). "+
+			"If empty, watches all namespaces.",
+	)
+	flag.StringVar(
+		&hostNamespaces,
+		"host-namespaces",
+		"",
+		"Comma-separated list of namespaces where host Pods run. The operator's Pod informer "+
+			"cache and per-namespace Pod RBAC cover this set so HostPodReconciler can manage "+
+			"finalizers on host Pods. Does NOT affect where Host CRDs are created — every Host "+
+			"always lives in the operator's own namespace. If empty, host Pods are assumed to "+
+			"run only in the operator's own namespace.",
+	)
+	flag.BoolVar(
+		&allowSharedHosts,
+		"allow-shared-hosts",
+		true,
+		"If true (default), a WorkloadDeployment may schedule onto a Host whose Environment "+
+			"differs from the workload's own namespace via spec.template.spec.environment. "+
+			"If false, scheduling is locked to the workload's own namespace and any non-matching "+
+			"environment is rejected.",
 	)
 
 	opts := zap.Options{
@@ -132,13 +158,23 @@ func main() {
 		zapOpts...,
 	))
 
+	// OPERATOR_NAMESPACE is required: every Host CRD is created here, and
+	// the namespaced Role for Host CRUD binds to this namespace.
+	operatorNamespace := os.Getenv("OPERATOR_NAMESPACE")
+	if operatorNamespace == "" {
+		setupLog.Error(errors.New("OPERATOR_NAMESPACE is unset"), "missing required configuration")
+		os.Exit(1)
+	}
+
 	operatorCfg := runtime_operator.EmbeddedOperatorConfig{
 		DisableArtifactController: disableArtifactController,
 		NatsURL:                   natsUrl,
 		HeartbeatTTL:              60 * time.Second,
 		HostCPUThreshold:          cpuBackpressureThreshold,
 		HostMemoryThreshold:       memoryBackpressureThreshold,
-		Namespace:                 os.Getenv("OPERATOR_NAMESPACE"),
+		Namespace:                 operatorNamespace,
+		HostNamespaces:            splitCSVList(hostNamespaces),
+		AllowSharedHosts:          allowSharedHosts,
 	}
 
 	if natsCreds != "" {
@@ -156,6 +192,19 @@ func main() {
 	if natsTLSFirst {
 		operatorCfg.NatsOptions = append(operatorCfg.NatsOptions, nats.TLSHandshakeFirst())
 	}
+
+	// Surface NATS connection state.
+	operatorCfg.NatsOptions = append(operatorCfg.NatsOptions,
+		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
+			setupLog.Error(err, "nats disconnected")
+		}),
+		nats.ReconnectHandler(func(nc *nats.Conn) {
+			setupLog.Info("nats reconnected", "url", nc.ConnectedUrl())
+		}),
+		nats.ClosedHandler(func(_ *nats.Conn) {
+			setupLog.Error(nil, "nats connection closed")
+		}),
+	)
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -200,31 +249,37 @@ func main() {
 	}
 	var cacheOpts cache.Options
 
-	// If watch namespaces is set, only watch the specified namespaces. Otherwise, watch all namespaces.
-	if watchNamespaces != "" {
-		namespaces := strings.Split(watchNamespaces, ",")
-		toWatchNamespaces := make(map[string]cache.Config, len(namespaces))
-		for _, ns := range namespaces {
-			ns = strings.TrimSpace(ns)
-			if ns != "" {
-				toWatchNamespaces[ns] = cache.Config{}
-			}
-		}
-		cacheOpts.DefaultNamespaces = toWatchNamespaces
+	// -watch-namespaces narrows the cache for workload-side resources
+	// (artifacts, workloads, workloaddeployments, etc.). Empty == all
+	// namespaces.
+	cacheOpts.DefaultNamespaces = parseNamespaceSet(watchNamespaces)
+
+	// Host objects always live in the operator's own namespace —
+	// hostStatusUpdater unconditionally creates them there, regardless of
+	// where the underlying host pod runs. The Host informer cache scopes
+	// to that single namespace.
+	hostCacheNamespaces := map[string]cache.Config{
+		operatorCfg.Namespace: {},
 	}
 
-	// Restrict the Pod cache to the operator's own namespace so the cache
-	// only requires a namespaced Role (not a ClusterRole) for Pod list/watch.
-	// ByObject overrides DefaultNamespaces for the specified type, so Pods are
-	// always scoped to the operator namespace regardless of -watch-namespaces.
-	if operatorCfg.Namespace != "" {
-		cacheOpts.ByObject = map[client.Object]cache.ByObject{
-			&corev1.Pod{}: {
-				Namespaces: map[string]cache.Config{
-					operatorCfg.Namespace: {},
-				},
-			},
-		}
+	// The Pod informer cache covers the operator's own namespace plus
+	// `-host-namespaces` so HostPodReconciler can manage finalizers on
+	// host Pods regardless of which namespace the platform team deploys
+	// them into. The HostPodLabel predicate keeps the working set
+	// bounded to actual host Pods.
+	podCacheNamespaces := map[string]cache.Config{
+		operatorCfg.Namespace: {},
+	}
+	for _, ns := range operatorCfg.HostNamespaces {
+		podCacheNamespaces[ns] = cache.Config{}
+	}
+	if len(podCacheNamespaces) == 0 {
+		podCacheNamespaces[cache.AllNamespaces] = cache.Config{}
+	}
+
+	cacheOpts.ByObject = map[client.Object]cache.ByObject{
+		&runtimev1alpha1.Host{}: {Namespaces: hostCacheNamespaces},
+		&corev1.Pod{}:           {Namespaces: podCacheNamespaces},
 	}
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
@@ -254,7 +309,7 @@ func main() {
 
 	ctx := ctrl.SetupSignalHandler()
 
-	_, err = runtime_operator.NewEmbeddedOperator(ctx, mgr, operatorCfg)
+	embeddedOperator, err := runtime_operator.NewEmbeddedOperator(ctx, mgr, operatorCfg)
 	if err != nil {
 		setupLog.Error(err, "unable to create runtime operator")
 		os.Exit(1)
@@ -264,6 +319,15 @@ func main() {
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
+		os.Exit(1)
+	}
+	// Liveness must reflect NATS connectivity: a permanently closed connection
+	// means the operator can no longer observe host heartbeats, so the kubelet
+	// should restart the pod. Only the terminal closed state fails the probe —
+	// transient reconnecting stays healthy so routine NATS rollouts don't
+	// trigger restart storms.
+	if err := mgr.AddHealthzCheck("nats", natsLivenessCheck(embeddedOperator.NatsConn)); err != nil {
+		setupLog.Error(err, "unable to set up nats health check")
 		os.Exit(1)
 	}
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
@@ -276,4 +340,58 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+// natsLivenessCheck reports the operator as unhealthy only when the NATS
+// connection is permanently closed. A closed connection means the operator can
+// no longer observe host heartbeats, so Kubernetes should restart the pod. It
+// deliberately stays healthy while merely reconnecting so routine NATS rollouts
+// don't trigger restart storms.
+func natsLivenessCheck(nc *nats.Conn) healthz.Checker {
+	return func(_ *http.Request) error {
+		if nc.IsClosed() {
+			return errors.New("nats connection permanently closed")
+		}
+		return nil
+	}
+}
+
+// splitCSVList parses a comma-separated string into a trimmed, non-empty
+// slice of values. Returns nil for an empty input.
+func splitCSVList(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// parseNamespaceSet parses a comma-separated namespace list into a
+// controller-runtime cache namespace map. Returns nil for an empty input,
+// which controller-runtime interprets as "all namespaces".
+func parseNamespaceSet(raw string) map[string]cache.Config {
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make(map[string]cache.Config, len(parts))
+	for _, ns := range parts {
+		ns = strings.TrimSpace(ns)
+		if ns != "" {
+			out[ns] = cache.Config{}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }

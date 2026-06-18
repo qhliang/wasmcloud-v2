@@ -35,7 +35,7 @@ spec:
         - name: runtime-operator
           image: {{ if $registry }}{{ printf "%s/%s" $registry .Values.operator.image.repository }}{{ else }}{{ .Values.operator.image.repository }}{{ end }}:{{ .Values.operator.image.tag | default .Chart.AppVersion }}
           args:
-            - "-nats-url=nats://nats:4222"
+            - "-nats-url={{ include "runtime-operator.schedulerNatsUrl" . }}"
             {{- if $.Values.global.tls.enabled }}
             - "-nats-ca=/operator-cert/ca.crt"
             - "-nats-client-cert=/operator-cert/tls.crt"
@@ -44,11 +44,25 @@ spec:
             {{- if .Values.operator.watchNamespaces }}
             - "-watch-namespaces={{ .Values.operator.watchNamespaces | join "," }}"
             {{- end }}
+            {{- with include "runtime-operator.hostNamespaces" . }}
+            - "-host-namespaces={{ . }}"
+            {{- end }}
+            - "-allow-shared-hosts={{ .Values.operator.allowSharedHosts }}"
+            {{- with .Values.operator.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           env:
             - name: OPERATOR_NAMESPACE
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            {{- with .Values.operator.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.operator.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           imagePullPolicy: {{ .Values.operator.image.pull_policy }}
           {{- if $.Values.global.tls.enabled }}
           volumeMounts:
@@ -56,6 +70,23 @@ spec:
               mountPath: /operator-cert
               readOnly: true
           {{- end }}
+          ports:
+            - name: health
+              containerPort: 8082
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
           securityContext:
             capabilities:
               drop:

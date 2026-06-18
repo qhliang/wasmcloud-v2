@@ -1,11 +1,12 @@
 {{- $registry := .Values.runtime.image.registry | default .Values.global.image.registry -}}
 {{- $top := . }}
 {{- range .Values.runtime.hostGroups }}
+{{- $ns := default $top.Release.Namespace .namespace }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: hostgroup-{{ .name }}
-  namespace: {{ $top.Release.Namespace }}
+  namespace: {{ $ns }}
   labels:
     wasmcloud.com/name: hostgroup
     wasmcloud.com/hostgroup: {{ .name }}
@@ -43,6 +44,12 @@ spec:
             secretName: {{ if and (.http.tls.certificate) (.http.tls.certificate.secretName) }}{{ .http.tls.certificate.secretName }}{{ else }}hostgroup-{{ .name }}-http-tls{{ end }}
         {{- end }}
         {{- end }}
+        {{- /* Optional pod volumes (e.g. ConfigMap / Secret mounts). Rendered
+               unconditionally — outside the global.tls.enabled guard above —
+               so they survive a TLS-off install. */}}
+        {{- with .volumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       serviceAccountName: {{ include "runtime.serviceAccountName" $top }}
       {{- include "runtime-operator.imagePullSecrets" $top | nindent 6 }}
       containers:
@@ -53,17 +60,41 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            - name: WASMCLOUD_HOST_ENVIRONMENT
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            {{- with $top.Values.runtime.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+            {{- with .env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- /* Optional envFrom (chart-wide runtime.envFrom + per-host-group). */}}
+          {{- if or $top.Values.runtime.envFrom .envFrom }}
+          envFrom:
+            {{- with $top.Values.runtime.envFrom }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+            {{- with .envFrom }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
           args:
+            {{- if .logLevel }}
+            - "--log-level={{ .logLevel }}"
+            {{- end }}
             - "host"
             - "--host-name=$(WASMCLOUD_HOST_IP)"
             - "--host-group={{ .name }}"
-            - "--scheduler-nats-url=nats://nats:4222"
+            - "--environment=$(WASMCLOUD_HOST_ENVIRONMENT)"
+            - "--scheduler-nats-url={{ include "runtime-operator.schedulerNatsUrl" (dict "ctx" $top "group" .) }}"
             {{- if $top.Values.global.tls.enabled }}
             - "--scheduler-nats-tls-ca=/runtime-cert/ca.crt"
             - "--scheduler-nats-tls-cert=/runtime-cert/tls.crt"
             - "--scheduler-nats-tls-key=/runtime-cert/tls.key"
             {{- end }}
-            - "--data-nats-url=nats://nats:4222"
+            - "--data-nats-url={{ include "runtime-operator.dataNatsUrl" (dict "ctx" $top "group" .) }}"
             {{- if $top.Values.global.tls.enabled }}
             - "--data-nats-tls-ca=/data-cert/ca.crt"
             - "--data-nats-tls-cert=/data-cert/tls.crt"
@@ -83,6 +114,14 @@ spec:
             {{- if and (.wasip3) (.wasip3.enabled) }}
             - "--wasip3"
             {{- end }}
+            {{- /* Chart-wide runtime.extraArgs applies to every host group; per-host-group
+                   .extraArgs is appended after it. */}}
+            {{- with $top.Values.runtime.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+            {{- with .extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           imagePullPolicy: {{ $top.Values.runtime.image.pull_policy }}
           volumeMounts:
             - name: oci-cache
@@ -100,6 +139,12 @@ spec:
               readOnly: true
             {{- end }}
             {{- end }}
+            {{- /* Optional host-container volumeMounts (pair with .volumes
+                   above). Rendered unconditionally so a TLS-off install still
+                   mounts user volumes. */}}
+            {{- with .volumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           {{- with .resources }}
           resources:
             {{- toYaml . | nindent 12 }}
@@ -109,6 +154,13 @@ spec:
             - name: http
               containerPort: {{ .http.port }}
               protocol: TCP
+            {{- end }}
+            {{- /* Optional additional container ports (e.g. metrics scrape).
+                   Do NOT re-list the http port — the chart renders it from
+                   `.http.port` above; a duplicate containerPort fails
+                   Deployment validation. */}}
+            {{- with .ports }}
+            {{- toYaml . | nindent 12 }}
             {{- end }}
           securityContext:
             capabilities:

@@ -23,7 +23,7 @@ use wasmtime::component::Resource;
 
 use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use wash_runtime::engine::workload::WorkloadItem;
-use wash_runtime::plugin::{HostPlugin, WorkloadTracker, find_interface};
+use wash_runtime::plugin::{HostPlugin, WitInterfaces, WorkloadTracker};
 use wash_runtime::wit::{WitInterface, WitWorld};
 
 use custom_plugin_nats_utils::build_nats_connect_options;
@@ -279,7 +279,7 @@ impl<'a> bindings::wasi::keyvalue::store::Host for ActiveCtx<'a> {
         &mut self,
         identifier: String,
     ) -> wasmtime::Result<Result<Resource<BucketHandle>, StoreError>> {
-        let Some(plugin) = self.get_plugin::<MultiBackendKeyValue>(PLUGIN_KEYVALUE_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<MultiBackendKeyValue>(PLUGIN_KEYVALUE_ID) else {
             return Ok(Err(StoreError::Other(format!(
                 "KV plugin not available for component '{}'",
                 self.component_id
@@ -353,7 +353,7 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
         bucket: Resource<BucketHandle>,
         key: String,
     ) -> wasmtime::Result<Result<Option<Vec<u8>>, StoreError>> {
-        let Some(plugin) = self.get_plugin::<MultiBackendKeyValue>(PLUGIN_KEYVALUE_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<MultiBackendKeyValue>(PLUGIN_KEYVALUE_ID) else {
             return Ok(Err(StoreError::Other(format!(
                 "KV plugin not available for component '{}'",
                 self.component_id
@@ -405,7 +405,7 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
         key: String,
         value: Vec<u8>,
     ) -> wasmtime::Result<Result<(), StoreError>> {
-        let Some(plugin) = self.get_plugin::<MultiBackendKeyValue>(PLUGIN_KEYVALUE_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<MultiBackendKeyValue>(PLUGIN_KEYVALUE_ID) else {
             return Ok(Err(StoreError::Other(format!(
                 "KV plugin not available for component '{}'",
                 self.component_id
@@ -449,7 +449,7 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
         bucket: Resource<BucketHandle>,
         key: String,
     ) -> wasmtime::Result<Result<(), StoreError>> {
-        let Some(plugin) = self.get_plugin::<MultiBackendKeyValue>(PLUGIN_KEYVALUE_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<MultiBackendKeyValue>(PLUGIN_KEYVALUE_ID) else {
             return Ok(Err(StoreError::Other(format!(
                 "KV plugin not available for component '{}'",
                 self.component_id
@@ -486,7 +486,7 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
         bucket: Resource<BucketHandle>,
         key: String,
     ) -> wasmtime::Result<Result<bool, StoreError>> {
-        let Some(plugin) = self.get_plugin::<MultiBackendKeyValue>(PLUGIN_KEYVALUE_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<MultiBackendKeyValue>(PLUGIN_KEYVALUE_ID) else {
             return Ok(Err(StoreError::Other(format!(
                 "KV plugin not available for component '{}'",
                 self.component_id
@@ -524,7 +524,7 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
         bucket: Resource<BucketHandle>,
         cursor: Option<u64>,
     ) -> wasmtime::Result<Result<KeyResponse, StoreError>> {
-        let Some(plugin) = self.get_plugin::<MultiBackendKeyValue>(PLUGIN_KEYVALUE_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<MultiBackendKeyValue>(PLUGIN_KEYVALUE_ID) else {
             return Ok(Err(StoreError::Other(format!(
                 "KV plugin not available for component '{}'",
                 self.component_id
@@ -652,7 +652,7 @@ impl<'a> bindings::wasi::keyvalue::atomics::Host for ActiveCtx<'a> {
         key: String,
         delta: u64,
     ) -> wasmtime::Result<Result<u64, StoreError>> {
-        let Some(plugin) = self.get_plugin::<MultiBackendKeyValue>(PLUGIN_KEYVALUE_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<MultiBackendKeyValue>(PLUGIN_KEYVALUE_ID) else {
             return Ok(Err(StoreError::Other(format!(
                 "KV plugin not available for component '{}'",
                 self.component_id
@@ -749,7 +749,7 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
         bucket: Resource<BucketHandle>,
         keys: Vec<String>,
     ) -> wasmtime::Result<Result<Vec<Option<(String, Vec<u8>)>>, StoreError>> {
-        let Some(plugin) = self.get_plugin::<MultiBackendKeyValue>(PLUGIN_KEYVALUE_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<MultiBackendKeyValue>(PLUGIN_KEYVALUE_ID) else {
             return Ok(Err(StoreError::Other(format!(
                 "KV plugin not available for component '{}'",
                 self.component_id
@@ -814,7 +814,7 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
         bucket: Resource<BucketHandle>,
         key_values: Vec<(String, Vec<u8>)>,
     ) -> wasmtime::Result<Result<(), StoreError>> {
-        let Some(plugin) = self.get_plugin::<MultiBackendKeyValue>(PLUGIN_KEYVALUE_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<MultiBackendKeyValue>(PLUGIN_KEYVALUE_ID) else {
             return Ok(Err(StoreError::Other(format!(
                 "KV plugin not available for component '{}'",
                 self.component_id
@@ -872,7 +872,7 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
         bucket: Resource<BucketHandle>,
         keys: Vec<String>,
     ) -> wasmtime::Result<Result<(), StoreError>> {
-        let Some(plugin) = self.get_plugin::<MultiBackendKeyValue>(PLUGIN_KEYVALUE_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<MultiBackendKeyValue>(PLUGIN_KEYVALUE_ID) else {
             return Ok(Err(StoreError::Other(format!(
                 "KV plugin not available for component '{}'",
                 self.component_id
@@ -930,9 +930,9 @@ impl HostPlugin for MultiBackendKeyValue {
     async fn on_workload_item_bind<'a>(
         &self,
         item: &mut WorkloadItem<'a>,
-        interfaces: std::collections::HashSet<WitInterface>,
+        interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
-        let Some(interface) = find_interface(&interfaces, "wasi", "keyvalue") else {
+        let Some(interface) = interfaces.get("wasi", "keyvalue", &[]) else {
             tracing::warn!(
                 "KV plugin requested for non-wasi:keyvalue interface(s): {:?}",
                 interfaces
@@ -973,7 +973,7 @@ impl HostPlugin for MultiBackendKeyValue {
     async fn on_workload_unbind(
         &self,
         workload_id: &str,
-        _interfaces: std::collections::HashSet<WitInterface>,
+        _interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
         self.tracker
             .write()

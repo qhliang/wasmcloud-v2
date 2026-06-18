@@ -52,7 +52,7 @@ use wasmtime::component::Resource;
 
 use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use wash_runtime::engine::workload::WorkloadItem;
-use wash_runtime::plugin::{HostPlugin, WorkloadTracker, find_interface};
+use wash_runtime::plugin::{HostPlugin, WitInterfaces, WorkloadTracker};
 use wash_runtime::wit::{WitInterface, WitWorld};
 
 mod bindings {
@@ -460,6 +460,7 @@ fn to_genai_content_part(part: ContentPart) -> genai::chat::ContentPart {
         ContentPart::ToolResponse(tr) => {
             genai::chat::ContentPart::ToolResponse(genai::chat::ToolResponse {
                 call_id: tr.call_id,
+                fn_name: None,
                 content: tr.content,
             })
         }
@@ -594,7 +595,7 @@ impl<'a> bindings::custom::llm_gateway::chat::Host for ActiveCtx<'a> {
         options: Option<WitChatOptions>,
         config: Option<LlmConfig>,
     ) -> wasmtime::Result<Result<ChatResponse, LlmError>> {
-        let Some(plugin) = self.get_plugin::<LlmGateway>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<LlmGateway>(PLUGIN_ID) else {
             return Ok(Err(LlmError::Unexpected(
                 "LLM Gateway plugin not available".to_string(),
             )));
@@ -762,7 +763,7 @@ impl<'a> bindings::custom::llm_gateway::chat_streaming::Host for ActiveCtx<'a> {
         options: Option<WitChatOptions>,
         config: Option<LlmConfig>,
     ) -> wasmtime::Result<Result<Resource<ChatStreamHandle>, LlmError>> {
-        let Some(plugin) = self.get_plugin::<LlmGateway>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<LlmGateway>(PLUGIN_ID) else {
             return Ok(Err(LlmError::Unexpected(
                 "LLM Gateway plugin not available".to_string(),
             )));
@@ -994,10 +995,10 @@ impl HostPlugin for LlmGateway {
     async fn on_workload_item_bind<'a>(
         &self,
         item: &mut WorkloadItem<'a>,
-        interfaces: HashSet<WitInterface>,
+        interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
         // Find the llm-gateway interface
-        let Some(interface) = find_interface(&interfaces, "custom", "llm-gateway") else {
+        let Some(interface) = interfaces.get("custom", "llm-gateway", &[]) else {
             tracing::warn!(
                 "LlmGateway plugin requested for non-llm-gateway interface(s): {:?}",
                 interfaces
@@ -1057,7 +1058,7 @@ impl HostPlugin for LlmGateway {
     async fn on_workload_unbind(
         &self,
         workload_id: &str,
-        _interfaces: HashSet<WitInterface>,
+        _interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
         self.tracker
             .write()

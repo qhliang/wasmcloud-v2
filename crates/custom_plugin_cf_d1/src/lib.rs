@@ -19,7 +19,7 @@ use wasmtime::component::Resource;
 use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use wash_runtime::engine::workload::WorkloadItem;
 use wash_runtime::plugin::config::resolve_field;
-use wash_runtime::plugin::{HostPlugin, WorkloadTracker, find_interface};
+use wash_runtime::plugin::{HostPlugin, WitInterfaces, WorkloadTracker};
 use wash_runtime::wit::{WitInterface, WitWorld};
 
 mod bindings {
@@ -270,7 +270,7 @@ impl<'a> bindings::custom::cf_d1::query::HostD1Client for ActiveCtx<'a> {
         &mut self,
         config: Option<D1Config>,
     ) -> wasmtime::Result<Resource<D1ClientHandle>> {
-        let Some(plugin) = self.get_plugin::<CloudflareD1>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<CloudflareD1>(PLUGIN_ID) else {
             return Err(wasmtime::Error::msg("cf-d1 plugin not available"));
         };
 
@@ -357,7 +357,7 @@ impl<'a> bindings::custom::cf_d1::query::HostD1Client for ActiveCtx<'a> {
         sql: String,
         params: Vec<ColumnValue>,
     ) -> wasmtime::Result<Result<QueryResult, QueryError>> {
-        let Some(plugin) = self.get_plugin::<CloudflareD1>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<CloudflareD1>(PLUGIN_ID) else {
             return Ok(Err(QueryError::ConnectionError(
                 "cf-d1 plugin not available".to_string(),
             )));
@@ -474,7 +474,7 @@ impl<'a> bindings::custom::cf_d1::query::HostD1Client for ActiveCtx<'a> {
         handle: Resource<D1ClientHandle>,
         sql: String,
     ) -> wasmtime::Result<Result<Vec<QueryResult>, QueryError>> {
-        let Some(plugin) = self.get_plugin::<CloudflareD1>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<CloudflareD1>(PLUGIN_ID) else {
             return Ok(Err(QueryError::ConnectionError(
                 "cf-d1 plugin not available".to_string(),
             )));
@@ -621,9 +621,9 @@ impl HostPlugin for CloudflareD1 {
     async fn on_workload_item_bind<'a>(
         &self,
         item: &mut WorkloadItem<'a>,
-        interfaces: HashSet<WitInterface>,
+        interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
-        let Some(interface) = find_interface(&interfaces, "custom", "cf-d1") else {
+        let Some(interface) = interfaces.get("custom", "cf-d1", &[]) else {
             tracing::warn!(
                 "CloudflareD1 plugin requested for non-cf:d1 interface(s): {:?}",
                 interfaces
@@ -662,7 +662,7 @@ impl HostPlugin for CloudflareD1 {
     async fn on_workload_unbind(
         &self,
         workload_id: &str,
-        _interfaces: HashSet<WitInterface>,
+        _interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
         self.tracker
             .write()

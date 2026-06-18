@@ -5,7 +5,7 @@ use std::time::Duration;
 use crate::host::{Host, HostApi, HostConfig};
 use crate::oci::{self, OciConfig};
 use crate::plugin::HostPlugin;
-use anyhow::Context as _;
+use anyhow::{Context as _, anyhow};
 use futures::StreamExt as _;
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, instrument};
@@ -29,6 +29,7 @@ pub struct ClusterHostBuilder {
     nats_client: Option<Arc<async_nats::Client>>,
     host_group: Option<String>,
     host_name: Option<String>,
+    environment: Option<String>,
     heartbeat_interval: Option<Duration>,
     cleanup_interval: Option<Duration>,
     cleanup_age: Option<Duration>,
@@ -43,6 +44,15 @@ impl ClusterHostBuilder {
 
     pub fn with_host_name(mut self, host_name: impl AsRef<str>) -> Self {
         self.host_name = Some(host_name.as_ref().into());
+        self
+    }
+
+    /// Sets the environment the host advertises in its heartbeat. For
+    /// in-cluster host pods this is the pod's namespace (sourced from
+    /// the downward API); for external hosts it is whatever identifier
+    /// the operator wants to attribute the host to.
+    pub fn with_environment(mut self, environment: impl AsRef<str>) -> Self {
+        self.environment = Some(environment.as_ref().into());
         self
     }
 
@@ -104,6 +114,10 @@ impl ClusterHostBuilder {
 
         if let Some(host_name) = self.host_name {
             builder = builder.with_hostname(host_name)
+        }
+
+        if let Some(environment) = self.environment {
+            builder = builder.with_environment(environment);
         }
 
         if let Some(host_config) = self.host_config {
@@ -186,7 +200,7 @@ pub async fn run_cluster_host(
                 _ = oci_cleanup_timer.tick() => {
                     if let Some(cache_dir) = host.config().oci_cache_dir.as_ref() &&
                     let Err(e) = oci::cleanup_cache(cache_dir, cluster_host.cleanup_age).await {
-                        error!("Error during OCI cache cleanup: {}", e);
+                        error!("error during OCI cache cleanup: {e}");
                     }
                 }
                 // Send heartbeat
@@ -206,7 +220,7 @@ pub async fn run_cluster_host(
                             }
                         }
                         Err(e) => {
-                            eprintln!("Error handling command: {}", e);
+                            error!("error handling command: {e}");
                         }
                     }
                 }
@@ -395,15 +409,29 @@ async fn workload_start(
                     });
                 }
             };
+            let local_resources = match component.local_resources.clone() {
+                Some(lr) => match crate::types::LocalResources::try_from(lr) {
+                    Ok(lr) => lr,
+                    Err(e) => {
+                        return Ok(types::v2::WorkloadStartResponse {
+                            workload_status: Some(types::v2::WorkloadStatus {
+                                workload_id: workload_id.clone(),
+                                workload_state: types::v2::WorkloadState::Error.into(),
+                                message: format!(
+                                    "invalid local_resources for component {}: {e:#}",
+                                    component.name
+                                ),
+                            }),
+                        });
+                    }
+                },
+                None => crate::types::LocalResources::default(),
+            };
             pulled_components.push(crate::types::Component {
                 name: component.name.clone(),
                 bytes: bytes.into(),
                 digest: Some(digest),
-                local_resources: component
-                    .local_resources
-                    .clone()
-                    .map(Into::into)
-                    .unwrap_or_default(),
+                local_resources,
                 pool_size: component.pool_size,
                 max_invocations: component.max_invocations,
             })
@@ -440,14 +468,25 @@ async fn workload_start(
                 });
             }
         };
+        let local_resources = match service.local_resources.clone() {
+            Some(lr) => match crate::types::LocalResources::try_from(lr) {
+                Ok(lr) => lr,
+                Err(e) => {
+                    return Ok(types::v2::WorkloadStartResponse {
+                        workload_status: Some(types::v2::WorkloadStatus {
+                            workload_id: workload_id.clone(),
+                            workload_state: types::v2::WorkloadState::Error.into(),
+                            message: format!("invalid local_resources for service: {e:#}"),
+                        }),
+                    });
+                }
+            },
+            None => crate::types::LocalResources::default(),
+        };
         Some(crate::types::Service {
             bytes: bytes.into(),
             digest: Some(digest),
-            local_resources: service
-                .local_resources
-                .clone()
-                .map(Into::into)
-                .unwrap_or_default(),
+            local_resources,
             max_restarts: service.max_restarts,
         })
     } else {
@@ -555,16 +594,45 @@ impl From<types::v2::Volume> for crate::types::Volume {
     }
 }
 
-impl From<types::v2::LocalResources> for crate::types::LocalResources {
-    fn from(lr: types::v2::LocalResources) -> Self {
-        crate::types::LocalResources {
+impl TryFrom<types::v2::LocalResources> for crate::types::LocalResources {
+    type Error = anyhow::Error;
+
+    fn try_from(lr: types::v2::LocalResources) -> Result<Self, Self::Error> {
+        // Parse `allowed_hosts` eagerly: every entry must be a recognized
+        // form (`*`, `*.foo`, `host[:port]`, or `scheme://…`). A bad entry
+        // fails the conversion so the workload start surfaces a clear error
+        // rather than silently widening egress. All parse failures are
+        // collected and joined into one error so a workload with several
+        // bad entries doesn't make the user fix them one-by-one.
+        let mut parsed: Vec<crate::host::allowed_hosts::AllowedHost> =
+            Vec::with_capacity(lr.allowed_hosts.len());
+        let mut errors: Vec<String> = Vec::new();
+        for s in &lr.allowed_hosts {
+            // Per-entry messages are formatted as `'<entry>': <parse error>`
+            // (no leading "invalid allowed_hosts" — that's the outer
+            // wrapper's job). The final message renders as one heading line
+            // plus a bullet per bad entry so multi-error output is scannable
+            // in a terminal.
+            match s.parse::<crate::host::allowed_hosts::AllowedHost>() {
+                Ok(entry) => parsed.push(entry),
+                Err(e) => errors.push(format!("'{s}': {e:#}")),
+            }
+        }
+        if !errors.is_empty() {
+            return Err(anyhow!(
+                "invalid allowed_hosts:\n  - {}",
+                errors.join("\n  - ")
+            ));
+        }
+        let allowed_hosts: Arc<[_]> = parsed.into();
+        Ok(crate::types::LocalResources {
             memory_limit_mb: lr.memory_limit_mb,
             cpu_limit: lr.cpu_limit,
             config: lr.config,
             volume_mounts: lr.volume_mounts.into_iter().map(Into::into).collect(),
-            allowed_hosts: lr.allowed_hosts.into(),
+            allowed_hosts,
             environment: lr.environment,
-        }
+        })
     }
 }
 
@@ -588,6 +656,7 @@ impl From<crate::types::HostHeartbeat> for types::v2::HostHeartbeat {
             labels: hb.labels,
             friendly_name: hb.friendly_name,
             http_port: hb.http_port.into(),
+            environment: hb.environment,
         }
     }
 }
@@ -674,6 +743,85 @@ impl From<types::v2::ImagePullPolicy> for crate::oci::OciPullPolicy {
 mod tests {
 
     use super::*;
+    use crate::host::allowed_hosts::AllowedHost;
+
+    #[test]
+    fn try_from_v2_local_resources_parses_allowed_hosts() {
+        // Strings flowing in from the proto wire are parsed into typed
+        // `AllowedHost` entries. Valid forms should round-trip cleanly.
+        let proto = types::v2::LocalResources {
+            memory_limit_mb: 0,
+            cpu_limit: 0,
+            config: Default::default(),
+            environment: Default::default(),
+            volume_mounts: vec![],
+            allowed_hosts: vec![
+                "*".to_string(),
+                "*.example.com".to_string(),
+                "api.example.com:8443".to_string(),
+                "https://api.example.com".to_string(),
+            ],
+        };
+        let lr = crate::types::LocalResources::try_from(proto).expect("conversion should succeed");
+        assert_eq!(lr.allowed_hosts.len(), 4);
+        assert!(matches!(lr.allowed_hosts[0], AllowedHost::Any));
+        assert!(matches!(
+            lr.allowed_hosts[1],
+            AllowedHost::SuffixWildcard { .. }
+        ));
+        assert!(matches!(lr.allowed_hosts[2], AllowedHost::Authority(_)));
+        assert!(matches!(lr.allowed_hosts[3], AllowedHost::Url(_)));
+    }
+
+    #[test]
+    fn try_from_v2_local_resources_rejects_bad_allowed_hosts_entry() {
+        // An ambiguous wildcard (`*com` matches every .com) must be
+        // rejected — the K8s pattern guards this at admission time, but
+        // workloads constructed by other paths land here and the
+        // workload start should surface a clear error rather than
+        // silently widen egress.
+        let proto = types::v2::LocalResources {
+            memory_limit_mb: 0,
+            cpu_limit: 0,
+            config: Default::default(),
+            environment: Default::default(),
+            volume_mounts: vec![],
+            allowed_hosts: vec!["*com".to_string()],
+        };
+        let err = crate::types::LocalResources::try_from(proto)
+            .expect_err("conversion should reject ambiguous wildcard");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("*com"), "{msg}");
+        assert!(
+            msg.contains("leading dot") || msg.contains("invalid"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn try_from_v2_local_resources_collects_all_allowed_hosts_errors() {
+        // Three bad entries in one workload — the conversion should report
+        // all three in a single error so the user doesn't have to iterate
+        // fix → start → fail → fix → start → ... for each entry.
+        let proto = types::v2::LocalResources {
+            memory_limit_mb: 0,
+            cpu_limit: 0,
+            config: Default::default(),
+            environment: Default::default(),
+            volume_mounts: vec![],
+            allowed_hosts: vec![
+                "*com".to_string(),                       // bare-star wildcard
+                "https://api.example.com/v1".to_string(), // has path
+                "example.com:notaport".to_string(),       // bad port
+            ],
+        };
+        let err = crate::types::LocalResources::try_from(proto)
+            .expect_err("conversion should reject all bad entries");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("*com"), "{msg}");
+        assert!(msg.contains("/v1"), "{msg}");
+        assert!(msg.contains("notaport"), "{msg}");
+    }
 
     #[tokio::test]
     async fn test_image_pull_secret_to_oci_config_none() {

@@ -6,48 +6,104 @@ on:
     tags:
       - "v*"
   pull_request:
-    paths:
-      - "runtime-gateway/**"
-      - "runtime-operator/**"
-      - "go.work"
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
+  changes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
+        id: filter
+        with:
+          filters: |
+            relevant:
+              - 'runtime-gateway/**'
+              - 'runtime-operator/**'
+              - 'go.work'
+
   lint:
+    needs:
+      - changes
+    if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     permissions:
       # Required: allow read access to the content for analysis.
       contents: read
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/setup-go
       - uses: ./.github/actions/lint-go
         with:
           working-directory: runtime-gateway
 
   test:
+    needs:
+      - changes
+    if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/setup-go
       - name: Build
         working-directory: runtime-gateway
         run: go build -v ./
 
+  gate:
+    needs:
+      - lint
+      - test
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all jobs to pass or be skipped
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          if echo "$RESULTS" | grep -qE '"(failure|cancelled)"'; then
+            exit 1
+          fi
+
+  # The `sha-<full-sha>` tag is what release-tag.yml pins to when promoting
+  # this canary digest as the immutable vX.Y.Z release tag. `canary` itself
+  # moves on every subsequent main push.
   canary:
-    if: github.ref == 'refs/heads/main' || contains(github.event.pull_request.labels.*.name, 'canary')
-    needs: [lint, test]
+    # `always()` is required to break the skipped-`changes` propagation
+    # that otherwise marks this job skipped even when its direct needs
+    # all succeed. The original intent — run on main pushes or PRs with
+    # the `canary` label — is preserved as the second clause; the
+    # per-need `result == 'success'` gates restore the implicit success()
+    # check that `always()` disables.
+    if: |
+      always() &&
+      (github.ref == 'refs/heads/main' || contains(github.event.pull_request.labels.*.name, 'canary')) &&
+      needs.lint.result == 'success' &&
+      needs.test.result == 'success'
+    needs:
+      - lint
+      - test
     permissions:
       contents: write
       packages: write
     uses: ./.github/workflows/docker-build-push.yml
-    secrets: inherit
     with:
       working-directory: runtime-gateway
       file: runtime-gateway/Dockerfile
@@ -55,19 +111,5 @@ jobs:
       push: true
       tags: |
         type=raw,value=canary
+        type=sha,format=long,prefix=sha-
 
-  release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [lint, test]
-    permissions:
-      contents: write
-      packages: write
-    uses: ./.github/workflows/docker-build-push.yml
-    secrets: inherit
-    with:
-      working-directory: runtime-gateway
-      file: runtime-gateway/Dockerfile
-      image: ghcr.io/wasmcloud/runtime-gateway
-      push: true
-      tags: |
-        type=semver,pattern={{version}},value=${{ github.ref_name }}

@@ -10,8 +10,9 @@ use std::sync::Arc;
 
 use crate::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use crate::engine::workload::WorkloadItem;
-use crate::plugin::HostPlugin;
+use crate::plugin::{HostPlugin, WitInterfaces};
 use crate::wit::{WitInterface, WitWorld};
+use tracing::instrument;
 use wasmtime::bail;
 
 const PLUGIN_LOGGING_ID: &str = "wasi-logging";
@@ -40,15 +41,14 @@ struct ComponentInfo {
 }
 
 impl<'a> bindings::wasi::logging::logging::Host for ActiveCtx<'a> {
+    #[instrument(name = "wasi.logging.log", skip(self, message))]
     async fn log(
         &mut self,
         level: Level,
         context: String,
         message: String,
     ) -> wasmtime::Result<()> {
-        let Some(plugin) = self.get_plugin::<TracingLogger>(PLUGIN_LOGGING_ID) else {
-            bail!("TracingLogger plugin not found in context");
-        };
+        let plugin = self.try_get_plugin::<TracingLogger>(PLUGIN_LOGGING_ID)?;
 
         let workloads = plugin.components.read().await;
         let Some(ComponentInfo {
@@ -136,14 +136,10 @@ impl HostPlugin for TracingLogger {
     async fn on_workload_item_bind<'a>(
         &self,
         component_handle: &mut WorkloadItem<'a>,
-        interfaces: std::collections::HashSet<WitInterface>,
+        interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
         // Ensure exactly one interface: "wasi:logging/logging"
-        let has_logging = interfaces
-            .iter()
-            .any(|i| i.namespace == "wasi" && i.package == "logging");
-
-        if !has_logging {
+        if !interfaces.contains("wasi", "logging", &[]) {
             tracing::warn!(
                 "TracingLogger plugin requested for non-wasi:logging interface(s): {:?}",
                 interfaces

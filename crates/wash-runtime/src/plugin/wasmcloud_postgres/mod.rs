@@ -13,7 +13,7 @@ use url::Url;
 
 use crate::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use crate::engine::workload::WorkloadItem;
-use crate::plugin::HostPlugin;
+use crate::plugin::{HostPlugin, WitInterfaces};
 use crate::wit::{WitInterface, WitWorld};
 
 use conversions::into_result_row;
@@ -178,17 +178,13 @@ fn extract_tls_requirement(url: &Url) -> bool {
 impl<'a> types::Host for ActiveCtx<'a> {}
 
 impl<'a> query::Host for ActiveCtx<'a> {
-    #[instrument(skip_all, fields(query = %q))]
+    #[instrument(name = "wasmcloud.postgres.query", skip_all, fields(query = %q))]
     async fn query(
         &mut self,
         q: String,
         params: Vec<PgValue>,
     ) -> wasmtime::Result<Result<Vec<query::ResultRow>, QueryError>> {
-        let Some(plugin) = self.get_plugin::<WasmcloudPostgres>(PLUGIN_POSTGRES_ID) else {
-            return Ok(Err(QueryError::Unexpected(
-                "postgres plugin not available".to_string(),
-            )));
-        };
+        let plugin = self.try_get_plugin::<WasmcloudPostgres>(PLUGIN_POSTGRES_ID)?;
 
         let component_id = self.component_id.to_string();
         let database = match plugin.database_for_component(&component_id).await {
@@ -243,13 +239,9 @@ impl<'a> query::Host for ActiveCtx<'a> {
         Ok(Ok(result))
     }
 
-    #[instrument(skip_all, fields(query = %q))]
+    #[instrument(name = "wasmcloud.postgres.query_batch", skip_all, fields(query = %q))]
     async fn query_batch(&mut self, q: String) -> wasmtime::Result<Result<(), QueryError>> {
-        let Some(plugin) = self.get_plugin::<WasmcloudPostgres>(PLUGIN_POSTGRES_ID) else {
-            return Ok(Err(QueryError::Unexpected(
-                "postgres plugin not available".to_string(),
-            )));
-        };
+        let plugin = self.try_get_plugin::<WasmcloudPostgres>(PLUGIN_POSTGRES_ID)?;
 
         let component_id = self.component_id.to_string();
         let database = match plugin.database_for_component(&component_id).await {
@@ -289,16 +281,12 @@ impl<'a> query::Host for ActiveCtx<'a> {
 }
 
 impl<'a> prepared::Host for ActiveCtx<'a> {
-    #[instrument(skip_all)]
+    #[instrument(name = "wasmcloud.postgres.prepare", skip_all)]
     async fn prepare(
         &mut self,
         statement: String,
     ) -> wasmtime::Result<Result<String, StatementPrepareError>> {
-        let Some(plugin) = self.get_plugin::<WasmcloudPostgres>(PLUGIN_POSTGRES_ID) else {
-            return Ok(Err(StatementPrepareError::Unexpected(
-                "postgres plugin not available".to_string(),
-            )));
-        };
+        let plugin = self.try_get_plugin::<WasmcloudPostgres>(PLUGIN_POSTGRES_ID)?;
 
         let component_id = self.component_id.to_string();
         let database = match plugin.database_for_component(&component_id).await {
@@ -353,17 +341,13 @@ impl<'a> prepared::Host for ActiveCtx<'a> {
         Ok(Ok(token))
     }
 
-    #[instrument(skip_all, fields(stmt_token = %stmt_token))]
+    #[instrument(name = "wasmcloud.postgres.exec", skip_all, fields(stmt_token = %stmt_token))]
     async fn exec(
         &mut self,
         stmt_token: String,
         params: Vec<PgValue>,
     ) -> wasmtime::Result<Result<u64, PreparedStatementExecError>> {
-        let Some(plugin) = self.get_plugin::<WasmcloudPostgres>(PLUGIN_POSTGRES_ID) else {
-            return Ok(Err(PreparedStatementExecError::Unexpected(
-                "postgres plugin not available".to_string(),
-            )));
-        };
+        let plugin = self.try_get_plugin::<WasmcloudPostgres>(PLUGIN_POSTGRES_ID)?;
 
         let entry = {
             let stmts = plugin.prepared_statements.read().await;
@@ -470,17 +454,15 @@ impl HostPlugin for WasmcloudPostgres {
     async fn on_workload_item_bind<'a>(
         &self,
         component_handle: &mut WorkloadItem<'a>,
-        interfaces: HashSet<WitInterface>,
+        interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
-        let database = match interfaces
-            .iter()
-            .find(|i| i.namespace == "wasmcloud" && i.package == "postgres")
-        {
-            Some(i) => match i.config.get("database").cloned() {
-                Some(db) => db,
-                None => bail!("wasmcloud:postgres requires a 'database' config parameter"),
-            },
+        let database = match interfaces.get("wasmcloud", "postgres", &[]) {
+            Some(i) => i.config.get("database"),
             None => return Ok(()),
+        };
+
+        let Some(database) = database.cloned() else {
+            bail!("wasmcloud:postgres requires a 'database' config parameter")
         };
 
         let component_id = component_handle.id().to_string();
@@ -518,7 +500,7 @@ impl HostPlugin for WasmcloudPostgres {
     async fn on_workload_unbind(
         &self,
         workload_id: &str,
-        _interfaces: HashSet<WitInterface>,
+        _interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
         tracing::debug!(workload_id = %workload_id, "Unbinding postgres plugin from workload");
 

@@ -31,7 +31,7 @@ use etcetera::base_strategy::BaseStrategy;
 use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use wash_runtime::engine::workload::WorkloadItem;
 use wash_runtime::plugin::config::{resolve_field, resolve_optional_field};
-use wash_runtime::plugin::{HostPlugin, WorkloadTracker, find_interface};
+use wash_runtime::plugin::{HostPlugin, WitInterfaces, WorkloadTracker};
 use wash_runtime::wit::{WitInterface, WitWorld};
 
 use codex_process::{
@@ -574,7 +574,7 @@ impl<'a> bindings::custom::codex::executor::Host for ActiveCtx<'a> {
         prompt: String,
         config: Option<WitCodexConfig>,
     ) -> wasmtime::Result<Result<Resource<ExecStreamHandle>, CodexError>> {
-        let Some(plugin) = self.get_plugin::<Codex>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<Codex>(PLUGIN_ID) else {
             return Ok(Err(CodexError::Internal(
                 "codex plugin not available".to_string(),
             )));
@@ -670,7 +670,7 @@ impl<'a> bindings::custom::codex::executor::HostExecStream for ActiveCtx<'a> {
             return Ok(Ok((vec![], true)));
         }
 
-        let Some(plugin) = self.get_plugin::<Codex>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<Codex>(PLUGIN_ID) else {
             return Ok(Err(CodexError::Internal(
                 "codex plugin not available".to_string(),
             )));
@@ -763,7 +763,7 @@ impl<'a> bindings::custom::codex::session::Host for ActiveCtx<'a> {
         &mut self,
         session_id: String,
     ) -> wasmtime::Result<Result<TokenUsage, CodexError>> {
-        let Some(plugin) = self.get_plugin::<Codex>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<Codex>(PLUGIN_ID) else {
             return Ok(Err(CodexError::Internal(
                 "codex plugin not available".to_string(),
             )));
@@ -808,7 +808,7 @@ impl<'a> bindings::custom::codex::session::Host for ActiveCtx<'a> {
         prompt: String,
         config: Option<WitCodexConfig>,
     ) -> wasmtime::Result<Result<Resource<ExecStreamHandle>, CodexError>> {
-        let Some(plugin) = self.get_plugin::<Codex>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<Codex>(PLUGIN_ID) else {
             return Ok(Err(CodexError::Internal(
                 "codex plugin not available".to_string(),
             )));
@@ -933,7 +933,7 @@ impl<'a> bindings::custom::codex::session::Host for ActiveCtx<'a> {
         prompt: String,
         config: Option<WitCodexConfig>,
     ) -> wasmtime::Result<Result<Resource<ExecStreamHandle>, CodexError>> {
-        let Some(plugin) = self.get_plugin::<Codex>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<Codex>(PLUGIN_ID) else {
             return Ok(Err(CodexError::Internal(
                 "codex plugin not available".to_string(),
             )));
@@ -973,7 +973,7 @@ impl<'a> bindings::custom::codex::session::Host for ActiveCtx<'a> {
         context_key: String,
         session_id: String,
     ) -> wasmtime::Result<Result<(), CodexError>> {
-        let Some(plugin) = self.get_plugin::<Codex>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<Codex>(PLUGIN_ID) else {
             return Ok(Err(CodexError::Internal(
                 "codex plugin not available".to_string(),
             )));
@@ -1013,7 +1013,7 @@ impl<'a> bindings::custom::codex::session::Host for ActiveCtx<'a> {
         &mut self,
         session_id: String,
     ) -> wasmtime::Result<Result<(), CodexError>> {
-        let Some(plugin) = self.get_plugin::<Codex>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<Codex>(PLUGIN_ID) else {
             return Ok(Err(CodexError::Internal(
                 "codex plugin not available".to_string(),
             )));
@@ -1054,7 +1054,7 @@ impl<'a> bindings::custom::codex::session::Host for ActiveCtx<'a> {
 
     #[instrument(skip_all)]
     async fn list_sessions(&mut self) -> wasmtime::Result<Result<Vec<SessionInfo>, CodexError>> {
-        let Some(plugin) = self.get_plugin::<Codex>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<Codex>(PLUGIN_ID) else {
             return Ok(Err(CodexError::Internal(
                 "codex plugin not available".to_string(),
             )));
@@ -1096,7 +1096,7 @@ impl<'a> bindings::custom::codex::session::Host for ActiveCtx<'a> {
         session_id: String,
         auto_approve: bool,
     ) -> wasmtime::Result<Result<(), CodexError>> {
-        let Some(plugin) = self.get_plugin::<Codex>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<Codex>(PLUGIN_ID) else {
             return Ok(Err(CodexError::Internal(
                 "codex plugin not available".to_string(),
             )));
@@ -1144,7 +1144,7 @@ impl<'a> bindings::custom::codex::session::Host for ActiveCtx<'a> {
         item_id: String,
         approved: bool,
     ) -> wasmtime::Result<Result<(), CodexError>> {
-        let Some(plugin) = self.get_plugin::<Codex>(PLUGIN_ID) else {
+        let Ok(plugin) = self.try_get_plugin::<Codex>(PLUGIN_ID) else {
             return Ok(Err(CodexError::Internal(
                 "codex plugin not available".to_string(),
             )));
@@ -1231,10 +1231,10 @@ impl HostPlugin for Codex {
     async fn on_workload_item_bind<'a>(
         &self,
         item: &mut WorkloadItem<'a>,
-        interfaces: HashSet<WitInterface>,
+        interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
         // Only handle codex interfaces
-        let Some(interface) = find_interface(&interfaces, "custom", "codex") else {
+        let Some(interface) = interfaces.get("custom", "codex", &[]) else {
             return Ok(());
         };
 
@@ -1308,7 +1308,7 @@ impl HostPlugin for Codex {
     async fn on_workload_unbind(
         &self,
         workload_id: &str,
-        _interfaces: HashSet<WitInterface>,
+        _interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
         let workload_cleanup = |_| async {};
         let component_cleanup = |component_data: ComponentData| async move {
