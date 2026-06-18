@@ -230,10 +230,21 @@ impl MultiBackendKeyValue {
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to connect to NATS: {e}"))?;
                 let jetstream = async_nats::jetstream::new(client);
+                // Idempotent: create_key_value returns the existing bucket if one
+                // exists with the same config, so concurrent opens all succeed and
+                // a missing bucket is auto-created. Requires stream-create
+                // permission even for read-only use; that is acceptable today
+                // because the NATS connection is host-owned and not scoped per
+                // workload. Ported from upstream wash-runtime commit 03e335116.
                 let store = jetstream
-                    .get_key_value(&bucket)
+                    .create_key_value(async_nats::jetstream::kv::Config {
+                        bucket: bucket.clone(),
+                        ..Default::default()
+                    })
                     .await
-                    .map_err(|e| anyhow::anyhow!("failed to get NATS KV bucket '{bucket}': {e}"))?;
+                    .map_err(|e| {
+                        anyhow::anyhow!("failed to open NATS KV bucket '{bucket}': {e}")
+                    })?;
                 KvEngine::Nats {
                     store: Box::new(store),
                 }
