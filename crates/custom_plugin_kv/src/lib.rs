@@ -186,8 +186,7 @@ impl MultiBackendKeyValue {
                 Some(data) => data.interface_config.clone(),
                 None => {
                     return Err(anyhow::anyhow!(
-                        "No KV config found for component '{}'",
-                        component_id
+                        "No KV config found for component '{component_id}'",
                     ));
                 }
             }

@@ -313,8 +313,7 @@ impl<'a> bindings::custom::mail::sender::HostMailClient for ActiveCtx<'a> {
             Ok(msg) => msg,
             Err(e) => {
                 return Ok(Err(MailError::SendFailed(format!(
-                    "failed to build email: {}",
-                    e
+                    "failed to build email: {e}"
                 ))));
             }
         };
@@ -357,8 +356,7 @@ impl<'a> bindings::custom::mail::sender::HostMailClient for ActiveCtx<'a> {
             Err(e) => {
                 debug!(error = %e, "Failed to send email");
                 Ok(Err(MailError::SendFailed(format!(
-                    "smtp send failed: {}",
-                    e
+                    "smtp send failed: {e}"
                 ))))
             }
         }
@@ -589,7 +587,7 @@ fn parse_addresses(addrs: &str) -> Result<Vec<Mailbox>, String> {
             continue;
         }
         let mailbox: Mailbox = addr.parse().map_err(|e: lettre::address::AddressError| {
-            format!("invalid address '{}': {}", addr, e)
+            format!("invalid address '{addr}': {e}")
         })?;
         result.push(mailbox);
     }

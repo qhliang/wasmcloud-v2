@@ -205,16 +205,14 @@ impl LlmGateway {
             let lock = self.tracker.read().await;
             let data = lock.get_component_data(component_id).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "No LLM Gateway config found for component '{}'",
-                    component_id
+                    "No LLM Gateway config found for component '{component_id}'"
                 )
             })?;
             data.config
                 .as_ref()
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "LLM Gateway config not set for component '{}'",
-                        component_id
+                        "LLM Gateway config not set for component '{component_id}'"
                     )
                 })?
                 .clone()
@@ -309,8 +307,7 @@ fn parse_provider(provider: &str) -> Result<AdapterKind, String> {
         "openai-compat" => Ok(AdapterKind::OpenAI),
         other => AdapterKind::from_lower_str(other).ok_or_else(|| {
             format!(
-                "Unknown provider '{}'. Supported: openai, anthropic, gemini, deepseek, ollama, groq, openai-compat",
-                other
+                "Unknown provider '{other}'. Supported: openai, anthropic, gemini, deepseek, ollama, groq, openai-compat"
             )
         }),
     }
@@ -619,15 +616,13 @@ impl<'a> bindings::custom::llm_gateway::chat::Host for ActiveCtx<'a> {
                     Some(c) => c,
                     None => {
                         return Ok(Err(LlmError::Unexpected(format!(
-                            "LLM Gateway config not set for component '{}'",
-                            component_id
+                            "LLM Gateway config not set for component '{component_id}'"
                         ))));
                     }
                 },
                 None => {
                     return Ok(Err(LlmError::Unexpected(format!(
-                        "No LLM Gateway config found for component '{}'",
-                        component_id
+                        "No LLM Gateway config found for component '{component_id}'"
                     ))));
                 }
             }
@@ -787,15 +782,13 @@ impl<'a> bindings::custom::llm_gateway::chat_streaming::Host for ActiveCtx<'a> {
                     Some(c) => c,
                     None => {
                         return Ok(Err(LlmError::Unexpected(format!(
-                            "LLM Gateway config not set for component '{}'",
-                            component_id
+                            "LLM Gateway config not set for component '{component_id}'"
                         ))));
                     }
                 },
                 None => {
                     return Ok(Err(LlmError::Unexpected(format!(
-                        "No LLM Gateway config found for component '{}'",
-                        component_id
+                        "No LLM Gateway config found for component '{component_id}'"
                     ))));
                 }
             }

@@ -402,8 +402,7 @@ impl CustomBlobstore {
                 Some(data) => data.interface_config.clone(),
                 None => {
                     return Err(anyhow::anyhow!(
-                        "No blobstore config found for component '{}'",
-                        component_id
+                        "No blobstore config found for component '{component_id}'"
                     ));
                 }
             }
