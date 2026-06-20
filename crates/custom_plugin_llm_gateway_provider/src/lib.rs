@@ -204,16 +204,12 @@ impl LlmGateway {
         let config = {
             let lock = self.tracker.read().await;
             let data = lock.get_component_data(component_id).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No LLM Gateway config found for component '{component_id}'"
-                )
+                anyhow::anyhow!("No LLM Gateway config found for component '{component_id}'")
             })?;
             data.config
                 .as_ref()
                 .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "LLM Gateway config not set for component '{component_id}'"
-                    )
+                    anyhow::anyhow!("LLM Gateway config not set for component '{component_id}'")
                 })?
                 .clone()
         };
