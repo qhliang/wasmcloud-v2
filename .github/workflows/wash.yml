@@ -245,7 +245,7 @@ jobs:
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
-          outputs: type=image,name=ghcr.io/wasmcloud/wash,push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/wash,push-by-digest=true,name-canonical=true,push=true
           cache-from: |
             type=gha,scope=wash-${{ matrix.arch }}-${{ github.head_ref || github.ref_name }}
             type=gha,scope=wash-${{ matrix.arch }}-main
@@ -433,7 +433,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         with:
-          images: ghcr.io/wasmcloud/wash
+          images: ghcr.io/${{ github.repository_owner }}/wash
           tags: |
             type=raw,value=canary
             type=sha,format=long,prefix=sha-
@@ -458,12 +458,12 @@ jobs:
             args+=(-t "$tag")
           done
           for d in "${digests[@]}"; do
-            args+=("ghcr.io/wasmcloud/wash@sha256:$d")
+            args+=("ghcr.io/${{ github.repository_owner }}/wash@sha256:$d")
           done
           docker buildx imagetools create "${args[@]}"
       - name: Inspect image
         run: |
-          docker buildx imagetools inspect "ghcr.io/wasmcloud/wash:${STEPS_META_OUTPUTS_VERSION}"
+          docker buildx imagetools inspect "ghcr.io/${{ github.repository_owner }}/wash:${STEPS_META_OUTPUTS_VERSION}"
         env:
           STEPS_META_OUTPUTS_VERSION: ${{ steps.meta.outputs.version }}
 
@@ -484,7 +484,7 @@ jobs:
       packages: write
     uses: ./.github/workflows/docker-build-push.yml
     with:
-      image: ghcr.io/wasmcloud/wash
+      image: ghcr.io/${{ github.repository_owner }}/wash
       build-args: |
         CARGO_FEATURES=wasip3,wasi-tls
       # Push (and the manifest merge) only on main; PRs build to validate.

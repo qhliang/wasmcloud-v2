@@ -3,7 +3,7 @@ name: release-tag
 # Once the release-train PR has merged AND the canary builds on the merge
 # commit have succeeded, this workflow:
 #   1. Promotes (build-once) each canary container image: retags
-#      `ghcr.io/wasmcloud/<image>:sha-<merge-sha>` as `X.Y.Z`. Same
+#      `ghcr.io/<owner>/<image>:sha-<merge-sha>` as `X.Y.Z`. Same
 #      manifest digest, no rebuild — the bytes that passed canary CI are
 #      the bytes users pull at the release tag. Note: OCI image tags use
 #      the bare semver (no `v` prefix) per the convention users expect
@@ -229,9 +229,9 @@ jobs:
           # tests. Retagging via `imagetools create` against the sha-pinned
           # source preserves the multi-arch manifest.
           declare -A IMAGES=(
-            [wash]="ghcr.io/wasmcloud/wash"
-            [gateway]="ghcr.io/wasmcloud/runtime-gateway"
-            [operator]="ghcr.io/wasmcloud/runtime-operator"
+            [wash]="ghcr.io/${{ github.repository_owner }}/wash"
+            [gateway]="ghcr.io/${{ github.repository_owner }}/runtime-gateway"
+            [operator]="ghcr.io/${{ github.repository_owner }}/runtime-operator"
           )
           for KEY in wash gateway operator; do
             IMG="${IMAGES[${KEY}]}"
@@ -264,21 +264,21 @@ jobs:
       - name: Attest wash release manifest
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
-          subject-name: ghcr.io/wasmcloud/wash
+          subject-name: ghcr.io/${{ github.repository_owner }}/wash
           subject-digest: ${{ steps.promote.outputs.wash_digest }}
           push-to-registry: true
 
       - name: Attest runtime-gateway release manifest
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
-          subject-name: ghcr.io/wasmcloud/runtime-gateway
+          subject-name: ghcr.io/${{ github.repository_owner }}/runtime-gateway
           subject-digest: ${{ steps.promote.outputs.gateway_digest }}
           push-to-registry: true
 
       - name: Attest runtime-operator release manifest
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
-          subject-name: ghcr.io/wasmcloud/runtime-operator
+          subject-name: ghcr.io/${{ github.repository_owner }}/runtime-operator
           subject-digest: ${{ steps.promote.outputs.operator_digest }}
           push-to-registry: true
 
