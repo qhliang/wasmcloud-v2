@@ -2214,13 +2214,11 @@ mod tests {
         postgres_iface
             .config
             .insert("database".to_string(), "testdb".to_string());
-        let cases: Vec<(Arc<dyn HostPlugin>, WitInterface)> = vec![
-            (
-                Arc::new(WasmcloudPostgres::new("postgres://user:pass@localhost:5432/db").unwrap())
-                    as Arc<dyn HostPlugin>,
-                postgres_iface,
-            ),
-        ];
+        let cases: Vec<(Arc<dyn HostPlugin>, WitInterface)> = vec![(
+            Arc::new(WasmcloudPostgres::new("postgres://user:pass@localhost:5432/db").unwrap())
+                as Arc<dyn HostPlugin>,
+            postgres_iface,
+        )];
         // A minimal empty component is enough: the bind hooks only mutate the linker.
         let build_component = || {
             let engine = wasmtime::Engine::default();

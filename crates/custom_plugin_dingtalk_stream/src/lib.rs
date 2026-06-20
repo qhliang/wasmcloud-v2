@@ -41,9 +41,9 @@ use wasmtime::component::Resource;
 use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use wash_runtime::engine::workload::{ResolvedWorkload, WorkloadItem};
 use wash_runtime::plugin::HostPlugin;
+use wash_runtime::plugin::WitInterfaces;
 use wash_runtime::plugin::WorkloadTracker;
 use wash_runtime::plugin::config::resolve_field;
-use wash_runtime::plugin::WitInterfaces;
 use wash_runtime::wit::{WitInterface, WitWorld};
 
 mod bindings {

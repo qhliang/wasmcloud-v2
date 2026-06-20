@@ -271,11 +271,14 @@ fn dirs_cache_path() -> PathBuf {
 // ---------------------------------------------------------------------------
 
 fn new_session_key() -> String {
-    std::time::SystemTime::now()
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_nanos()
-        .to_string()
+        .as_nanos();
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos}-{seq}")
 }
 
 // ---------------------------------------------------------------------------
