@@ -23,6 +23,16 @@ inputs:
       Omit (or pass empty) to skip the publish steps entirely.
     required: false
     default: ""
+  package-name:
+    description: >
+      Cargo package name to publish. Required when the working-directory
+      is a Cargo workspace root (its top-level Cargo.toml has [workspace]
+      instead of [package]); the publish step needs the package name to
+      look up the version via `cargo metadata`. When omitted, the name is
+      read from `Cargo.toml`'s [package].name field, which assumes a
+      single-package example.
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -80,12 +90,15 @@ runs:
           echo "ERROR: .wash/config.yaml is missing build.component_path" >&2
           exit 1
         fi
-        # Resolve the Cargo package version. cargo metadata walks up to the
-        # workspace root, which is what we want for grpc-hello-world's
-        # component-* dirs where version is inherited from [workspace.package].
-        PKG_NAME=$(yq -p toml '.package.name' Cargo.toml)
+        # Resolve the Cargo package name + version. When the caller
+        # supplies `package-name` (workspace case), use it directly;
+        # otherwise read from Cargo.toml's [package].name.
+        PKG_NAME="${{ inputs.package-name }}"
+        if [[ -z "${PKG_NAME}" ]]; then
+          PKG_NAME=$(yq -p toml '.package.name' Cargo.toml)
+        fi
         if [[ -z "${PKG_NAME}" || "${PKG_NAME}" == "null" ]]; then
-          echo "ERROR: package.name missing in Cargo.toml" >&2
+          echo "ERROR: package.name missing in Cargo.toml (and package-name input not set)" >&2
           exit 1
         fi
         VERSION=$(cargo metadata --format-version 1 --no-deps --manifest-path Cargo.toml \
