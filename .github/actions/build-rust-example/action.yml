@@ -31,11 +31,14 @@ runs:
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       run: |
-        # clippy resolves the wit_bindgen::generate! macro, so WIT deps
-        # need to be in place before clippy runs. Examples without a
-        # wit/ directory (e.g. protobuf-based ones) skip this.
-        if [[ -d wit ]]; then
+        # Skip when wit/deps/ already has content — the example ships its
+        # deps committed (typically because it imports custom:* namespaces
+        # that have no public registry, so wash wit fetch would fail trying
+        # to resolve them).
+        if [[ -d wit ]] && ! ls wit/deps/* >/dev/null 2>&1; then
           wash wit fetch
+        else
+          echo "wit/deps/ already populated (or no wit/ dir), skipping wash wit fetch"
         fi
 
     - name: Format check
