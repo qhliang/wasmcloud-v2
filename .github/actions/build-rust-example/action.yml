@@ -54,7 +54,11 @@ runs:
     - name: Build
       shell: bash
       working-directory: ${{ inputs.working-directory }}
-      run: wash build
+      # --skip-fetch: wit/deps/ is either pre-populated by the Fetch WIT
+      # dependencies step above, or committed to the repo for namespaces
+      # without a public registry. Either way wash build should not try
+      # to refresh deps itself.
+      run: wash build --skip-fetch
 
     - name: Login to ghcr.io
       if: github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.image != ''
