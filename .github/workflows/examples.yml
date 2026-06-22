@@ -37,11 +37,7 @@ env:
   # item so that multiple items can share a `filter`. e.g. examples/grpc-hello-world/**
   ITEMS: |
     [
-      {"key": "blobby",                   "workdir": "examples/blobby",                              "image": "ghcr.io/wasmcloud/components/blobby"},
-      {"key": "grpc-hello-world-client",  "filter": "grpc-hello-world",   "workdir": "examples/grpc-hello-world/component-client", "image": "ghcr.io/wasmcloud/components/grpc-hello-world-client", "needs_protoc": true},
-      {"key": "grpc-hello-world-server",  "filter": "grpc-hello-world",   "workdir": "examples/grpc-hello-world/component-server", "image": "ghcr.io/wasmcloud/components/grpc-hello-world-server", "needs_protoc": true},
-      {"key": "otel-config",              "workdir": "examples/otel-config",                         "image": "ghcr.io/wasmcloud/components/otel-config"},
-      {"key": "qrcode",                   "workdir": "examples/qrcode",                              "image": "ghcr.io/wasmcloud/components/qrcode"}
+      {"key": "http-api-distributed",                   "workdir": "examples/http-api-distributed",                              "image": "ghcr.io/qhliang/components/http-api-distributed"}
     ]
   # When these change, every example rebuilds.
   SHARED_PATHS: |
@@ -140,6 +136,21 @@ jobs:
         with:
           version: "29.x"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create minimal wash config if missing
+        working-directory: ${{ matrix.workdir }}
+        run: |
+          if [[ -f .wash/config.yaml ]]; then
+            echo ".wash/config.yaml already exists, skipping generation"
+            exit 0
+          fi
+          mkdir -p .wash
+          cat > .wash/config.yaml <<'EOF'
+          build:
+            command: cargo build --workspace --target wasm32-wasip2 --release
+            component_path: target/wasm32-wasip2/release/http_api.wasm
+          EOF
+          echo "Generated minimal .wash/config.yaml (CI override; the real one is gitignored because it contains per-developer secrets)"
 
       - uses: ./.github/actions/build-rust-example
         with:
