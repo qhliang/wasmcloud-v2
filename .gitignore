@@ -20,7 +20,6 @@ worktrees/
 .claude
 
 # WIT dependencies (fetched by wash build / build scripts)
-examples/*/wit/deps/
 crates/wash-runtime/tests/fixtures/*/wit/deps/
 
 # Local WIT build output (root /wit/ publish workflow)

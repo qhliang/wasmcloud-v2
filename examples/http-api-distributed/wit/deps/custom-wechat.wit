@@ -1,0 +1,48 @@
+package custom:wechat@0.1.0;
+
+interface types {
+    variant wechat-error {
+        internal(string),
+        send-failed(string),
+        not-ready(string),
+    }
+
+    record wechat-config {
+        token: string,
+    }
+
+    record wechat-message {
+        message-id: string,
+        sender: string,
+        receiver: string,
+        message-type: string,
+        text-content: option<string>,
+        timestamp: s64,
+        raw-json: string,
+    }
+}
+
+interface sender {
+    use types.{wechat-error, wechat-config};
+
+    resource wechat-client {
+        constructor(config: option<wechat-config>);
+        send-text: func(to: string, text: string) -> result<_, wechat-error>;
+        send-media: func(to: string, file-path: string) -> result<_, wechat-error>;
+        qr-start: func() -> result<string, wechat-error>;
+        qr-poll-status: func(session-json: string) -> result<string, wechat-error>;
+        stop: func() -> result<_, wechat-error>;
+    }
+}
+
+interface handler {
+    use types.{wechat-message};
+    use sender.{wechat-client};
+
+    on-message: func(client: borrow<wechat-client>, msg: wechat-message) -> result<_, string>;
+}
+
+world wechat {
+    import sender;
+    export handler;
+}

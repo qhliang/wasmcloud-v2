@@ -1,0 +1,46 @@
+package custom:dingtalk-stream@0.1.0;
+
+interface types {
+    variant dingtalk-error {
+        internal(string),
+        auth-failed(string),
+        send-failed(string),
+    }
+
+    record dingtalk-config {
+        client-id: string,
+        client-secret: string,
+    }
+
+    record chatbot-message {
+        conversation-type: string,
+        conversation-id: string,
+        sender-id: string,
+        sender-nick: string,
+        message-id: string,
+        text-content: option<string>,
+        is-admin: bool,
+        is-at: bool,
+        raw-json: string,
+    }
+}
+
+interface sender {
+    use types.{dingtalk-error, dingtalk-config};
+
+    resource dingtalk-client {
+        constructor(config: option<dingtalk-config>);
+        send-text: func(conversation-id: string, sender-id: string, content: string) -> result<_, dingtalk-error>;
+        send-markdown: func(conversation-id: string, sender-id: string, title: string, content: string) -> result<_, dingtalk-error>;
+        send-oto-text: func(user-id: string, content: string) -> result<_, dingtalk-error>;
+        get-access-token: func() -> result<string, dingtalk-error>;
+        stop: func() -> result<_, dingtalk-error>;
+    }
+}
+
+interface handler {
+    use types.{chatbot-message};
+    use sender.{dingtalk-client};
+
+    on-message: func(client: borrow<dingtalk-client>, msg: chatbot-message) -> result<_, string>;
+}

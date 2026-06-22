@@ -1,0 +1,111 @@
+package custom:feishu@0.1.0;
+
+interface types {
+    variant feishu-error {
+        internal(string),
+        auth-failed(string),
+        send-failed(string),
+    }
+
+    record feishu-config {
+        app-id: string,
+        app-secret: string,
+    }
+
+    record im-message {
+        message-id: string,
+        chat-id: string,
+        sender-id: string,
+        sender-type: string,
+        message-type: string,
+        text-content: option<string>,
+        create-time: string,
+        raw-json: string,
+    }
+}
+
+interface sender {
+    use types.{feishu-error, feishu-config};
+
+    resource feishu-client {
+        constructor(config: option<feishu-config>);
+
+        // IM
+        send-text: func(chat-id: string, content: string) -> result<_, feishu-error>;
+        send-text-to-user: func(receive-id: string, receive-id-type: string, content: string) -> result<_, feishu-error>;
+        reply-message: func(message-id: string, content: string) -> result<_, feishu-error>;
+        get-access-token: func() -> result<string, feishu-error>;
+
+        // Contact
+        get-user: func(user-id: string, user-id-type: string) -> result<string, feishu-error>;
+        batch-get-users: func(request-json: string) -> result<string, feishu-error>;
+        search-users: func(request-json: string) -> result<string, feishu-error>;
+        list-department-users: func(request-json: string) -> result<string, feishu-error>;
+        get-department: func(department-id: string, department-id-type: string) -> result<string, feishu-error>;
+        list-sub-departments: func(request-json: string) -> result<string, feishu-error>;
+
+        // Group
+        create-group: func(request-json: string) -> result<string, feishu-error>;
+        get-group: func(chat-id: string) -> result<string, feishu-error>;
+        update-group: func(chat-id: string, request-json: string) -> result<_, feishu-error>;
+        add-group-members: func(chat-id: string, request-json: string) -> result<string, feishu-error>;
+        remove-group-members: func(chat-id: string, request-json: string) -> result<_, feishu-error>;
+        list-group-members: func(chat-id: string, request-json: string) -> result<string, feishu-error>;
+
+        // AI
+        recognize-text: func(request-json: string) -> result<string, feishu-error>;
+        translate: func(request-json: string) -> result<string, feishu-error>;
+
+        // Calendar
+        list-calendars: func(request-json: string) -> result<string, feishu-error>;
+        create-calendar-event: func(calendar-id: string, request-json: string) -> result<string, feishu-error>;
+        list-calendar-events: func(calendar-id: string, request-json: string) -> result<string, feishu-error>;
+        get-calendar-event: func(calendar-id: string, event-id: string) -> result<string, feishu-error>;
+        delete-calendar-event: func(calendar-id: string, event-id: string) -> result<_, feishu-error>;
+
+        // CardKit
+        create-card: func(request-json: string) -> result<string, feishu-error>;
+        update-card: func(card-id: string, request-json: string) -> result<_, feishu-error>;
+
+        // Mail
+        send-mail: func(user-mailbox-id: string, request-json: string) -> result<string, feishu-error>;
+        list-mails: func(user-mailbox-id: string, request-json: string) -> result<string, feishu-error>;
+        get-mail: func(user-mailbox-id: string, message-id: string) -> result<string, feishu-error>;
+
+        // Task
+        create-task: func(request-json: string) -> result<string, feishu-error>;
+        get-task: func(task-guid: string) -> result<string, feishu-error>;
+        update-task: func(task-guid: string, request-json: string) -> result<_, feishu-error>;
+        delete-task: func(task-guid: string) -> result<_, feishu-error>;
+        list-tasks: func(request-json: string) -> result<string, feishu-error>;
+        create-tasklist: func(request-json: string) -> result<string, feishu-error>;
+        list-tasklists: func(request-json: string) -> result<string, feishu-error>;
+
+        // Bot
+        get-bot-info: func() -> result<string, feishu-error>;
+
+        // Docs
+        create-document: func(request-json: string) -> result<string, feishu-error>;
+        get-document: func(document-id: string) -> result<string, feishu-error>;
+        create-spreadsheet: func(request-json: string) -> result<string, feishu-error>;
+        get-spreadsheet: func(spreadsheet-token: string) -> result<string, feishu-error>;
+        create-bitable: func(request-json: string) -> result<string, feishu-error>;
+        list-bitable-tables: func(app-token: string) -> result<string, feishu-error>;
+        list-bitable-records: func(app-token: string, table-id: string, request-json: string) -> result<string, feishu-error>;
+
+        // Lifecycle
+        stop: func() -> result<_, feishu-error>;
+    }
+}
+
+interface handler {
+    use types.{im-message};
+    use sender.{feishu-client};
+
+    on-message: func(client: borrow<feishu-client>, msg: im-message) -> result<_, string>;
+}
+
+world feishu {
+    import sender;
+    export handler;
+}

@@ -1,0 +1,35 @@
+package custom:mail@0.1.0;
+
+interface types {
+    variant mail-error {
+        config-error(string),
+        send-failed(string),
+        invalid-address(string),
+        internal(string),
+    }
+
+    record mail-config {
+        smtp-host: string,
+        smtp-port: option<u16>,
+        username: string,
+        password: string,
+        default-from: string,
+        imap-host: option<string>,
+    }
+}
+
+interface sender {
+    use types.{mail-error, mail-config};
+
+    resource mail-client {
+        constructor(config: option<mail-config>);
+        send-mail: func(to: string, subject: string, body-text: option<string>, body-html: option<string>, cc: option<string>, bcc: option<string>) -> result<_, mail-error>;
+        list-mails: func(mailbox: option<string>, search-criteria: option<string>, limit: option<u32>) -> result<string, mail-error>;
+        get-mail: func(message-id: string, mailbox: option<string>) -> result<string, mail-error>;
+        stop: func() -> result<_, mail-error>;
+    }
+}
+
+world mail {
+    import sender;
+}

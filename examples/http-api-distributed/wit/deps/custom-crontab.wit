@@ -1,0 +1,43 @@
+package custom:crontab@0.1.0;
+
+interface types {
+    variant schedule-error {
+        invalid-expression(string),
+        not-found(string),
+        already-exists(string),
+        internal(string),
+    }
+}
+
+/// Host-provided scheduling API that guest can call to manage schedules at runtime.
+interface scheduler {
+    use types.{schedule-error};
+
+    /// Add a periodic cron schedule.
+    /// Returns the schedule name on success.
+    schedule: func(name: string, cron-expression: string) -> result<_, schedule-error>;
+
+    /// Schedule a one-shot callback after the given delay.
+    /// Returns the schedule name on success.
+    schedule-delay: func(name: string, delay-ms: u64) -> result<_, schedule-error>;
+
+    /// Remove a schedule by name.
+    remove: func(name: string) -> result<_, schedule-error>;
+
+    /// List active schedule names.
+    list-schedules: func() -> result<list<string>, schedule-error>;
+}
+
+/// Interface that the guest component must export.
+/// The host calls `handle-tick` when a scheduled tick fires.
+interface handler {
+    /// Called by the host when a scheduled tick fires.
+    ///
+    /// `name` is the schedule name that triggered this tick.
+    handle-tick: func(name: string) -> result<_, string>;
+}
+
+world crontab {
+    import scheduler;
+    export handler;
+}

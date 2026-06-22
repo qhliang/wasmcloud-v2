@@ -1,0 +1,101 @@
+package custom:cf-d1@0.1.0;
+
+/// Types used by components and providers of the Cloudflare D1 interface
+interface types {
+    /// Errors that can occur when executing SQL queries
+    variant query-error {
+        /// Invalid query syntax
+        invalid-query(string),
+        /// Invalid parameters
+        invalid-params(string),
+        /// Database error
+        database-error(string),
+        /// Connection or authentication error
+        connection-error(string),
+        /// Unexpected error
+        unexpected(string),
+    }
+
+    /// Configuration for a D1 client
+    record d1-config {
+        /// Cloudflare account ID
+        account-id: string,
+        /// Cloudflare API token with D1 permissions
+        api-token: string,
+        /// D1 database ID
+        database-id: string,
+    }
+
+    /// A column value from a query result
+    variant column-value {
+        null,
+        integer(s64),
+        real(f64),
+        text(string),
+        blob(list<u8>),
+    }
+
+    /// A single row from a query result
+    record result-row {
+        /// Column values in order
+        values: list<column-value>,
+    }
+
+    /// Metadata about a column in the result
+    record column-meta {
+        /// Column name
+        name: string,
+        /// Column type (SQLite type name)
+        column-type: option<string>,
+    }
+
+    /// Result of query execution
+    record query-result {
+        /// Column metadata
+        columns: list<column-meta>,
+        /// Result rows
+        rows: list<result-row>,
+        /// Number of rows affected (for INSERT, UPDATE, DELETE)
+        rows-affected: u64,
+        /// Last inserted row ID (for INSERT)
+        last-insert-rowid: option<s64>,
+    }
+}
+
+/// Interface for executing SQL queries against Cloudflare D1
+interface query {
+    use types.{query-error, query-result, column-value, result-row, d1-config};
+
+    /// A D1 client resource that manages connection to a Cloudflare D1 database.
+    ///
+    /// Configuration can be provided dynamically via the constructor,
+    /// or statically via interface config as a fallback.
+    resource d1-client {
+        /// Create a new D1 client.
+        ///
+        /// If config is provided, it is used directly.
+        /// If config is None, the plugin falls back to static interface config.
+        constructor(config: option<d1-config>);
+
+        /// Execute a SQL query with parameters
+        ///
+        /// Parameters use SQLite syntax: ?, ?1, ?2, etc.
+        query: func(sql: string, params: list<column-value>) -> result<query-result, query-error>;
+
+        /// Execute a batch of SQL statements (no parameters allowed)
+        ///
+        /// Useful for migrations or multiple statements.
+        query-batch: func(sql: string) -> result<list<query-result>, query-error>;
+
+        /// Execute a SQL query and return only the first row
+        query-one: func(sql: string, params: list<column-value>) -> result<option<result-row>, query-error>;
+
+        /// Stop the client (no-op for D1, no background tasks)
+        stop: func() -> result<_, query-error>;
+    }
+}
+
+/// World defining the D1 database interface
+world d1 {
+    import query;
+}
