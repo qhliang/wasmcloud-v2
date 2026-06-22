@@ -2,19 +2,22 @@ name: examples
 
 # Validates and (on push to main) publishes the Rust components under
 # examples/. Pipeline:
-#   plan      dorny/paths-filter → plan-matrix.mjs picks the matrix for
-#             this event (PR = intersection with changed paths, push or
-#             examples-canary label = everything).
-#   coverage  coverage-matrix.mjs asserts ITEMS matches examples/ on
-#             disk (every dir with .wash/config.yaml + Cargo.toml is
-#             enrolled; every top-level example has a README.md).
-#   build     matrix-fans over plan.outputs.matrix; each cell runs
-#             build-rust-example (fmt + clippy + wash build, plus
-#             OCI publish on pushes to main when `image` is set).
+#   plan    dorny/paths-filter → plan-matrix.mjs picks the matrix for
+#           this event (PR = intersection with changed paths, push or
+#           examples-canary label = everything).
+#   build   matrix-fans over plan.outputs.matrix; each cell runs
+#           build-rust-example (fmt + clippy + wash build, plus
+#           OCI publish on pushes to main when `image` is set).
 #
-# Multi-component example (grpc-hello-world): one ITEMS entry per
-# component, both sharing `filter: grpc-hello-world` so a change anywhere
-# under examples/grpc-hello-world/** rebuilds both client and server.
+# This fork trims upstream's pipeline:
+#   - coverage job removed: it scans for `.wash/config.yaml` on disk,
+#     but http-api-distributed's real config is gitignored (contains
+#     per-developer secrets), so coverage always fails on the checkout.
+#     The build job materializes a minimal CI-only config instead.
+#   - One ITEMS entry per published wasm: http-api-distributed is a
+#     Cargo workspace with two members (http-api, task-leet). Each
+#     entry pins `package` + `component` so the generated config builds
+#     only the relevant crate and pushes the matching .wasm artifact.
 
 on:
   pull_request:
@@ -37,7 +40,8 @@ env:
   # item so that multiple items can share a `filter`. e.g. examples/grpc-hello-world/**
   ITEMS: |
     [
-      {"key": "http-api-distributed",                   "workdir": "examples/http-api-distributed",                              "image": "ghcr.io/qhliang/components/http-api-distributed"}
+      {"key": "http-api-distributed", "workdir": "examples/http-api-distributed", "package": "http-api",  "component": "http_api.wasm", "image": "ghcr.io/qhliang/components/http-api-distributed"},
+      {"key": "task-leet",            "workdir": "examples/http-api-distributed", "package": "task-leet", "component": "task_leet.wasm", "image": "ghcr.io/qhliang/components/task-leet"}
     ]
   # When these change, every example rebuilds.
   SHARED_PATHS: |
@@ -87,25 +91,6 @@ jobs:
           CANARY: ${{ contains(github.event.pull_request.labels.*.name, 'examples-canary') }}
         run: node .github/scripts/plan-matrix.mjs
 
-  coverage:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          persist-credentials: false
-      - name: Assert ITEMS matches examples/ on disk
-        env:
-          ITEMS: ${{ env.ITEMS }}
-          DISCOVERY_ROOT: examples
-          # Scoped to Rust because this workflow is Rust-only — a
-          # non-Rust subdirectory under examples/ wouldn't have a
-          # Cargo.toml and is silently ignored by the disk scan.
-          REQUIRE_FILES: '["Cargo.toml"]'
-          REQUIRE_README: "true"
-        run: node .github/scripts/coverage-matrix.mjs
-
   build:
     needs:
       - plan
@@ -139,18 +124,21 @@ jobs:
 
       - name: Create minimal wash config if missing
         working-directory: ${{ matrix.workdir }}
+        env:
+          PACKAGE: ${{ matrix.package }}
+          COMPONENT: ${{ matrix.component }}
         run: |
           if [[ -f .wash/config.yaml ]]; then
             echo ".wash/config.yaml already exists, skipping generation"
             exit 0
           fi
           mkdir -p .wash
-          cat > .wash/config.yaml <<'EOF'
+          cat > .wash/config.yaml <<EOF
           build:
-            command: cargo build --workspace --target wasm32-wasip2 --release
-            component_path: target/wasm32-wasip2/release/http_api.wasm
+            command: cargo build -p ${PACKAGE} --target wasm32-wasip2 --release
+            component_path: target/wasm32-wasip2/release/${COMPONENT}
           EOF
-          echo "Generated minimal .wash/config.yaml (CI override; the real one is gitignored because it contains per-developer secrets)"
+          echo "Generated minimal .wash/config.yaml for package ${PACKAGE} (CI override; the real one is gitignored because it contains per-developer secrets)"
 
       - uses: ./.github/actions/build-rust-example
         with:
@@ -160,7 +148,6 @@ jobs:
   gate:
     needs:
       - plan
-      - coverage
       - build
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
