@@ -375,9 +375,14 @@ jobs:
             exit 1
           fi
           # Main pushes must also build the per-target binaries that
-          # release-tag.yml attaches to the GH Release.
-          if [[ "${REF}" == "refs/heads/main" ]] && [[ "${CANARY_BINARIES_RESULT}" != "success" ]]; then
-            echo "canary-binaries result=${CANARY_BINARIES_RESULT} on main push; expected success" >&2
+          # release-tag.yml attaches to the GH Release. Forks skip
+          # canary-binaries (no releases cut from a fork, and the
+          # cross-compile env can't see OpenSSL headers), so accept
+          # `skipped` there.
+          if [[ "${REF}" == "refs/heads/main" ]] \
+            && [[ "${CANARY_BINARIES_RESULT}" != "success" ]] \
+            && [[ "${CANARY_BINARIES_RESULT}" != "skipped" ]]; then
+            echo "canary-binaries result=${CANARY_BINARIES_RESULT} on main push; expected success or skipped" >&2
             exit 1
           fi
 
