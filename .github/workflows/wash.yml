@@ -503,10 +503,17 @@ jobs:
     # Fires on every main push and on `workflow_dispatch`. `always()`
     # breaks the skipped-`changes` propagation; the explicit per-need
     # success gates restore the default `success()` check.
+    #
+    # Fork-skip: canary-binaries cross-compiles wash into pre-built
+    # binaries for GitHub Release downloads (install.sh targets).
+    # Forks don't publish releases, and the cargo-zigbuild cross
+    # environment chokes on missing OpenSSL headers anyway — skip on
+    # non-upstream repos.
     if: |
       always() &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       github.ref == 'refs/heads/main' &&
+      github.repository == 'wasmCloud/wasmCloud' &&
       needs.check.result == 'success' &&
       needs.lint.result == 'success' &&
       needs.runtime-operator-e2e.result == 'success'
