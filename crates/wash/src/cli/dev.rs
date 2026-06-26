@@ -145,6 +145,30 @@ impl CliCommand for DevCommand {
             host_builder.with_plugin(Arc::new(plugin::wasi_logging::TracingLogger::default()))?;
         debug!("Logging plugin registered");
 
+        // Enable wasmcloud:messaging — NATS when `dev.data_nats_url` is set,
+        // otherwise the in-memory backend. Mirrors upstream's dev.rs behavior;
+        // components that import `wasmcloud:messaging/consumer` need one or
+        // the other bound or linker instantiation fails.
+        let data_nats_client = if let Some(url) = &dev_config.data_nats_url {
+            let client = async_nats::connect(url.as_str())
+                .await
+                .context("failed to connect to NATS for dev.data_nats_url")?;
+            Some(Arc::new(client))
+        } else {
+            None
+        };
+        if let Some(client) = &data_nats_client {
+            host_builder = host_builder.with_plugin(Arc::new(
+                plugin::wasmcloud_messaging::NatsMessaging::new(client.clone()),
+            ))?;
+            debug!("wasmcloud:messaging plugin registered with NATS backend (dev.data_nats_url)");
+        } else {
+            host_builder = host_builder.with_plugin(Arc::new(
+                plugin::wasmcloud_messaging::InMemoryMessaging::default(),
+            ))?;
+            debug!("wasmcloud:messaging plugin registered with in-memory backend");
+        }
+
         // Add keyvalue plugin — unified multi-backend (memory/redis/nats/filesystem via config)
         host_builder =
             host_builder.with_plugin(Arc::new(custom_plugin_kv::MultiBackendKeyValue::new()))?;
