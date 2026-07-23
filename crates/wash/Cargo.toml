@@ -12,7 +12,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [features]
-default = ["wasi-webgpu"]
+default = ["wasi-webgpu", "wasm_component_model_implements"]
 wasi-tls = ["wash-runtime/wasi-tls"]
 # Route component-model `(implements ..)` named imports to per-import backends.
 # When enabled, `wash host`/`wash dev` additionally register the multiplexed
