@@ -197,6 +197,7 @@ impl CliCommand for HostCommand {
         {
             cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(
                 plugin::wasi_keyvalue::MultiplexedKeyValue::new()
+                    .with_provider(Arc::new(plugin::wasi_keyvalue::CloudflareKvProvider))
                     .with_provider(Arc::new(plugin::wasi_keyvalue::InMemoryProvider))
                     .with_provider(Arc::new(plugin::wasi_keyvalue::RedisProvider))
                     .with_provider(Arc::new(plugin::wasi_keyvalue::NatsProvider))
@@ -209,12 +210,14 @@ impl CliCommand for HostCommand {
             ))?;
             cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(
                 plugin::wasi_blobstore::MultiplexedBlobstore::new()
+                    .with_provider(Arc::new(plugin::wasi_blobstore::OpenDalBlobProvider))
                     .with_provider(Arc::new(plugin::wasi_blobstore::InMemoryProvider))
                     .with_provider(Arc::new(plugin::wasi_blobstore::FilesystemProvider))
                     .with_provider(Arc::new(plugin::wasi_blobstore::NatsBlobProvider)),
             ))?;
             cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(
                 plugin::wasi_blobstore::MultiplexedAsyncBlobstore::new()
+                    .with_provider(Arc::new(plugin::wasi_blobstore::OpenDalBlobProvider))
                     .with_provider(Arc::new(plugin::wasi_blobstore::InMemoryProvider))
                     .with_provider(Arc::new(plugin::wasi_blobstore::FilesystemProvider))
                     .with_provider(Arc::new(plugin::wasi_blobstore::NatsBlobProvider)),

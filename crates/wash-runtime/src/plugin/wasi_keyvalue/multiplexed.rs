@@ -321,11 +321,14 @@ const LIST_KEYS_BATCH_SIZE: usize = 1000;
 /// A keyvalue backend provider: a [`BackendProvider`] producing [`KvId`]s.
 pub type KvProvider = dyn BackendProvider<KvId>;
 
+mod cloudflare;
 mod filesystem;
 mod in_memory;
 mod nats;
 mod redis;
 
+#[allow(unused_imports)]
+pub use cloudflare::{CloudflareKvBackend, CloudflareKvProvider};
 pub use filesystem::{FilesystemBackend, FilesystemProvider};
 pub use in_memory::{InMemoryBackend, InMemoryProvider};
 pub use nats::{NatsBackend, NatsProvider};

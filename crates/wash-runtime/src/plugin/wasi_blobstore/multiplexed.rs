@@ -554,9 +554,12 @@ impl<'a> bindings::wasi::blobstore::types::Host for ActiveCtx<'a> {}
 
 mod filesystem;
 mod in_memory;
+mod s3;
 mod nats;
 
 pub use filesystem::{FilesystemBackend, FilesystemProvider};
+#[allow(unused_imports)]
+pub use s3::{OpenDalBlobBackend, OpenDalBlobProvider};
 pub use in_memory::{InMemoryBackend, InMemoryProvider};
 pub use nats::{NatsBlobBackend, NatsBlobProvider};
 

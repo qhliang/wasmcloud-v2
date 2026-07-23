@@ -72,7 +72,11 @@ http-body-util = { workspace = true }
 hyper = { workspace = true, features = ["server", "http1", "http2"] }
 hyper-util = { workspace = true, features = ["client-legacy", "http1", "http2", "tokio", "server-auto"] }
 moka = { workspace = true, features = ["sync"]}
+base64 = { workspace = true }
 names = { workspace = true }
+reqwest = { workspace = true }
+opendal = { workspace = true }
+redis = { workspace = true }
 semver = { workspace = true }
 sysinfo = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
