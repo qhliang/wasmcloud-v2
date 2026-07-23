@@ -97,12 +97,16 @@ git push -u origin main
 
 ## commit前必须要做的步骤
 
+**关键约束**：以下命令必须**全 workspace 执行**，禁止用 `-p <crate>` 缩小范围。理由：本地 nightly rustfmt 与 CI 的 nightly 版本可能不同，导致未触碰的 crate 中存在格式漂移；只在改动的 crate 上跑 fmt/clippy 会漏掉这些漂移，push 后 CI 才报错。即使本次改动只涉及单个 crate，也要跑全 workspace 检查。
+
 1. 执行test测试：`cargo test --workspace` 与 `cargo test -p wash-runtime --features wasip3`
-2. 使用fmt格式化：`cargo +nightly fmt -- --check`
-3. 使用clippy检查：`cargo clippy --workspace --features wasip3`
+2. 使用fmt格式化：`cargo +nightly fmt -- --check`（**禁止 `-p` 过滤**）
+3. 使用clippy检查：`cargo clippy --workspace --features wasip3`（**禁止 `-p` 过滤**）
 4. 使用machete检查未使用的依赖：`cargo machete`
 
 > 注：`cargo-machete` 在根 `Cargo.toml` 的 `[workspace.metadata.cargo-machete]` 中忽略了一些在 `build.rs` 中使用的依赖（如 `pbjson`/`tonic`/`tonic-prost`），这是预期的。
+
+> 历史教训：commit `7af9ad04a` 引入 `find_interface` 后只跑了局部 fmt，遗留了 8 个 custom_plugin_* 文件的 `let-else` 漂移，导致 main 分支 CI 连续 5 次 wash workflow 失败。事后只能用 `cargo +nightly fmt --` 一次性修复。
 
 ## http-api-distributed示例编译方法
 
