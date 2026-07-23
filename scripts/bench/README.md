@@ -330,7 +330,7 @@ The playbook installs (as `root` on the bench host):
 - A **smoke build**:
   ```sh
   cargo xtask build-fixtures   # benches include_bytes! the wasm fixtures
-  cargo bench -p wash-runtime --features wasip3 --bench http_invoke --no-run
+  cargo bench -p wash-runtime --bench http_invoke --no-run
   ```
   to verify the bench binary compiles end-to-end. ~3 minutes cold.
   (`run-bench.sh` runs `cargo xtask build-fixtures` for you; it's only
@@ -386,7 +386,7 @@ with a fresh token). It:
 - Installs **rustup as the `bench` user** so `cargo` is available in
   the workflow's PATH. The actual toolchain is auto-installed on
   first build via `rust-toolchain.toml`.
-- Downloads `actions-runner-linux-x64-2.334.0.tar.gz`, **verifies the
+- Downloads `actions-runner-linux-x64-2.335.1.tar.gz`, **verifies the
   SHA256** (constant in the script — bump version + sha together
   when upgrading), extracts to `/opt/actions-runner`.
 - Registers the runner with labels `self-hosted, bench, hetzner` and
@@ -487,7 +487,7 @@ touches the repo, a CI log, or `/proc/<pid>/cmdline` (env-only).
 
 1. **Pre-flight** ([`bench-preflight.mjs`](../../.github/scripts/bench-preflight.mjs)) — see §10.
 2. **Run bench** ([`run-bench.sh`](./run-bench.sh)) — sources cargo,
-   runs `cargo bench -p wash-runtime --features wasip3 --bench <name>`,
+   runs `cargo bench -p wash-runtime --bench <name>`,
    tees output to a per-run log under `$CARGO_TARGET_DIR`.
 3. **Summary** (`cargo run -p bench-tools -- summary --bench <name>`) —
    emits a markdown table to `$GITHUB_STEP_SUMMARY` with one row per
@@ -593,7 +593,7 @@ GitHub":
 ssh -i ~/.ssh/hetzner_bench root@<WASMCLOUD_BENCH_HOST_IP> \
   '. $HOME/.cargo/env && cd /opt/wasmcloud && \
    cargo xtask build-fixtures && \
-   cargo bench -p wash-runtime --features wasip3 --bench http_invoke'
+   cargo bench -p wash-runtime --bench http_invoke'
 ```
 
 Manual runs do **not** touch S3 or arewefastyet — only the GitHub
@@ -883,7 +883,7 @@ cache). For longer staleness:
 | [`op-env.sh`](./op-env.sh)                                                                                     | `source`-only helper: pulls `WASMCLOUD_BENCH_HOST_IP` / `WASMCLOUD_BENCH_HOSTNAME` / `WASMCLOUD_BENCH_HOST_IPV6` from the 1Password item `WASMCLOUD_BENCH_BOX` into the current shell                                     |
 | [`stage-hetzner.sh`](./stage-hetzner.sh)                                                                       | Phase 1 from your laptop: rescue → installed OS                                                                                                                                                                           |
 | [`ansible/`](./ansible/)                                                                                       | Phase 2 from your laptop: deps + Rust + valgrind + gungraun-runner + repo + kernel cmdline + perf governor. Idempotent; re-run to apply drift or as the "patch a live box without re-staging" path (`--tags kernel`) |
-| [`install-runner.sh`](./install-runner.sh)                                                                     | Phase 3 on the host: GH Actions runner under `bench` user; also installs gungraun-runner. Kept as bash because runner registration takes a one-shot token whose lifecycle is awkward to model declaratively.             |
+| [`install-runner.sh`](./install-runner.sh)                                                                     | Phase 3 on the host: registers the GH Actions runner under the `bench` user and wires it to the shared bench tools in `/usr/local` (installed by `provision.yml`). Kept as bash because runner registration takes a one-shot token whose lifecycle is awkward to model declaratively.             |
 | [`../../.github/scripts/bench-preflight.mjs`](../../.github/scripts/bench-preflight.mjs)                       | CI step: refuses to bench on a drifted host (env: `WASMCLOUD_BENCH_HOSTNAME`). GHA-only — runs via `node` from the workflow.                                                                                              |
 | [`run-bench.sh`](./run-bench.sh)                                                                               | CI step + local: invokes `cargo bench`, writes a run log. Stays bash because compare-bench.sh invokes it on the host for local operator runs.                                                                             |
 | [`../../.github/scripts/bench-push-results.mjs`](../../.github/scripts/bench-push-results.mjs)                 | CI step: per-run upload + history.json aggregate + CloudFront invalidate; archives `target/criterion/` and/or `target/gungraun/`. GHA-only.                                                                                    |
@@ -939,7 +939,7 @@ into layers, each with its own cadence.
 | glibc / libstdc++                      | with the kernel                                   | apt                                                                                                | Same reason.                                                                                                                                                                                                           |
 | valgrind                               | yearly, or when gungraun asks for it              | apt                                                                                                | Major valgrind bumps have historically renamed cachegrind event columns; our `Ir` parser is robust to that, but verify.                                                                                                |
 | Rust toolchain                         | rolls with `rust-toolchain.toml` (monthly stable) | repo file                                                                                          | No bench-host-specific pin.                                                                                                                                                                                            |
-| `gungraun` crate + runner              | when the bench fails to start, or yearly          | `crates/wash-runtime/Cargo.toml` (single source of truth)                                          | Bump the dep version in `Cargo.toml`; `provision.yml` and `install-runner.sh` both derive the runner version from there at install time. gungraun enforces crate-vs-runner equality at run time.                       |
+| `gungraun` crate + runner              | when the bench fails to start, or yearly          | `crates/wash-runtime/Cargo.toml`, resolved in `Cargo.lock`                                          | Bump the dep in `Cargo.toml` and `cargo update -p gungraun`; `provision.yml` installs the matching `gungraun-runner` (derived from the **resolved** `Cargo.lock` version — a caret req resolves up to the latest patch) to the shared `/usr/local`. gungraun enforces crate-vs-runner equality at run time.                       |
 | Node.js                                | quarterly (with the kernel bump)                  | `provision.yml` (`node_lts_major`)                                                                 | Bump to the current active LTS line. Built-ins-only scripts; Node version changes are usually low-risk.                                                                                                                |
 | GitHub Actions runner agent            | monthly check, bump on changelog review           | `install-runner.sh` (`RUNNER_VERSION` + `RUNNER_SHA256`)                                           | Auto-tracked via [`bench-host-checks.yml`](../../.github/workflows/bench-host-checks.yml); see below.                                                                                                                  |
 | Action SHA pins (`actions/checkout@…`) | weekly via Dependabot                             | `.github/workflows/*.yml`                                                                          | Low risk — these execute on hosted runners, not the bench host.                                                                                                                                                        |

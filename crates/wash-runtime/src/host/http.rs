@@ -27,7 +27,7 @@ use std::{
 };
 
 use crate::host::allowed_hosts::AllowedHost;
-use crate::wit::WitInterface;
+use crate::host::trigger_service::{BrokerMessage, MessagingJob};
 use crate::{engine::ctx::SharedCtx, observability::Meters};
 use crate::{engine::workload::ResolvedWorkload, observability::FuelConsumptionMeter};
 use anyhow::{Context, ensure};
@@ -38,7 +38,11 @@ use hyper_util::{
     server::conn::auto,
 };
 use opentelemetry::{KeyValue, context::FutureExt};
-use tokio::net::TcpListener;
+use opentelemetry_semantic_conventions::attribute::{
+    HTTP_REQUEST_METHOD, HTTP_RESPONSE_BODY_SIZE, HTTP_RESPONSE_STATUS_CODE, OTEL_STATUS_CODE,
+    RPC_GRPC_STATUS_CODE, SERVER_ADDRESS, SERVER_PORT, URL_FULL, URL_PATH,
+};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tracing::{Instrument, debug, error, info, instrument, warn};
 use wasmtime::Store;
@@ -134,6 +138,13 @@ pub trait Router: Send + Sync + 'static {
     /// Unregister a workload that is being stopped
     async fn on_workload_unbind(&self, workload_id: &str) -> anyhow::Result<()>;
 
+    /// Register a workload whose long-lived service handles HTTP ingress (the
+    /// service exports `wasi:http/handler`). Routers that key off a component
+    /// can use this to map the workload for routing. Default: no-op.
+    async fn on_service_http_resolved(&self, _workload_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Determine if the outgoing request is allowed
     fn allow_outgoing_request(
         &self,
@@ -144,7 +155,6 @@ pub trait Router: Send + Sync + 'static {
     ) -> anyhow::Result<()>;
 
     /// Determine if a P3 outgoing request is allowed.
-    #[cfg(feature = "wasip3")]
     fn allow_outgoing_request_p3(
         &self,
         _workload_id: &str,
@@ -183,13 +193,14 @@ impl Router for DynamicRouter {
         resolved_handle: &ResolvedWorkload,
         _component_id: &str,
     ) -> anyhow::Result<()> {
-        let incoming_handler_interface = WitInterface::from("wasi:http/incoming-handler");
         let Some(http_iface) = resolved_handle
             .host_interfaces()
             .iter()
-            .find(|iface| iface.contains(&incoming_handler_interface))
+            .find(|iface| iface.is_incoming_http_handler())
         else {
-            anyhow::bail!("workload did not request wasi:http/incoming-handler interface");
+            anyhow::bail!(
+                "workload did not request wasi:http/incoming-handler or wasi:http/handler interface"
+            );
         };
 
         let primary_host = http_iface
@@ -316,7 +327,6 @@ pub trait OutgoingHandler: Send + Sync + 'static {
     /// it (`_fut`). It is provided so that custom transports with out-of-band
     /// error channels can still deliver upload errors to the component after
     /// the response has been returned.
-    #[cfg(feature = "wasip3")]
     fn send_request_p3(
         &self,
         workload_id: &str,
@@ -339,11 +349,24 @@ impl OutgoingHandler for DefaultOutgoingHandler {
         config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
     ) -> wasmtime_wasi_http::p2::HttpResult<wasmtime_wasi_http::p2::types::HostFutureIncomingResponse>
     {
-        Ok(wasmtime_wasi_http::p2::default_send_request(
-            request, config,
-        ))
+        // Spawn the default handler ourselves (rather than calling
+        // `default_send_request`) so the request can be wrapped in a client
+        // span and the response status recorded once it arrives.
+        let span = outbound_client_span(request.method(), request.uri());
+        let handle = wasmtime_wasi::runtime::spawn(
+            async move {
+                let result =
+                    wasmtime_wasi_http::p2::default_send_request_handler(request, config).await;
+                match &result {
+                    Ok(incoming) => record_outbound_status(incoming.resp.status()),
+                    Err(_) => record_outbound_error(),
+                }
+                Ok(result)
+            }
+            .instrument(span),
+        );
+        Ok(HostFutureIncomingResponse::pending(handle))
     }
-    #[cfg(feature = "wasip3")]
     fn send_request_p3(
         &self,
         _workload_id: &str,
@@ -391,6 +414,17 @@ impl Router for DevRouter {
         {
             let _ = lock.take();
         }
+        Ok(())
+    }
+
+    async fn on_service_http_resolved(&self, workload_id: &str) -> anyhow::Result<()> {
+        // A service-handled workload routes the same way as a component one:
+        // DevRouter sends all requests to the most-recently resolved workload.
+        let mut lock = self
+            .last_workload_id
+            .write()
+            .map_err(|e| anyhow::anyhow!("DevRouter write lock poisoned: {e}"))?;
+        lock.replace(workload_id.to_string());
         Ok(())
     }
 
@@ -448,6 +482,52 @@ pub trait HostHandler: Send + Sync + 'static {
     /// Unregister a workload
     async fn on_workload_unbind(&self, workload_id: &str) -> anyhow::Result<()>;
 
+    /// Register a long-lived service instance that serves HTTP ingress: inbound
+    /// requests for `workload_id` are delivered over `sender` instead of
+    /// instantiating a component per request. Default: no-op (the workload
+    /// keeps the per-request path).
+    async fn on_service_http_resolved(
+        &self,
+        _workload_id: &str,
+        _sender: tokio::sync::mpsc::Sender<ServiceHttpJob>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// Unregister a service HTTP instance. Default: no-op.
+    async fn on_service_http_unbind(&self, _workload_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Register a long-lived trigger service instance that handles inbound messages:
+    /// messages for `workload_id` are delivered over `sender` instead of
+    /// instantiating a component per message. Default: no-op.
+    async fn on_trigger_service_messaging_resolved(
+        &self,
+        _workload_id: &str,
+        _sender: tokio::sync::mpsc::Sender<MessagingJob>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// Unregister a trigger service messaging instance. Default: no-op.
+    async fn on_trigger_service_messaging_unbind(&self, _workload_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    /// Deliver a message to a workload's registered messaging trigger service, returning
+    /// the handler's `result<_, string>`. Default: no messaging support.
+    async fn deliver_trigger_service_message(
+        &self,
+        _workload_id: &str,
+        _msg: BrokerMessage,
+    ) -> anyhow::Result<Result<(), String>> {
+        anyhow::bail!("this host does not support trigger service messaging delivery")
+    }
+    /// Whether a long-lived trigger service is registered to handle messages for
+    /// `workload_id` (so a host ingress can deliver to it instead of
+    /// instantiating per message). Default: false.
+    async fn has_trigger_service_messaging(&self, _workload_id: &str) -> bool {
+        false
+    }
+
     /// Handle an outgoing HTTP request from a workload
     fn outgoing_request(
         &self,
@@ -463,7 +543,6 @@ pub trait HostHandler: Send + Sync + 'static {
     /// Override to apply custom egress logic (e.g. alternate transports or
     /// per-workload TLS configuration) while still honouring the allowlist via
     /// [`check_allowed_hosts`].
-    #[cfg(feature = "wasip3")]
     fn outgoing_request_p3(
         &self,
         workload_id: &str,
@@ -539,7 +618,6 @@ impl HostHandler for NullServer {
         ))
     }
 
-    #[cfg(feature = "wasip3")]
     fn outgoing_request_p3(
         &self,
         _workload_id: &str,
@@ -561,6 +639,21 @@ impl HostHandler for NullServer {
 pub type WorkloadHandles =
     Arc<RwLock<HashMap<String, (ResolvedWorkload, InstancePre<SharedCtx>, String)>>>;
 
+/// An inbound HTTP request routed to a long-lived service instance, paired with
+/// a oneshot for its response.
+pub type ServiceHttpJob = (
+    hyper::Request<hyper::body::Incoming>,
+    tokio::sync::oneshot::Sender<anyhow::Result<hyper::Response<HyperOutgoingBody>>>,
+);
+
+/// A map from workload id to the channel of its HTTP-serving service instance.
+/// Empty unless a workload's service opts into HTTP ingress (a p3 feature).
+pub type ServiceHandlers = Arc<RwLock<HashMap<String, tokio::sync::mpsc::Sender<ServiceHttpJob>>>>;
+
+/// A map from workload id to the channel of a trigger service's messaging handler
+/// instance. Empty unless a workload's service exports a messaging handler.
+pub type MessagingHandlers = Arc<RwLock<HashMap<String, tokio::sync::mpsc::Sender<MessagingJob>>>>;
+
 /// HTTP server plugin that handles incoming HTTP requests for WebAssembly components.
 ///
 /// This plugin implements the `wasi:http/incoming-handler` interface and routes
@@ -581,6 +674,10 @@ pub struct HttpServer<T: Router, O: OutgoingHandler = DefaultOutgoingHandler> {
     outgoing_handler: O,
     addr: SocketAddr,
     workload_handles: WorkloadHandles,
+    /// Workloads whose long-lived service serves HTTP ingress directly.
+    service_handlers: ServiceHandlers,
+    /// Workloads whose long-lived trigger service serves messaging ingress directly.
+    messaging_handlers: MessagingHandlers,
     shutdown_tx: Arc<RwLock<Option<mpsc::Sender<()>>>>,
     tls_acceptor: Option<TlsAcceptor>,
     listener: Arc<tokio::sync::Mutex<Option<TcpListener>>>,
@@ -700,6 +797,8 @@ impl<T: Router, O: OutgoingHandler> HttpServerBuilder<T, O> {
             outgoing_handler: self.outgoing_handler,
             addr,
             workload_handles: Arc::default(),
+            service_handlers: Arc::default(),
+            messaging_handlers: Arc::default(),
             shutdown_tx: Arc::new(RwLock::new(None)),
             tls_acceptor,
             listener: Arc::new(tokio::sync::Mutex::new(Some(listener))),
@@ -743,6 +842,7 @@ impl<T: Router, O: OutgoingHandler> HostHandler for HttpServer<T, O> {
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
         let shutdown_tx_clone = self.shutdown_tx.clone();
         let workload_handles = self.workload_handles.clone();
+        let service_handlers = self.service_handlers.clone();
         let tls_acceptor = self.tls_acceptor.clone();
 
         // Store the shutdown sender
@@ -769,6 +869,7 @@ impl<T: Router, O: OutgoingHandler> HostHandler for HttpServer<T, O> {
                 listener,
                 handler,
                 workload_handles,
+                service_handlers,
                 &mut shutdown_rx,
                 tls_acceptor,
                 fuel_meter,
@@ -804,14 +905,18 @@ impl<T: Router, O: OutgoingHandler> HostHandler for HttpServer<T, O> {
             .await?;
         let instance_pre = resolved_handle.instantiate_pre(component_id).await?;
 
-        self.workload_handles.write().await.insert(
-            resolved_handle.id().to_string(),
-            (
-                resolved_handle.clone(),
-                instance_pre,
-                component_id.to_string(),
-            ),
-        );
+        // Only components that export wasi:http are routable HTTP entrypoints.
+        // Anything else stays unregistered and routes to a 404.
+        if crate::engine::exports_wasi_http(instance_pre.component()) {
+            self.workload_handles.write().await.insert(
+                resolved_handle.id().to_string(),
+                (
+                    resolved_handle.clone(),
+                    instance_pre,
+                    component_id.to_string(),
+                ),
+            );
+        }
 
         Ok(())
     }
@@ -820,8 +925,87 @@ impl<T: Router, O: OutgoingHandler> HostHandler for HttpServer<T, O> {
         self.router.on_workload_unbind(workload_id).await?;
 
         self.workload_handles.write().await.remove(workload_id);
+        self.service_handlers.write().await.remove(workload_id);
+        self.messaging_handlers.write().await.remove(workload_id);
 
         Ok(())
+    }
+
+    async fn on_service_http_resolved(
+        &self,
+        workload_id: &str,
+        sender: tokio::sync::mpsc::Sender<ServiceHttpJob>,
+    ) -> anyhow::Result<()> {
+        self.router.on_service_http_resolved(workload_id).await?;
+        // A re-resolve without an intervening unbind is expected: the trigger
+        // service supervisor re-registers a fresh sender on every restart (see
+        // `execute_trigger_service`) to swap in the new incarnation. Overwriting
+        // is correct there — the replaced mapping belonged to the faulted
+        // incarnation whose receiver is already dropped, so nothing live is
+        // orphaned. Stop is the only path that unbinds.
+        self.service_handlers
+            .write()
+            .await
+            .insert(workload_id.to_string(), sender);
+        Ok(())
+    }
+
+    async fn on_service_http_unbind(&self, workload_id: &str) -> anyhow::Result<()> {
+        self.service_handlers.write().await.remove(workload_id);
+        Ok(())
+    }
+
+    async fn on_trigger_service_messaging_resolved(
+        &self,
+        workload_id: &str,
+        sender: tokio::sync::mpsc::Sender<MessagingJob>,
+    ) -> anyhow::Result<()> {
+        // As with the HTTP handler: a re-resolve without unbind is the expected
+        // restart path (the supervisor swaps in the new incarnation's sender),
+        // and the replaced mapping belonged to a faulted incarnation whose
+        // receiver is already gone. Stop is the only path that unbinds.
+        self.messaging_handlers
+            .write()
+            .await
+            .insert(workload_id.to_string(), sender);
+        Ok(())
+    }
+
+    async fn on_trigger_service_messaging_unbind(&self, workload_id: &str) -> anyhow::Result<()> {
+        self.messaging_handlers.write().await.remove(workload_id);
+        Ok(())
+    }
+
+    async fn deliver_trigger_service_message(
+        &self,
+        workload_id: &str,
+        msg: BrokerMessage,
+    ) -> anyhow::Result<Result<(), String>> {
+        let sender = self
+            .messaging_handlers
+            .read()
+            .await
+            .get(workload_id)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no messaging trigger service registered for workload {workload_id}"
+                )
+            })?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        sender
+            .send((msg, tx))
+            .await
+            .map_err(|_| anyhow::anyhow!("trigger service messaging instance is not running"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("trigger service dropped the message response"))
+    }
+
+    async fn has_trigger_service_messaging(&self, workload_id: &str) -> bool {
+        self.messaging_handlers
+            .read()
+            .await
+            .contains_key(workload_id)
     }
 
     fn outgoing_request(
@@ -848,7 +1032,6 @@ impl<T: Router, O: OutgoingHandler> HostHandler for HttpServer<T, O> {
             .send_request(workload_id, request, config)
     }
 
-    #[cfg(feature = "wasip3")]
     fn outgoing_request_p3(
         &self,
         workload_id: &str,
@@ -857,23 +1040,55 @@ impl<T: Router, O: OutgoingHandler> HostHandler for HttpServer<T, O> {
         fut: crate::host::http_p3::P3RequestErrorFuture,
         allowed_hosts: &[AllowedHost],
     ) -> crate::host::http_p3::P3SendFuture {
-        if let Err(e) =
-            self.router
-                .allow_outgoing_request_p3(workload_id, &request, options, allowed_hosts)
+        let span = outbound_client_span(request.method(), request.uri());
+        let inner: crate::host::http_p3::P3SendFuture = if let Err(e) = self
+            .router
+            .allow_outgoing_request_p3(workload_id, &request, options, allowed_hosts)
         {
             warn!(workload_id = %workload_id, err = %e, "P3 outgoing request denied by allowed_hosts policy");
             use wasmtime_wasi_http::p3::bindings::http::types::ErrorCode;
-            return Box::new(async move {
+            Box::new(async move {
                 Err(wasmtime_wasi::TrappableError::from(
                     ErrorCode::HttpRequestDenied,
                 ))
-            });
-        }
-        if is_grpc_request(&request) {
-            return send_grpc_request_p3(request, options);
-        }
-        self.outgoing_handler
-            .send_request_p3(workload_id, request, options, fut)
+            })
+        } else if is_grpc_request(&request) {
+            send_grpc_request_p3(request, options)
+        } else {
+            self.outgoing_handler
+                .send_request_p3(workload_id, request, options, fut)
+        };
+        // Instrument the whole send so the span is current while the response
+        // is awaited; `record_outbound_status` then lands on this span.
+        Box::new(
+            async move {
+                let result = Box::into_pin(inner).await;
+                match &result {
+                    Ok((resp, _)) => {
+                        record_outbound_status(resp.status());
+                        // No-op unless the response carries a `grpc-status` header.
+                        record_grpc_status(resp.headers());
+                    }
+                    // Covers allowed-hosts denials and transport failures.
+                    Err(_) => record_outbound_error(),
+                }
+                result
+            }
+            .instrument(span),
+        )
+    }
+}
+
+/// Configure a freshly accepted connection before it is served.
+///
+/// Disables Nagle's algorithm. Responses are written as a head segment followed
+/// by body frames streamed from the guest (see [`crate::host::http_p3`]); with
+/// Nagle on, the small body segment is held until the client ACKs the head, and
+/// the client's delayed ACK adds a ~40ms stall to every request (write-write-read
+/// deadlock). `wasmtime serve` sets `TCP_NODELAY` for the same reason.
+fn prepare_accepted_conn(stream: &TcpStream) {
+    if let Err(e) = stream.set_nodelay(true) {
+        warn!(err = ?e, "failed to set TCP_NODELAY on accepted connection");
     }
 }
 
@@ -882,6 +1097,7 @@ async fn run_http_server<T: Router>(
     listener: TcpListener,
     handler: Arc<T>,
     workload_handles: WorkloadHandles,
+    service_handlers: ServiceHandlers,
     shutdown_rx: &mut mpsc::Receiver<()>,
     tls_acceptor: Option<TlsAcceptor>,
     fuel_meter: FuelConsumptionMeter,
@@ -899,13 +1115,17 @@ async fn run_http_server<T: Router>(
                     Ok((client, client_addr)) => {
                         debug!(addr = ?client_addr, "new HTTP client connection");
 
+                        prepare_accepted_conn(&client);
+
                         let handles_clone = workload_handles.clone();
+                        let service_handlers_clone = service_handlers.clone();
                         let tls_acceptor_clone = tls_acceptor.clone();
                         let handler_clone = handler.clone();
                         let fuel_meter = fuel_meter.clone();
                         tokio::spawn(async move {
                             let service = hyper::service::service_fn(move |req| {
                                 let handles = handles_clone.clone();
+                                let service_handlers = service_handlers_clone.clone();
                                 let handler = handler_clone.clone();
                                 let fuel_meter = fuel_meter.clone();
                                 async move {
@@ -913,7 +1133,7 @@ async fn run_http_server<T: Router>(
                                     let remote_context =
                                         opentelemetry::global::get_text_map_propagator(|propagator| propagator.extract(&extractor));
 
-                                    handle_http_request(handler, req, handles, fuel_meter).with_context(remote_context).await
+                                    handle_http_request(handler, req, handles, service_handlers, fuel_meter).with_context(remote_context).await
                                 }
                             });
 
@@ -984,20 +1204,28 @@ fn error_response(status: u16) -> hyper::Response<HyperOutgoingBody> {
 ///   collectors can break down requests by 2xx/4xx/5xx.
 /// - `otel.status_code` is set to `ERROR` for 5xx; 4xx stays UNSET per semconv.
 #[instrument(skip_all, fields(
+    // Legacy (pre-semconv) attribute names retained so dashboards built against
+    // them keep resolving.
     http.method = %req.method(),
-    http.request.method = %req.method(),
     http.uri = %req.uri(),
-    url.path = %req.uri().path(),
     http.host = %host_header(&req),
-    server.address = split_host_port(host_header(&req)).0,
-    server.port = tracing::field::Empty,
-    http.response.status_code = tracing::field::Empty,
-    otel.status_code = tracing::field::Empty,
+    // Current OTel HTTP semantic conventions, referenced via the
+    // `opentelemetry-semantic-conventions` constants (tracing's `{expr}` field
+    // syntax resolves the constant to its attribute name at compile time).
+    { HTTP_REQUEST_METHOD } = %req.method(),
+    { URL_PATH } = %req.uri().path(),
+    { SERVER_ADDRESS } = split_host_port(host_header(&req)).0,
+    { SERVER_PORT } = tracing::field::Empty,
+    { HTTP_RESPONSE_STATUS_CODE } = tracing::field::Empty,
+    // Recorded once the response body has been fully streamed (see `MeteredBody`).
+    { HTTP_RESPONSE_BODY_SIZE } = tracing::field::Empty,
+    { OTEL_STATUS_CODE } = tracing::field::Empty,
 ))]
 async fn handle_http_request<T: Router>(
     handler: Arc<T>,
     req: hyper::Request<hyper::body::Incoming>,
     workload_handles: WorkloadHandles,
+    service_handlers: ServiceHandlers,
     fuel_meter: FuelConsumptionMeter,
 ) -> Result<hyper::Response<HyperOutgoingBody>, hyper::Error> {
     let method = req.method().clone();
@@ -1006,7 +1234,7 @@ async fn handle_http_request<T: Router>(
     // server.port is recorded separately from server.address per the OTel HTTP
     // semconv; only set it when the Host header actually carries a port.
     if let Some(port) = split_host_port(host_header(&req)).1 {
-        tracing::Span::current().record("server.port", port);
+        tracing::Span::current().record(SERVER_PORT, port);
     }
 
     let workload_id = match handler.route_incoming_request(&req) {
@@ -1025,6 +1253,31 @@ async fn handle_http_request<T: Router>(
         host = %workload_id,
         "HTTP request received"
     );
+
+    // If this workload's long-lived service serves HTTP, deliver the request to
+    // it (preserving its in-memory state) instead of the per-request path.
+    let service_sender = service_handlers.read().await.get(&workload_id).cloned();
+    if let Some(sender) = service_sender {
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        let response = if sender.send((req, resp_tx)).await.is_err() {
+            error!(host = %workload_id, "service HTTP instance is not running");
+            error_response(503)
+        } else {
+            match resp_rx.await {
+                Ok(Ok(resp)) => resp,
+                Ok(Err(e)) => {
+                    error!(err = ?e, "service HTTP handler failed");
+                    error_response(500)
+                }
+                Err(_) => {
+                    error!("service HTTP instance dropped the response");
+                    error_response(500)
+                }
+            }
+        };
+        record_response_status(&response);
+        return Ok(response);
+    }
 
     // NOTE(lxf): Separate HTTP / GRPC handling
 
@@ -1062,6 +1315,13 @@ async fn handle_http_request<T: Router>(
     };
 
     record_response_status(&response);
+    // Carry the current span on the response body so `http.response.body.size`
+    // is recorded once the HTTP server finishes streaming the body. That
+    // happens after this handler future — and its `#[instrument]` span — has
+    // returned, so the body wrapper keeps a span handle alive to land the
+    // attribute before the span closes.
+    let response =
+        response.map(|body| MeteredBody::new(body, tracing::Span::current()).boxed_unsync());
     Ok(response)
 }
 
@@ -1071,9 +1331,145 @@ async fn handle_http_request<T: Router>(
 fn record_response_status<B>(response: &hyper::Response<B>) {
     let status = response.status().as_u16();
     let span = tracing::Span::current();
-    span.record("http.response.status_code", status);
+    span.record(HTTP_RESPONSE_STATUS_CODE, status);
     if status >= 500 {
-        span.record("otel.status_code", "ERROR");
+        span.record(OTEL_STATUS_CODE, "ERROR");
+    }
+}
+
+/// Build a `client` span for an outbound HTTP request following the OTel HTTP
+/// client semantic conventions. `http.response.status_code` and
+/// `otel.status_code` are left empty for [`record_outbound_status`] to fill in
+/// once the response arrives.
+///
+/// The span must be entered (e.g. via [`tracing::Instrument::instrument`]) for
+/// the duration of the request so that status recorded on the *current* span
+/// from inside the async work lands on this span.
+fn outbound_client_span(method: &hyper::Method, uri: &hyper::Uri) -> tracing::Span {
+    let span = tracing::info_span!(
+        "outbound_http_request",
+        otel.kind = "client",
+        { HTTP_REQUEST_METHOD } = %method,
+        { URL_FULL } = %uri,
+        { SERVER_ADDRESS } = uri.host().unwrap_or_default(),
+        { SERVER_PORT } = tracing::field::Empty,
+        { HTTP_RESPONSE_STATUS_CODE } = tracing::field::Empty,
+        { RPC_GRPC_STATUS_CODE } = tracing::field::Empty,
+        { OTEL_STATUS_CODE } = tracing::field::Empty,
+    );
+    if let Some(port) = uri.port_u16() {
+        span.record(SERVER_PORT, port);
+    }
+    span
+}
+
+/// Record an outbound response status on the current span. Per the HTTP client
+/// semconv, both 4xx and 5xx flip `otel.status_code` to `ERROR` for client
+/// spans (unlike server spans, where 4xx stays UNSET).
+fn record_outbound_status(status: hyper::StatusCode) {
+    let span = tracing::Span::current();
+    span.record(HTTP_RESPONSE_STATUS_CODE, status.as_u16());
+    if status.as_u16() >= 400 {
+        span.record(OTEL_STATUS_CODE, "ERROR");
+    }
+}
+
+/// Mark the current outbound span as failed when the request never produced a
+/// response (allowed-hosts denial, connection failure, transport error, …).
+fn record_outbound_error() {
+    tracing::Span::current().record(OTEL_STATUS_CODE, "ERROR");
+}
+
+/// Record the gRPC status as `rpc.grpc.status_code` on the current span when the
+/// response carries a `grpc-status` header. gRPC errors are typically
+/// trailers-only responses that put the status in headers, so this captures
+/// them; a status delivered in actual trailers (the streaming-success case) is
+/// not read here.
+fn record_grpc_status(headers: &hyper::HeaderMap) {
+    if let Some(code) = headers
+        .get("grpc-status")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<i64>().ok())
+    {
+        tracing::Span::current().record(RPC_GRPC_STATUS_CODE, code);
+    }
+}
+
+/// Response-body wrapper that tallies streamed bytes and records
+/// `http.response.body.size` on `span` once the body completes (ends, errors,
+/// or is dropped).
+///
+/// The HTTP server drains the body after the handler future returns, so the
+/// wrapper holds its own [`tracing::Span`] handle. That keeps the span open
+/// until the body is done, ensuring the attribute is recorded before the span
+/// closes.
+struct MeteredBody {
+    inner: HyperOutgoingBody,
+    span: tracing::Span,
+    bytes: u64,
+    recorded: bool,
+}
+
+impl MeteredBody {
+    fn new(inner: HyperOutgoingBody, span: tracing::Span) -> Self {
+        Self {
+            inner,
+            span,
+            bytes: 0,
+            recorded: false,
+        }
+    }
+
+    fn record(&mut self) {
+        if !self.recorded {
+            self.span.record(HTTP_RESPONSE_BODY_SIZE, self.bytes);
+            self.recorded = true;
+        }
+    }
+}
+
+impl hyper::body::Body for MeteredBody {
+    type Data = bytes::Bytes;
+    type Error = wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        use std::task::Poll;
+        match std::pin::Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    self.bytes += data.len() as u64;
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                self.record();
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Ready(None) => {
+                self.record();
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for MeteredBody {
+    fn drop(&mut self) {
+        // Capture whatever was streamed if the body was dropped early (e.g. the
+        // client disconnected mid-response).
+        self.record();
     }
 }
 
@@ -1112,16 +1508,12 @@ async fn invoke_component_handler(
     req: hyper::Request<hyper::body::Incoming>,
     fuel_meter: FuelConsumptionMeter,
 ) -> anyhow::Result<hyper::Response<HyperOutgoingBody>> {
-    // Create a new store for this request with plugin contexts
     let store = workload_handle.new_store(component_id).await?;
 
-    // Check if this component targets WASIP3 and dispatch accordingly
-    #[cfg(feature = "wasip3")]
     if crate::engine::targets_wasip3_http(instance_pre.component()) {
         let resp =
             crate::host::http_p3::handle_component_request_p3(store, instance_pre, req, fuel_meter)
                 .await?;
-        // Convert P3 response to a compatible HyperOutgoingBody response
         let (parts, body) = resp.into_parts();
         let body = HyperOutgoingBody::new(
             body.map_err(|e| {
@@ -1345,9 +1737,21 @@ fn send_grpc_request(
     request: hyper::Request<HyperOutgoingBody>,
     config: OutgoingRequestConfig,
 ) -> HostFutureIncomingResponse {
-    let handle = wasmtime_wasi::runtime::spawn(async move {
-        Ok(send_grpc_request_handler(request, config).await)
-    });
+    let span = outbound_client_span(request.method(), request.uri());
+    let handle = wasmtime_wasi::runtime::spawn(
+        async move {
+            let result = send_grpc_request_handler(request, config).await;
+            match &result {
+                Ok(incoming) => {
+                    record_outbound_status(incoming.resp.status());
+                    record_grpc_status(incoming.resp.headers());
+                }
+                Err(_) => record_outbound_error(),
+            }
+            Ok(result)
+        }
+        .instrument(span),
+    );
     HostFutureIncomingResponse::pending(handle)
 }
 
@@ -1474,7 +1878,6 @@ async fn send_grpc_request_handler(
 }
 
 /// P3 sibling of send_grpc_request: HTTP/2 sender for P3 outgoing gRPC.
-#[cfg(feature = "wasip3")]
 fn send_grpc_request_p3(
     request: hyper::Request<crate::host::http_p3::P3Body>,
     options: Option<wasmtime_wasi_http::p3::RequestOptions>,
@@ -1482,7 +1885,71 @@ fn send_grpc_request_p3(
     Box::new(send_grpc_request_p3_handler(request, options))
 }
 
-#[cfg(feature = "wasip3")]
+/// Response-body wrapper enforcing a between-bytes read timeout on a streaming
+/// P3 outgoing response.
+///
+/// `inner` is held in an `Option` so it can be dropped the instant the timeout
+/// fires (or the stream ends / errors), releasing the underlying HTTP/2 stream
+/// and TCP connection eagerly instead of leaving it pinned until the guest
+/// drops its body handle.
+struct TimedBody<B> {
+    inner: Option<B>,
+    interval: tokio::time::Interval,
+}
+
+impl<B> hyper::body::Body for TimedBody<B>
+where
+    B: hyper::body::Body<Data = bytes::Bytes, Error = hyper::Error> + Unpin,
+{
+    type Data = bytes::Bytes;
+    type Error = wasmtime_wasi_http::p3::bindings::http::types::ErrorCode;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        use std::task::{Poll, ready};
+        use wasmtime_wasi_http::p3::bindings::http::types::ErrorCode;
+
+        let Some(inner) = self.inner.as_mut() else {
+            return Poll::Ready(None);
+        };
+        match std::pin::Pin::new(inner).poll_frame(cx) {
+            Poll::Ready(None) => {
+                self.inner = None;
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(err))) => {
+                self.inner = None;
+                Poll::Ready(Some(Err(ErrorCode::from_hyper_request_error(err))))
+            }
+            Poll::Ready(Some(Ok(frame))) => {
+                self.interval.reset();
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Pending => {
+                ready!(self.interval.poll_tick(cx));
+                // Release the connection before surfacing the timeout rather
+                // than waiting for the guest to drop the body.
+                self.inner = None;
+                Poll::Ready(Some(Err(ErrorCode::ConnectionReadTimeout)))
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_none_or(hyper::body::Body::is_end_stream)
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner
+            .as_ref()
+            .map_or_else(hyper::body::SizeHint::default, hyper::body::Body::size_hint)
+    }
+}
+
 async fn send_grpc_request_p3_handler(
     mut request: hyper::Request<crate::host::http_p3::P3Body>,
     options: Option<wasmtime_wasi_http::p3::RequestOptions>,
@@ -1594,47 +2061,10 @@ async fn send_grpc_request_p3_handler(
         .map_err(|_| ErrorCode::ConnectionReadTimeout)?
         .map_err(ErrorCode::from_hyper_request_error)?
         .map(|body| {
-            use http_body_util::BodyExt;
-            use std::pin::Pin;
-            use std::task::{Context, Poll, ready};
-            struct TimedBody {
-                inner: hyper::body::Incoming,
-                interval: tokio::time::Interval,
-            }
-            impl hyper::body::Body for TimedBody {
-                type Data = bytes::Bytes;
-                type Error = ErrorCode;
-                fn poll_frame(
-                    mut self: Pin<&mut Self>,
-                    cx: &mut Context<'_>,
-                ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>>
-                {
-                    match Pin::new(&mut self.as_mut().inner).poll_frame(cx) {
-                        Poll::Ready(None) => Poll::Ready(None),
-                        Poll::Ready(Some(Err(err))) => {
-                            Poll::Ready(Some(Err(ErrorCode::from_hyper_request_error(err))))
-                        }
-                        Poll::Ready(Some(Ok(frame))) => {
-                            self.interval.reset();
-                            Poll::Ready(Some(Ok(frame)))
-                        }
-                        Poll::Pending => {
-                            ready!(self.interval.poll_tick(cx));
-                            Poll::Ready(Some(Err(ErrorCode::ConnectionReadTimeout)))
-                        }
-                    }
-                }
-                fn is_end_stream(&self) -> bool {
-                    self.inner.is_end_stream()
-                }
-                fn size_hint(&self) -> hyper::body::SizeHint {
-                    self.inner.size_hint()
-                }
-            }
             let mut interval = tokio::time::interval(between_bytes_timeout);
             interval.reset();
             TimedBody {
-                inner: body,
+                inner: Some(body),
                 interval,
             }
             .boxed_unsync()
@@ -1655,6 +2085,29 @@ mod tests {
             .uri(uri)
             .body(HyperOutgoingBody::default())
             .unwrap()
+    }
+
+    /// Guards the P3 streaming regression fix: `run_http_server` must disable
+    /// Nagle on accepted sockets. A streamed head-then-body response otherwise
+    /// stalls ~40ms per request on the client's delayed ACK. The precondition
+    /// asserts the socket starts with Nagle on, so this proves the helper
+    /// actually flips it rather than reading a coincidental default.
+    #[tokio::test]
+    async fn accepted_connections_disable_nagle() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        assert!(
+            !server.nodelay().unwrap(),
+            "precondition: a freshly accepted socket should start with Nagle enabled"
+        );
+        prepare_accepted_conn(&server);
+        assert!(
+            server.nodelay().unwrap(),
+            "run_http_server must set TCP_NODELAY on accepted connections"
+        );
     }
 
     // --- check_allowed_hosts tests ---
@@ -1811,7 +2264,6 @@ mod tests {
             ))
         }
 
-        #[cfg(feature = "wasip3")]
         fn send_request_p3(
             &self,
             _workload_id: &str,
@@ -1866,9 +2318,108 @@ mod tests {
         assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
     }
 
+    /// When the between-bytes timeout fires, [`TimedBody`] must surface
+    /// `ConnectionReadTimeout` *and* eagerly drop the inner body so the
+    /// underlying connection is released immediately rather than lingering
+    /// until the guest drops its body handle.
+    #[tokio::test]
+    async fn timed_body_releases_inner_on_between_bytes_timeout() {
+        use http_body_util::BodyExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use wasmtime_wasi_http::p3::bindings::http::types::ErrorCode;
+
+        // A body that never yields a frame — guarantees the between-bytes
+        // timeout fires. Its `Drop` flips a flag so the test can prove the
+        // inner body (and thus its connection) is released.
+        struct NeverBody {
+            dropped: Arc<AtomicBool>,
+        }
+        impl Drop for NeverBody {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+        impl hyper::body::Body for NeverBody {
+            type Data = bytes::Bytes;
+            type Error = hyper::Error;
+            fn poll_frame(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>>
+            {
+                std::task::Poll::Pending
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut interval = tokio::time::interval(Duration::from_millis(10));
+        interval.reset();
+        let mut body = TimedBody {
+            inner: Some(NeverBody {
+                dropped: dropped.clone(),
+            }),
+            interval,
+        };
+
+        // Awaiting the next frame parks on the interval until the timeout
+        // elapses, then yields the timeout error.
+        match body.frame().await {
+            Some(Err(ErrorCode::ConnectionReadTimeout)) => {}
+            other => panic!("expected ConnectionReadTimeout, got {other:?}"),
+        }
+        assert!(
+            body.inner.is_none(),
+            "inner body should be dropped from the wrapper on timeout"
+        );
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "inner body (and its connection) should be released eagerly on timeout"
+        );
+    }
+
+    /// `MeteredBody` must tally the bytes of data frames (excluding trailers)
+    /// and record the total once the body completes.
+    #[tokio::test]
+    async fn metered_body_counts_data_frame_bytes_excluding_trailers() {
+        use http_body_util::BodyExt;
+
+        struct FramesBody {
+            frames: std::collections::VecDeque<hyper::body::Frame<bytes::Bytes>>,
+        }
+        impl hyper::body::Body for FramesBody {
+            type Data = bytes::Bytes;
+            type Error = wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
+            fn poll_frame(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>>
+            {
+                std::task::Poll::Ready(self.frames.pop_front().map(Ok))
+            }
+        }
+
+        let frames = [
+            hyper::body::Frame::data(bytes::Bytes::from_static(b"ab")),
+            hyper::body::Frame::data(bytes::Bytes::from_static(b"cde")),
+            // Trailers carry no body bytes and must not be counted.
+            hyper::body::Frame::trailers(hyper::HeaderMap::new()),
+        ]
+        .into_iter()
+        .collect();
+        let inner: HyperOutgoingBody = FramesBody { frames }.boxed_unsync();
+
+        let mut body = MeteredBody::new(inner, tracing::Span::none());
+        while body.frame().await.is_some() {}
+
+        assert_eq!(body.bytes, 5, "should count 2 + 3 data bytes, not trailers");
+        assert!(
+            body.recorded,
+            "size should be recorded once the body completes"
+        );
+    }
+
     /// NullServer must deny P3 outgoing requests with an internal error,
     /// matching its P2 behaviour of returning "http client not available".
-    #[cfg(feature = "wasip3")]
     #[tokio::test]
     async fn null_server_denies_p3_outgoing_request() {
         use crate::host::http_p3::{P3Body, P3RequestErrorFuture};

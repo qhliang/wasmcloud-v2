@@ -10,7 +10,7 @@ use clap::Args;
 use tokio::{select, sync::mpsc};
 use tracing::{debug, info, instrument, warn};
 use wash_runtime::{
-    engine::Engine,
+    engine::{Engine, WasmProposal},
     host::{Host, HostApi},
     observability::Meters,
     plugin::{self},
@@ -63,13 +63,14 @@ impl CliCommand for DevCommand {
             .clone()
             .unwrap_or_else(|| "0.0.0.0:8000".to_string());
 
-        #[allow(unused_mut)]
         let mut engine_builder = Engine::builder()
             .with_pooling_allocator(true)
             .with_fuel_consumption(ctx.enable_meters());
-        #[cfg(feature = "wasip3")]
-        {
-            engine_builder = engine_builder.with_wasip3(dev_config.wasip3);
+        for name in &dev_config.wasm_proposals {
+            let proposal: WasmProposal = name
+                .parse()
+                .with_context(|| format!("invalid dev.wasm_proposals entry {name:?}"))?;
+            engine_builder = engine_builder.with_wasm_proposal(proposal);
         }
         let engine = engine_builder.build()?;
 
@@ -88,9 +89,7 @@ impl CliCommand for DevCommand {
         ))?;
 
         // Add blobstore plugin (multi-backend: memory, filesystem, S3, WebDAV, FTP, NATS)
-        host_builder =
-            host_builder.with_plugin(Arc::new(custom_plugin_blobstore::CustomBlobstore::new()))?;
-        debug!("WASI Blobstore plugin registered with multi-backend support");
+
 
         let http_handler = wash_runtime::host::http::DevRouter::default();
         // TODO(#19): Only spawn the server if the component exports wasi:http
@@ -169,10 +168,45 @@ impl CliCommand for DevCommand {
             debug!("wasmcloud:messaging plugin registered with in-memory backend");
         }
 
-        // Add keyvalue plugin — unified multi-backend (memory/redis/nats/filesystem via config)
-        host_builder =
-            host_builder.with_plugin(Arc::new(custom_plugin_kv::MultiBackendKeyValue::new()))?;
-        debug!("WASI KeyValue plugin registered with multi-backend support");
+        #[cfg(feature = "wasm_component_model_implements")]
+        {
+            host_builder = host_builder.with_plugin(Arc::new(
+                plugin::wasi_keyvalue::MultiplexedKeyValue::new()
+                    .with_provider(Arc::new(plugin::wasi_keyvalue::InMemoryProvider))
+                    .with_provider(Arc::new(plugin::wasi_keyvalue::RedisProvider))
+                    .with_provider(Arc::new(plugin::wasi_keyvalue::NatsProvider))
+                    .with_provider(Arc::new(plugin::wasi_keyvalue::FilesystemProvider)),
+            ))?;
+            debug!("WASI KeyValue multiplexed plugin registered (implements)");
+            host_builder = host_builder.with_plugin(Arc::new(
+                plugin::wasmcloud_messaging::MultiplexedMessaging::new()
+                    .with_provider(Arc::new(plugin::wasmcloud_messaging::InMemoryMsgProvider))
+                    .with_provider(Arc::new(plugin::wasmcloud_messaging::NatsMsgProvider)),
+            ))?;
+            debug!("wasmcloud:messaging multiplexed plugin registered (implements)");
+            host_builder = host_builder.with_plugin(Arc::new(
+                plugin::wasi_blobstore::MultiplexedBlobstore::new()
+                    .with_provider(Arc::new(plugin::wasi_blobstore::InMemoryProvider))
+                    .with_provider(Arc::new(plugin::wasi_blobstore::FilesystemProvider))
+                    .with_provider(Arc::new(plugin::wasi_blobstore::NatsBlobProvider)),
+            ))?;
+            debug!("wasi:blobstore multiplexed plugin registered (implements)");
+            host_builder = host_builder.with_plugin(Arc::new(
+                plugin::wasi_blobstore::MultiplexedAsyncBlobstore::new()
+                    .with_provider(Arc::new(plugin::wasi_blobstore::InMemoryProvider))
+                    .with_provider(Arc::new(plugin::wasi_blobstore::FilesystemProvider))
+                    .with_provider(Arc::new(plugin::wasi_blobstore::NatsBlobProvider)),
+            ))?;
+            debug!("wasmcloud:blobstore async multiplexed plugin registered (implements)");
+            host_builder = host_builder.with_plugin(Arc::new(
+                plugin::wasi_keyvalue::MultiplexedAsyncKeyValue::new()
+                    .with_provider(Arc::new(plugin::wasi_keyvalue::InMemoryProvider))
+                    .with_provider(Arc::new(plugin::wasi_keyvalue::RedisProvider))
+                    .with_provider(Arc::new(plugin::wasi_keyvalue::NatsProvider))
+                    .with_provider(Arc::new(plugin::wasi_keyvalue::FilesystemProvider)),
+            ))?;
+            debug!("wasmcloud:keyvalue async multiplexed plugin registered (implements)");
+        }
         // Enable Cloudflare D1 plugin (always loaded by default)
         host_builder =
             host_builder.with_plugin(Arc::new(custom_plugin_cf_d1::CloudflareD1::new()))?;
@@ -221,6 +255,17 @@ impl CliCommand for DevCommand {
                     .context("failed to configure postgres plugin")?,
             ))?;
             debug!("wasmcloud:postgres plugin registered");
+        } else {
+            // No shared bouncer URL: still register postgres so workloads that
+            // route purely through `(implements ..)` named imports (each
+            // carrying its own URL) are served.
+            #[cfg(feature = "wasm_component_model_implements")]
+            {
+                host_builder = host_builder.with_plugin(Arc::new(
+                    plugin::wasmcloud_postgres::WasmcloudPostgres::multiplex_only(),
+                ))?;
+                debug!("wasmcloud:postgres multiplexed plugin registered (implements)");
+            }
         }
 
         // Add otel plugin
@@ -231,7 +276,11 @@ impl CliCommand for DevCommand {
         }
 
         // Enable WASI WebGPU if requested
-        #[cfg(all(not(target_os = "windows"), not(target_arch = "s390x")))]
+        #[cfg(all(
+            not(target_os = "windows"),
+            not(target_arch = "s390x"),
+            feature = "wasi-webgpu"
+        ))]
         if dev_config.wasi_webgpu {
             host_builder =
                 host_builder.with_plugin(Arc::new(plugin::wasi_webgpu::WebGpu::default()))?;
@@ -379,13 +428,21 @@ async fn create_workload(
         });
     }
 
-    let service_file_bytes = if let Some(service_path) = &dev_config.service_file {
-        let raw = tokio::fs::read(service_path).await.with_context(|| {
-            format!("failed to read service file at {}", service_path.display())
-        })?;
-        Some(Bytes::from(raw))
-    } else {
-        None
+    // The service file is only deployed as a service when the dev component
+    // isn't itself the service (`dev.service = false`); see `build_workload`.
+    // When `dev.service` is true the file is ignored, so there's no point
+    // reading it or folding its imports into the workload host interfaces.
+    let (service_file_bytes, service_interfaces) = match &dev_config.service_file {
+        Some(service_path) if !dev_config.service => {
+            let raw = tokio::fs::read(service_path).await.with_context(|| {
+                format!("failed to read service file at {}", service_path.display())
+            })?;
+            let interfaces = host
+                .intersect_interfaces(&raw)
+                .context("failed to extract service file interfaces")?;
+            (Some(Bytes::from(raw)), Some(interfaces))
+        }
+        _ => (None, None),
     };
 
     Ok(build_workload(
@@ -394,6 +451,7 @@ async fn create_workload(
         dev_interfaces,
         sidecars,
         service_file_bytes,
+        service_interfaces,
         resolved_workload,
     ))
 }
@@ -419,6 +477,7 @@ fn build_workload(
     dev_interfaces: HashSet<WitInterface>,
     sidecars: Vec<LoadedComponent>,
     service_file_bytes: Option<Bytes>,
+    service_interfaces: Option<HashSet<WitInterface>>,
     resolved_workload: &ResolvedWorkload,
 ) -> Workload {
     let mut volumes = Vec::<Volume>::new();
@@ -439,10 +498,14 @@ fn build_workload(
         });
     }
 
-    let mut all_component_interfaces = Vec::with_capacity(1 + sidecars.len());
+    // dev component + sidecars + optional service file.
+    let mut all_component_interfaces = Vec::with_capacity(2 + sidecars.len());
     all_component_interfaces.push(dev_interfaces);
     for s in &sidecars {
         all_component_interfaces.push(s.interfaces.clone());
+    }
+    if let Some(svc_interfaces) = service_interfaces {
+        all_component_interfaces.push(svc_interfaces);
     }
 
     let host_interfaces = build_workload_host_interfaces(
@@ -688,6 +751,7 @@ mod tests {
             HashSet::new(),
             sidecars,
             None,
+            None,
             &resolved,
         );
 
@@ -740,6 +804,7 @@ mod tests {
             HashSet::new(),
             sidecars,
             None,
+            None,
             &resolved,
         );
 
@@ -788,6 +853,7 @@ mod tests {
             HashSet::new(),
             Vec::new(),
             None,
+            None,
             &resolved,
         );
 
@@ -817,6 +883,7 @@ mod tests {
             HashSet::new(),
             Vec::new(),
             Some(fake_bytes("svc-sidecar")),
+            None,
             &resolved,
         );
 
@@ -849,6 +916,7 @@ mod tests {
             HashSet::new(),
             sidecars,
             Some(fake_bytes("svc")),
+            None,
             &ResolvedWorkload::default(),
         );
 
@@ -896,12 +964,38 @@ mod tests {
             HashSet::from([iface("wasi", "http")]),
             sidecars,
             None,
+            None,
             &resolved,
         );
 
         let entry = find_iface(&workload.host_interfaces, "wasi", "config")
             .expect("sidecar import should have triggered wasi:config injection");
         assert_eq!(entry.config.get("KEY").unwrap(), "value");
+    }
+
+    #[test]
+    fn build_workload_service_file_interfaces_reach_host_interfaces() {
+        // Regression for #5351: a service_file that imports a plugin
+        // interface (e.g. wasi:keyvalue) must have that interface folded into
+        // the workload's host_interfaces so the plugin binds to the service.
+        // Here neither the dev component nor any sidecar imports it, so the
+        // interface can only reach host_interfaces via the service file.
+        let dev_cfg = DevConfig::default();
+
+        let workload = build_workload(
+            &dev_cfg,
+            fake_bytes("dev"),
+            HashSet::new(),
+            Vec::new(),
+            Some(fake_bytes("svc")),
+            Some(HashSet::from([iface("wasi", "keyvalue")])),
+            &ResolvedWorkload::default(),
+        );
+
+        assert!(
+            find_iface(&workload.host_interfaces, "wasi", "keyvalue").is_some(),
+            "service file import should appear in host_interfaces"
+        );
     }
 
     #[test]
@@ -927,6 +1021,7 @@ mod tests {
             fake_bytes("dev"),
             HashSet::new(),
             sidecars,
+            None,
             None,
             &ResolvedWorkload::default(),
         );

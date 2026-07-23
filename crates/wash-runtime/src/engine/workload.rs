@@ -5,28 +5,29 @@ use std::{
     ops::{Deref, DerefMut},
     path::PathBuf,
     sync::Arc,
-    time::Duration,
 };
 
-use crate::{
-    plugin::WitInterfaces,
-    sockets::{self, SocketAddrUse, loopback},
-};
-use anyhow::{Context as _, bail, ensure};
-use tokio::{sync::RwLock, task::JoinHandle, time::timeout};
+use crate::{plugin::WitInterfaces, sockets::loopback};
+use anyhow::{bail, ensure};
+use tokio::{sync::RwLock, task::JoinHandle};
 use tracing::{Instrument, debug, error, info, instrument, trace, warn};
 use wasmtime::component::{
-    Component, Instance, InstancePre, Linker, ResourceAny, ResourceType, Val, types::ComponentItem,
+    Component, InstancePre, Linker, ResourceAny, ResourceType, types::ComponentItem,
 };
+use wasmtime::error::Context as _;
 use wasmtime_wasi::p2::bindings::CommandPre;
-use wasmtime_wasi::{DirPerms, FilePerms, WasiCtxBuilder};
 
 #[cfg(feature = "wasi-tls")]
 use crate::engine::ctx::SharedTlsProvider;
 use crate::{
     engine::{
-        ctx::{Ctx, SharedCtx},
-        value::{lift, lower},
+        ctx::SharedCtx,
+        linked_call::{
+            ComponentCtxTemplate, EphemeralCallMode, EphemeralLinkedCall, LinkedExportInvocation,
+            func_is_bridge_safe, func_is_ephemeral_safe, invoke_linked_async_export,
+            invoke_linked_sync_export, new_store_from_templates,
+        },
+        volumes::{ResolvedVolumeMount, resolve_component_volume_mounts_in_map},
     },
     plugin::HostPlugin,
     types::{LocalResources, VolumeMount},
@@ -41,17 +42,13 @@ type BoundPluginWithInterfaces = (
     Vec<String>,
 );
 
-/// Shared slot holding the most recently instantiated component, keyed by its id.
-/// Used while resolving inter-component imports.
-type SharedInstanceSlot = Arc<RwLock<Option<(Arc<str>, Instance)>>>;
-
 /// Metadata associated with components and services within a workload.
 #[derive(Clone)]
 pub struct WorkloadMetadata {
     /// The unique identifier for this component
-    id: Arc<str>,
+    pub(crate) id: Arc<str>,
     /// The unique identifier for the workload this component belongs to
-    workload_id: Arc<str>,
+    pub(crate) workload_id: Arc<str>,
     /// The name of the workload this component belongs to
     workload_name: Arc<str>,
     /// The namespace of the workload this component belongs to
@@ -61,21 +58,29 @@ pub struct WorkloadMetadata {
     /// The wasmtime [`Linker`] used to instantiate the component
     linker: Linker<SharedCtx>,
     /// The volume mounts requested by this component
-    volume_mounts: Vec<(PathBuf, VolumeMount)>,
+    pub(crate) volume_mounts: Vec<(PathBuf, VolumeMount)>,
+    /// Canonicalized volume mounts, resolved once during workload resolution.
+    pub(crate) resolved_volume_mounts: Vec<ResolvedVolumeMount>,
     /// The local resources requested by this component
-    local_resources: LocalResources,
+    pub(crate) local_resources: LocalResources,
     /// The plugins available to this component
-    plugins: Option<HashMap<&'static str, Arc<dyn HostPlugin + Send + Sync>>>,
+    pub(crate) plugins: Option<HashMap<&'static str, Arc<dyn HostPlugin + Send + Sync>>>,
     /// Workload loopback
-    loopback: Arc<std::sync::Mutex<loopback::Network>>,
+    pub(crate) loopback: Arc<std::sync::Mutex<loopback::Network>>,
     /// Linked component ids
     linked_components: HashSet<Arc<str>>,
-    /// Whether WASIP3 support is enabled for this component's engine.
-    #[cfg(feature = "wasip3")]
-    wasip3_enabled: bool,
 }
 
 impl WorkloadMetadata {
+    async fn resolve_volume_mounts(&mut self) -> anyhow::Result<()> {
+        let mut resolved = Vec::with_capacity(self.volume_mounts.len());
+        for (host_path, mount) in &self.volume_mounts {
+            resolved.push(ResolvedVolumeMount::from_mount(host_path, mount).await?);
+        }
+        self.resolved_volume_mounts = resolved;
+        Ok(())
+    }
+
     /// Returns the unique identifier for this component.
     pub fn id(&self) -> &str {
         &self.id
@@ -104,6 +109,11 @@ impl WorkloadMetadata {
     /// Returns a mutable reference to the component's linker.
     pub fn linker(&mut self) -> &mut Linker<SharedCtx> {
         &mut self.linker
+    }
+
+    /// Returns a reference to the wasmtime [`Component`].
+    pub fn component(&self) -> &Component {
+        &self.component
     }
 
     /// Returns a reference to component local resources.
@@ -141,6 +151,7 @@ impl WorkloadMetadata {
             .component
             .component_type()
             .exports(self.component.engine())
+            .map(|(name, item)| (name, item.ty))
             .filter_map(|(name, item)| {
                 if matches!(item, ComponentItem::ComponentInstance(_)) {
                     Some((name.to_string(), item))
@@ -163,10 +174,9 @@ impl WorkloadMetadata {
         crate::engine::exports_wasi_http(&self.component)
     }
 
-    /// Returns whether this component targets WASIP3 and the engine has P3 enabled.
-    #[cfg(feature = "wasip3")]
+    /// Returns whether this component targets WASIP3.
     pub fn targets_p3(&self) -> bool {
-        self.wasip3_enabled && crate::engine::targets_wasip3(&self.component)
+        crate::engine::targets_wasip3(&self.component)
     }
 
     /// Computes and returns the [`WitWorld`] of this component.
@@ -180,8 +190,21 @@ impl WorkloadMetadata {
             .component_type()
             .imports(self.component.engine())
         {
-            if let ComponentItem::ComponentInstance(_) = import_item {
-                let interface = WitInterface::from(import_name);
+            if let ComponentItem::ComponentInstance(_) = &import_item.ty {
+                // An `(implements <id>)` import carries the real interface
+                // identity in its `implements` annotation; the import name is
+                // the multiplex label (e.g. `team-a`). Build the interface from
+                // the annotation and record the label as the routing `name` so
+                // it lines up with a named host interface. A plain import uses
+                // its name as the identity directly.
+                let interface = match import_item.implements {
+                    Some(implements_id) => {
+                        let mut iface = WitInterface::from(implements_id);
+                        iface.name = Some(import_name.to_string());
+                        iface
+                    }
+                    None => WitInterface::from(import_name),
+                };
                 let k = interface.instance();
                 imports
                     .entry(k)
@@ -203,7 +226,7 @@ impl WorkloadMetadata {
             .component_type()
             .exports(self.component.engine())
         {
-            if let ComponentItem::ComponentInstance(_) = export_item {
+            if let ComponentItem::ComponentInstance(_) = export_item.ty {
                 let interface = WitInterface::from(export_name);
                 let k = interface.instance();
                 exports
@@ -253,7 +276,6 @@ impl WorkloadService {
         local_resources: LocalResources,
         max_restarts: u64,
         loopback: Arc<std::sync::Mutex<loopback::Network>>,
-        #[cfg(feature = "wasip3")] wasip3_enabled: bool,
     ) -> Self {
         Self {
             metadata: WorkloadMetadata {
@@ -264,12 +286,11 @@ impl WorkloadService {
                 component,
                 linker,
                 volume_mounts,
+                resolved_volume_mounts: Vec::new(),
                 local_resources,
                 plugins: None,
                 loopback,
                 linked_components: Default::default(),
-                #[cfg(feature = "wasip3")]
-                wasip3_enabled,
             },
             handle: None,
             max_restarts,
@@ -285,7 +306,6 @@ impl WorkloadService {
     }
 
     /// Pre-instantiate the component for P3 execution.
-    #[cfg(feature = "wasip3")]
     pub fn pre_instantiate_p3(
         &mut self,
     ) -> anyhow::Result<wasmtime_wasi::p3::bindings::CommandPre<SharedCtx>> {
@@ -293,6 +313,18 @@ impl WorkloadService {
         let pre = self.metadata.linker.instantiate_pre(&component)?;
         let command = wasmtime_wasi::p3::bindings::CommandPre::new(pre)?;
         Ok(command)
+    }
+
+    /// Pre-instantiate the raw component, leaving binding-view construction
+    /// (e.g. both cli `Command` and http `Service`) to the caller. Used when a
+    /// p3 service also serves HTTP and must drive both exports on one instance.
+    pub fn pre_instantiate_raw(
+        &self,
+    ) -> anyhow::Result<wasmtime::component::InstancePre<SharedCtx>> {
+        Ok(self
+            .metadata
+            .linker
+            .instantiate_pre(&self.metadata.component)?)
     }
 
     /// Whether or not the service is currently running.
@@ -312,7 +344,7 @@ pub struct WorkloadComponent {
     /// Component name. Primarily for debugging purposes.
     name: Arc<str>,
     /// The [`WorkloadMetadata`] for this component
-    metadata: WorkloadMetadata,
+    pub(crate) metadata: WorkloadMetadata,
     /// The number of warm instances to keep for this component
     pool_size: usize,
     /// The maximum number of concurrent invocations allowed for this component
@@ -333,7 +365,6 @@ impl WorkloadComponent {
         volume_mounts: Vec<(PathBuf, VolumeMount)>,
         local_resources: LocalResources,
         loopback: Arc<std::sync::Mutex<loopback::Network>>,
-        #[cfg(feature = "wasip3")] wasip3_enabled: bool,
     ) -> Self {
         Self {
             metadata: WorkloadMetadata {
@@ -344,12 +375,11 @@ impl WorkloadComponent {
                 component,
                 linker,
                 volume_mounts,
+                resolved_volume_mounts: Vec::new(),
                 local_resources,
                 plugins: None,
                 loopback,
                 linked_components: Default::default(),
-                #[cfg(feature = "wasip3")]
-                wasip3_enabled,
             },
             name: component_name.into(),
             // TODO: Implement pooling and instance limits
@@ -362,6 +392,16 @@ impl WorkloadComponent {
     pub fn pre_instantiate(&mut self) -> wasmtime::Result<InstancePre<SharedCtx>> {
         let component = self.metadata.component.clone();
         self.metadata.linker.instantiate_pre(&component)
+    }
+
+    /// Like [`Self::pre_instantiate`] but without requiring `&mut self`:
+    /// `Linker::instantiate_pre` only needs `&self`, so callers holding a read
+    /// lock on the component map can pre-instantiate without serializing on a
+    /// write lock.
+    pub fn pre_instantiate_ref(&self) -> wasmtime::Result<InstancePre<SharedCtx>> {
+        self.metadata
+            .linker
+            .instantiate_pre(&self.metadata.component)
     }
 
     pub fn metadata(&self) -> &WorkloadMetadata {
@@ -517,16 +557,80 @@ impl std::fmt::Debug for ResolvedWorkload {
     }
 }
 
+/// Everything needed to rebuild a p3 service's store (plain `cli/run` or
+/// trigger service), captured by its supervisor so each incarnation gets a
+/// FRESH store: after a guest trap the old store can no longer enter ANY
+/// component instance ("cannot enter component instance"), so reusing it would
+/// leave every restarted incarnation permanently broken.
+struct ServiceStoreRecipe {
+    engine: wasmtime::Engine,
+    http_handler: Arc<dyn crate::host::http::HostHandler>,
+    active_template: ComponentCtxTemplate,
+    linked_templates: Vec<ComponentCtxTemplate>,
+    linked_instances: Vec<(Arc<str>, wasmtime::component::InstancePre<SharedCtx>)>,
+}
+
+impl ServiceStoreRecipe {
+    /// Build a fresh service store (`is_service = true` so `cli/run` may bind
+    /// its loopback socket).
+    async fn build(&self) -> anyhow::Result<wasmtime::Store<SharedCtx>> {
+        new_store_from_templates(
+            &self.engine,
+            self.http_handler.clone(),
+            &self.active_template,
+            &self.linked_templates,
+            &self.linked_instances,
+            true,
+        )
+        .await
+    }
+}
+
+/// Build a trigger service's host-invoked ingresses, returning them alongside the
+/// paired senders to register with the host-side HTTP/messaging ingresses. Called
+/// once per incarnation (start and each restart) so a restarted service gets fresh
+/// channels whose senders replace the stale registrations.
+#[allow(clippy::type_complexity)]
+fn build_trigger_ingresses(
+    serves_http: bool,
+    serves_messaging: bool,
+) -> (
+    Vec<crate::host::trigger_service::Ingress>,
+    Option<tokio::sync::mpsc::Sender<crate::host::http::ServiceHttpJob>>,
+    Option<tokio::sync::mpsc::Sender<crate::host::trigger_service::MessagingJob>>,
+) {
+    let mut ingresses = Vec::new();
+    let http_tx = serves_http.then(|| {
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        ingresses.push(crate::host::trigger_service::Ingress::Http(rx));
+        tx
+    });
+    let messaging_tx = serves_messaging.then(|| {
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        ingresses.push(crate::host::trigger_service::Ingress::Messaging(rx));
+        tx
+    });
+    (ingresses, http_tx, messaging_tx)
+}
+
 impl ResolvedWorkload {
     /// Executes the service, if present, and returns whether it was run.
     #[instrument(name="execute_service", skip_all, fields(workload.id = self.id.as_ref(), workload.name = self.name.as_ref(), workload.namespace = self.namespace.as_ref()))]
     pub(crate) async fn execute_service(&mut self) -> anyhow::Result<Option<Arc<JoinHandle<()>>>> {
-        #[cfg(feature = "wasip3")]
         if self
             .service
             .as_ref()
             .is_some_and(|s| s.metadata.targets_p3())
         {
+            // A p3 service that also exports a host-invoked handler (today
+            // `wasi:http/handler`) co-drives it with `cli/run` on one instance
+            // (see the `trigger service` module).
+            if self.service.as_ref().is_some_and(|s| {
+                crate::engine::exports_wasi_http(&s.metadata.component)
+                    || crate::engine::exports_messaging_handler(&s.metadata.component)
+            }) {
+                return self.execute_trigger_service().await;
+            }
             return self.execute_service_p3().await;
         }
 
@@ -535,6 +639,7 @@ impl ResolvedWorkload {
         };
         let pre = service.pre_instantiate()?;
         let mut max_restarts = service.max_restarts;
+        self.resolve_service_volume_mounts().await?;
         // Re-borrow immutably after the mutable borrow for pre_instantiate() is done
         let Some(service) = self.service.as_ref() else {
             bail!("service unexpectedly missing during execution");
@@ -567,7 +672,6 @@ impl ResolvedWorkload {
     }
 
     /// Execute a service using P3 (wasi:cli@0.3) CommandPre.
-    #[cfg(feature = "wasip3")]
     async fn execute_service_p3(&mut self) -> anyhow::Result<Option<Arc<JoinHandle<()>>>> {
         let service = self
             .service
@@ -575,13 +679,19 @@ impl ResolvedWorkload {
             .map(|s| (s.pre_instantiate_p3(), s.max_restarts));
 
         if let Some((Ok(pre), mut max_restarts)) = service {
-            let mut store = if let Some(service) = self.service.as_ref() {
-                self.new_store_from_metadata(&service.metadata, true)
-                    .await?
-            } else {
-                bail!("service unexpectedly missing during execution");
+            self.resolve_service_volume_mounts().await?;
+            // Capture the store recipe so each restarted incarnation gets a
+            // FRESH store: a trapped store cannot re-enter any component
+            // instance, so reuse after a fault would leave every restart
+            // permanently broken (and even a clean restart would accumulate
+            // stale instances in a reused store).
+            let recipe = {
+                let Some(service) = self.service.as_ref() else {
+                    bail!("service unexpectedly missing during execution");
+                };
+                self.service_store_recipe(&service.metadata).await?
             };
-
+            let mut store = recipe.build().await?;
             let handle = tokio::spawn(async move {
                 loop {
                     let instance = match pre.instantiate_async(&mut store).await {
@@ -617,6 +727,13 @@ impl ResolvedWorkload {
                         }
                     }
                     max_restarts = max_restarts.saturating_sub(1);
+                    match recipe.build().await {
+                        Ok(fresh) => store = fresh,
+                        Err(e) => {
+                            error!(err = %e, "failed to rebuild P3 service store; giving up");
+                            break;
+                        }
+                    }
                 }
             });
 
@@ -628,6 +745,125 @@ impl ResolvedWorkload {
         } else {
             Ok(None)
         }
+    }
+
+    /// Execute a p3 service that also exports a host-invoked handler (today
+    /// `wasi:http/handler` and `wasmcloud:messaging`): one instance co-drives
+    /// `cli/run` and the handler under a single `run_concurrent` (see
+    /// [`crate::host::trigger_service`]). The service runs in its own
+    /// long-lived store.
+    /// `is_service = true` lets the `cli/run` side bind its loopback socket.
+    async fn execute_trigger_service(&mut self) -> anyhow::Result<Option<Arc<JoinHandle<()>>>> {
+        let Some(service) = self.service.as_ref() else {
+            return Ok(None);
+        };
+        let pre = service.pre_instantiate_raw()?;
+        let (serves_http, serves_messaging, max_restarts) = (
+            crate::engine::exports_wasi_http(&service.metadata.component),
+            crate::engine::exports_messaging_handler(&service.metadata.component),
+            service.max_restarts,
+        );
+        self.resolve_service_volume_mounts().await?;
+
+        // Capture the store recipe so the supervisor below can rebuild a FRESH
+        // store per incarnation: a trapped store cannot re-enter any component
+        // instance, so a restart must never reuse it.
+        let recipe = {
+            let Some(service) = self.service.as_ref() else {
+                bail!("service unexpectedly missing during execution");
+            };
+            self.service_store_recipe(&service.metadata).await?
+        };
+        let mut store = recipe.build().await?;
+        let http_handler = self.http_handler.clone();
+        let workload_id: Arc<str> = Arc::from(self.id());
+
+        // Build the first incarnation's host-invoked ingresses. Each paired sender
+        // is registered with its host-side ingress (the HTTP server, the messaging
+        // subscriber), which then delivers to this live instance instead of
+        // instantiating a component per request/message. The first registration is
+        // synchronous (before the driver spawns) so a delivery immediately after
+        // start finds the handler; restarts re-register from inside the supervisor.
+        let (ingresses, http_tx, messaging_tx) =
+            build_trigger_ingresses(serves_http, serves_messaging);
+        if let Some(http_tx) = http_tx {
+            self.http_handler
+                .on_service_http_resolved(self.id(), http_tx)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to register service HTTP handler: {e:#}"))?;
+        }
+        if let Some(messaging_tx) = messaging_tx {
+            self.http_handler
+                .on_trigger_service_messaging_resolved(self.id(), messaging_tx)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("failed to register trigger service messaging handler: {e:#}")
+                })?;
+        }
+
+        // Supervise the driver: on a fault (e.g. a guest trap in `cli/run` or a
+        // handler), re-instantiate into the same store, rebuild the ingresses, and
+        // re-register their handlers (swapping the stale senders) until the restart
+        // budget is exhausted. A clean exit (every channel closed) stops it.
+        let handle = tokio::spawn(async move {
+            let mut first = Some(ingresses);
+            let mut restarts = max_restarts;
+            loop {
+                let ingresses = match first.take() {
+                    Some(ingresses) => ingresses,
+                    None => {
+                        let (ingresses, http_tx, messaging_tx) =
+                            build_trigger_ingresses(serves_http, serves_messaging);
+                        if let Some(http_tx) = http_tx
+                            && let Err(e) = http_handler
+                                .on_service_http_resolved(&workload_id, http_tx)
+                                .await
+                        {
+                            error!(err = %e, "failed to re-register service HTTP handler on restart");
+                        }
+                        if let Some(messaging_tx) = messaging_tx
+                            && let Err(e) = http_handler
+                                .on_trigger_service_messaging_resolved(&workload_id, messaging_tx)
+                                .await
+                        {
+                            error!(err = %e, "failed to re-register trigger service messaging handler on restart");
+                        }
+                        ingresses
+                    }
+                };
+                match crate::host::trigger_service::run_trigger_driver(&mut store, &pre, ingresses)
+                    .await
+                {
+                    Ok(()) => {
+                        info!("trigger service exited");
+                        break;
+                    }
+                    Err(e) if restarts == 0 => {
+                        error!(err = %e, "trigger service faulted; max restarts reached");
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(err = %e, retries = restarts, "trigger service faulted; restarting");
+                        restarts = restarts.saturating_sub(1);
+                        // The faulted store cannot re-enter any component
+                        // instance; the next incarnation needs a fresh one.
+                        match recipe.build().await {
+                            Ok(fresh) => store = fresh,
+                            Err(e) => {
+                                error!(err = %e, "failed to rebuild trigger service store; giving up");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let handle = Arc::new(handle);
+        if let Some(s) = self.service.as_mut() {
+            s.handle = Some(Arc::clone(&handle));
+        }
+        Ok(Some(handle))
     }
 
     /// Aborts the running service [`JoinHandle`] if it exists.
@@ -649,6 +885,51 @@ impl ResolvedWorkload {
 
     pub fn host_interfaces(&self) -> &Vec<WitInterface> {
         &self.host_interfaces
+    }
+
+    async fn resolve_component_volume_mounts(
+        &self,
+        component_ids: &[Arc<str>],
+    ) -> anyhow::Result<()> {
+        resolve_component_volume_mounts_in_map(&self.components, component_ids).await
+    }
+
+    async fn resolve_service_volume_mounts(&mut self) -> anyhow::Result<()> {
+        let linked_component_ids = self
+            .service
+            .as_ref()
+            .map(|service| {
+                service
+                    .metadata
+                    .linked_components
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.resolve_component_volume_mounts(&linked_component_ids)
+            .await?;
+        if let Some(service) = &mut self.service
+            && service.metadata.resolved_volume_mounts.is_empty()
+            && !service.metadata.volume_mounts.is_empty()
+        {
+            service.metadata.resolve_volume_mounts().await?;
+        }
+        Ok(())
+    }
+
+    fn component_ctx_template(&self, metadata: &WorkloadMetadata) -> ComponentCtxTemplate {
+        #[cfg(feature = "wasi-tls")]
+        {
+            crate::engine::linked_call::component_ctx_template_from_metadata_with_tls(
+                metadata,
+                self.tls_provider.clone(),
+            )
+        }
+        #[cfg(not(feature = "wasi-tls"))]
+        {
+            crate::engine::linked_call::component_ctx_template_from_metadata(metadata)
+        }
     }
 
     #[instrument(name="link_components", skip_all, fields(workload.id = self.id.as_ref(), workload.name = self.name.as_ref(), workload.namespace = self.namespace.as_ref()))]
@@ -709,7 +990,7 @@ impl ResolvedWorkload {
                 let ty = component.metadata.component.component_type();
                 for (import_name, import_item) in ty.imports(component.metadata.component.engine())
                 {
-                    if !matches!(import_item, ComponentItem::ComponentInstance(_)) {
+                    if !matches!(import_item.ty, ComponentItem::ComponentInstance(_)) {
                         continue;
                     }
                     // An interface exported by multiple components can't be
@@ -737,7 +1018,8 @@ impl ResolvedWorkload {
         // Topologically sort components: components with no dependencies (or dependencies
         // already processed) come first. This ensures that when we process a component
         // that imports from another component, the exporter has already been resolved.
-        let sorted_component_ids = topological_sort_components(&dependencies).context(
+        let sorted_component_ids = anyhow::Context::context(
+            topological_sort_components(&dependencies),
             "failed to determine component processing order - possible circular dependency",
         )?;
 
@@ -745,6 +1027,8 @@ impl ResolvedWorkload {
             order = ?sorted_component_ids.iter().map(|id| id.as_ref()).collect::<Vec<_>>(),
             "processing components in topological order"
         );
+
+        let mut resolved_links: HashMap<Arc<str>, HashSet<Arc<str>>> = HashMap::new();
 
         for component_id in sorted_component_ids {
             // In order to have mutable access to both the workload component and components that need
@@ -760,29 +1044,29 @@ impl ResolvedWorkload {
             let component = workload_component.metadata.component.clone();
             let linker = &mut workload_component.metadata.linker;
 
-            // TODO: only triggerable components (e.g. http-handler, messaging handler) should have linked components
-            let linked_components = self.components.read().await.keys().cloned().collect();
-
             let res = match self
                 .resolve_component_imports(&component, linker, interface_map)
                 .await
             {
-                Ok(_) => {
+                Ok(direct_links) => {
+                    let linked_components = expand_link_closure(&direct_links, &resolved_links);
                     workload_component.linked_components = linked_components;
                     Ok(())
                 }
                 Err(err) => Err(err),
             };
 
+            let linked_components = workload_component.linked_components.clone();
+            let workload_component_id = workload_component.metadata.id.clone();
+
             self.components
                 .write()
                 .await
                 .insert(workload_component.metadata.id.clone(), workload_component);
+            resolved_links.insert(workload_component_id, linked_components);
             // Propagate any errors encountered during import resolution
             res?;
         }
-
-        let linked_components = self.components.read().await.keys().cloned().collect();
 
         if let Some(mut service) = self.service.take() {
             let component = service.metadata.component.clone();
@@ -792,7 +1076,8 @@ impl ResolvedWorkload {
                 .resolve_component_imports(&component, linker, interface_map)
                 .await
             {
-                Ok(_) => {
+                Ok(direct_links) => {
+                    let linked_components = expand_link_closure(&direct_links, &resolved_links);
                     service.metadata.linked_components = linked_components;
                     Ok(())
                 }
@@ -817,15 +1102,30 @@ impl ResolvedWorkload {
         let mut linked_components = HashSet::new();
         let ty = component.component_type();
         let imports: Vec<_> = ty.imports(component.engine()).collect();
+        // The cross-store stream bridge engages only for a p3-service workload:
+        // there a long-lived service store must never be pinned/frozen by a
+        // stream-carrying backend call, so such calls run ephemerally (relocated)
+        // instead of on the shared store. In service-less / per-request workloads
+        // stream-carrying calls stay on the shared store.
+        let is_service_workload = self
+            .service
+            .as_ref()
+            .is_some_and(|s| s.metadata.targets_p3());
 
-        let instance: SharedInstanceSlot = Arc::default();
         for (import_name, import_item) in imports.into_iter() {
-            match import_item {
+            match import_item.ty {
                 ComponentItem::ComponentInstance(import_instance_ty) => {
                     trace!(name = import_name, "processing component instance import");
                     let mut all_components = self.components.write().await;
-                    let (plugin_component, instance_idx) = {
-                        let Some(exporter_component) = interface_map.get(import_name) else {
+                    let (
+                        plugin_component,
+                        instance_idx,
+                        plugin_component_id,
+                        nested_linked_component_ids,
+                        plugin_engine,
+                    ) = {
+                        let Some(exporter_component) = interface_map.get(import_name).cloned()
+                        else {
                             // Import not provided by another component in the workload.
                             // This is expected for host-provided interfaces (e.g. wasi:*).
                             // If it's not host-provided, linking will fail later with a
@@ -836,12 +1136,29 @@ impl ResolvedWorkload {
                             );
                             continue;
                         };
-                        let Some(plugin_component) = all_components.get_mut(exporter_component)
+                        let nested_linked_component_ids = {
+                            let Some(exporter_workload_component) =
+                                all_components.get(&exporter_component)
+                            else {
+                                anyhow::bail!(
+                                    "exporting component '{exporter_component}' for import '{import_name}' not found"
+                                );
+                            };
+                            exporter_workload_component
+                                .metadata
+                                .linked_components
+                                .iter()
+                                .cloned()
+                                .collect::<Vec<_>>()
+                        };
+                        let Some(plugin_component) = all_components.get_mut(&exporter_component)
                         else {
                             anyhow::bail!(
                                 "exporting component '{exporter_component}' for import '{import_name}' not found"
                             );
                         };
+                        let plugin_component_id = plugin_component.id.clone();
+                        let plugin_engine = plugin_component.metadata.engine().clone();
                         let Some((ComponentItem::ComponentInstance(_), idx)) = plugin_component
                             .metadata
                             .component
@@ -850,7 +1167,13 @@ impl ResolvedWorkload {
                             trace!(name = import_name, "skipping non-instance import");
                             continue;
                         };
-                        (plugin_component, idx)
+                        (
+                            plugin_component,
+                            idx,
+                            plugin_component_id,
+                            nested_linked_component_ids,
+                            plugin_engine,
+                        )
                     };
                     trace!(name = import_name, index = ?instance_idx, "found import at index");
 
@@ -870,8 +1193,8 @@ impl ResolvedWorkload {
                     for (export_name, export_ty) in
                         import_instance_ty.exports(plugin_component.metadata.component.engine())
                     {
-                        match export_ty {
-                            ComponentItem::ComponentFunc(_func_ty) => {
+                        match export_ty.ty {
+                            ComponentItem::ComponentFunc(func_ty) => {
                                 let (item, func_idx) = match plugin_component
                                     .metadata
                                     .component
@@ -896,120 +1219,90 @@ impl ResolvedWorkload {
                                     fn_name = export_name,
                                     "linking function import"
                                 );
-                                let import_name: Arc<str> = import_name.into();
-                                let export_name: Arc<str> = export_name.into();
-                                let pre = pre.clone();
-                                let instance = instance.clone();
-                                let plugin_component_id = plugin_component.id.clone();
+                                let export_is_async = func_ty.async_();
+                                // Plain-value async calls always run ephemerally
+                                // (params copied). In a p3-service workload, a call
+                                // carrying only relocatable `stream<T>` handles also
+                                // runs ephemerally — its args/results are relocated
+                                // (see `relocate`) rather than copied — so a
+                                // stream-carrying backend call can't pin or freeze
+                                // the service store.
+                                let plain_safe = func_is_ephemeral_safe(&func_ty);
+                                let relocate = !plain_safe
+                                    && is_service_workload
+                                    && func_is_bridge_safe(&func_ty);
+                                let ephemeral_call = if export_is_async && (plain_safe || relocate)
+                                {
+                                    let mode = if relocate {
+                                        EphemeralCallMode::Relocated {
+                                            param_tys: func_ty.params().map(|(_, ty)| ty).collect(),
+                                            result_tys: func_ty.results().collect(),
+                                        }
+                                    } else {
+                                        EphemeralCallMode::PlainValue
+                                    };
+                                    Some(Arc::new(EphemeralLinkedCall {
+                                        engine: plugin_engine.clone(),
+                                        http_handler: self.http_handler.clone(),
+                                        components: self.components.clone(),
+                                        active_component_id: plugin_component_id.clone(),
+                                        linked_component_ids: nested_linked_component_ids.clone(),
+                                        #[cfg(feature = "wasi-tls")]
+                                        tls_provider: self.tls_provider.clone(),
+                                        mode,
+                                    }))
+                                } else {
+                                    None
+                                };
 
-                                linked_components.insert(plugin_component_id.clone());
+                                let inv = LinkedExportInvocation {
+                                    import_name: import_name.into(),
+                                    export_name: export_name.into(),
+                                    pre: pre.clone(),
+                                    plugin_component_id: plugin_component.id.clone(),
+                                    func_idx,
+                                    param_tys: Arc::default(),
+                                    ephemeral_call,
+                                };
 
-                                linker_instance
-                                    .func_new_async(
-                                        &export_name.clone(),
-                                        move |mut store, _func, params, results| {
-                                            // TODO(#103): some kind of store data hashing mechanism
-                                            // to detect a diff store to drop the old one
-                                            let import_name = import_name.clone();
-                                            let export_name = export_name.clone();
-                                            let pre = pre.clone();
-                                            let plugin_component_id = plugin_component_id.clone();
-                                            let instance = instance.clone();
-                                            Box::new(async move {
-                                                let prev_id =
-                                                    store.data().active_ctx.component_id.clone();
+                                linked_components.insert(inv.plugin_component_id.clone());
 
-                                                store
-                                                    .data_mut()
-                                                    .set_active_ctx(&plugin_component_id)?;
-
-                                                let existing_instance = instance.read().await;
-                                                let store_id = store.data().active_ctx.id.clone();
-                                                let instance = if let Some((id, instance)) =
-                                                    existing_instance.clone()
-                                                    && id == store_id
-                                                {
-                                                    drop(existing_instance);
-                                                    instance
-                                                } else {
-                                                    // Likely unnecessary, but explicit drop of the read lock
-                                                    let new_instance =
-                                                        pre.instantiate_async(&mut store).await?;
-                                                    drop(existing_instance);
-                                                    *instance.write().await =
-                                                        Some((store_id, new_instance));
-                                                    new_instance
-                                                };
-
-                                                let func = instance
-                                                    .get_func(&mut store, func_idx)
-                                                    .ok_or_else(|| {
-                                                        wasmtime::format_err!("function not found")
-                                                    })?;
-                                                trace!(
-                                                    name = %import_name,
-                                                    fn_name = %export_name,
-                                                    ?params,
-                                                    "lowering params"
-                                                );
-                                                let mut params_buf =
-                                                    Vec::with_capacity(params.len());
-                                                for v in params {
-                                                    params_buf.push(lower(&mut store, v)?);
-                                                }
-                                                trace!(
-                                                    name = %import_name,
-                                                    fn_name = %export_name,
-                                                    ?params_buf,
-                                                    "invoking dynamic export"
-                                                );
-
-                                                let mut results_buf =
-                                                    vec![Val::Bool(false); results.len()];
-
-                                                // Enforce a timeout on this call to prevent hanging indefinitely
-                                                const CALL_TIMEOUT: Duration =
-                                                    Duration::from_secs(30);
-                                                timeout(
-                                                    CALL_TIMEOUT,
-                                                    func.call_async(
-                                                        &mut store,
-                                                        &params_buf,
-                                                        &mut results_buf,
-                                                    ),
-                                                )
-                                                .await
-                                                .map_err(|e| wasmtime::format_err!(
-                                                    "function call timed out after 30 seconds: {e}",
-                                                ))??;
-
-                                                trace!(
-                                                    name = %import_name,
-                                                    fn_name = %export_name,
-                                                    ?results_buf,
-                                                    "lifting results"
-                                                );
-                                                for (i, v) in results_buf.into_iter().enumerate() {
-                                                    *results.get_mut(i).ok_or_else(|| {
-                                                        wasmtime::format_err!(
-                                                            "result index out of bounds"
-                                                        )
-                                                    })? = lift(&mut store, v)?;
-                                                }
-                                                trace!(
-                                                    name = %import_name,
-                                                    fn_name = %export_name,
-                                                    ?results,
-                                                    "invoked dynamic export"
-                                                );
-
-                                                store.data_mut().set_active_ctx(&prev_id)?;
-
-                                                Ok(())
-                                            })
-                                        },
-                                    )
-                                    .map_err(|e| e.context("failed to create async func"))?;
+                                let export_name = inv.export_name.clone();
+                                if export_is_async {
+                                    linker_instance
+                                        .func_new_concurrent(
+                                            export_name.as_ref(),
+                                            move |accessor, _func_ty, params, results| {
+                                                let inv = inv.clone();
+                                                Box::pin(async move {
+                                                    invoke_linked_async_export(
+                                                        accessor, params, results, &inv,
+                                                    )
+                                                    .await
+                                                })
+                                            },
+                                        )
+                                        .map_err(|e| {
+                                            e.context("failed to create concurrent func")
+                                        })?;
+                                } else {
+                                    linker_instance
+                                        .func_new_async(
+                                            export_name.as_ref(),
+                                            move |store, _func_ty, params, results| {
+                                                let inv = inv.clone();
+                                                Box::new(async move {
+                                                    invoke_linked_sync_export(
+                                                        store, params, results, &inv,
+                                                    )
+                                                    .await
+                                                })
+                                            },
+                                        )
+                                        .map_err(|e| {
+                                            e.context("failed to wrap sync func in async func")
+                                        })?;
+                                }
                             }
                             ComponentItem::Resource(resource_ty) => {
                                 let (item, _idx) = match plugin_component
@@ -1095,6 +1388,15 @@ impl ResolvedWorkload {
         &self.id
     }
 
+    /// The host-side handler this workload's ingress registers with (the HTTP
+    /// server / trigger-service messaging registry). Lets a host plugin (e.g.
+    /// the messaging subscriber) deliver an inbound message to a long-lived
+    /// trigger-service instance instead of instantiating a component per
+    /// message.
+    pub fn http_handler(&self) -> &Arc<dyn crate::host::http::HostHandler> {
+        &self.http_handler
+    }
+
     /// Gets the name of the workload
     pub fn name(&self) -> &str {
         &self.name
@@ -1111,124 +1413,114 @@ impl ResolvedWorkload {
         self.components.read().await.len()
     }
 
-    /// Helper to create a new wasmtime Store for a given component in the workload.
-    async fn new_ctx(&self, component_id: &str) -> anyhow::Result<Ctx> {
-        let components = self.components.read().await;
-        let component = components
-            .get(component_id)
-            .context("component ID not found in workload")?;
-        self.new_ctx_from_metadata(&component.metadata, false).await
-    }
-
-    /// Creates a new wasmtime Store from the given workload metadata.
-    async fn new_ctx_from_metadata(
-        &self,
-        metadata: &WorkloadMetadata,
-        is_service: bool,
-    ) -> anyhow::Result<Ctx> {
-        let components = self.components.read().await;
-
-        // TODO: Consider stderr/stdout buffering + logging
-        let mut wasi_ctx_builder = WasiCtxBuilder::new();
-        wasi_ctx_builder
-            .envs(
-                metadata
-                    .local_resources
-                    .environment
-                    .iter()
-                    .map(|kv| (kv.0.as_str(), kv.1.as_str()))
-                    .collect::<Vec<_>>()
-                    .as_slice(),
-            )
-            .inherit_stdout()
-            .inherit_stderr();
-
-        // Build our custom sockets context with loopback support
-        let sockets_ctx = sockets::WasiSocketsCtx {
-            socket_addr_check: sockets::SocketAddrCheck::new(move |addr, reason| {
-                Box::pin(async move {
-                    match reason {
-                        SocketAddrUse::TcpBind if is_service => addr.ip().is_loopback(),
-                        SocketAddrUse::TcpBind => false,
-                        SocketAddrUse::UdpBind => {
-                            // NOTE: Outbound UDP requires an explicit bind in `wasi:sockets`
-                            addr.ip().is_loopback() || addr.ip().is_unspecified()
-                        }
-                        SocketAddrUse::TcpConnect
-                        | SocketAddrUse::UdpConnect
-                        | SocketAddrUse::UdpOutgoingDatagram => true,
-                    }
-                })
-            }),
-            loopback: Arc::clone(&metadata.loopback),
-            ..Default::default()
-        };
-
-        // Mount all possible volume mounts in the workload since components share a WasiCtx
-        for (host_path, mount) in &components
-            .values()
-            .flat_map(|workload_component| workload_component.metadata.volume_mounts.clone())
-            .collect::<Vec<_>>()
-        {
-            let dir = tokio::fs::canonicalize(host_path).await?;
-            debug!(host_path = %dir.display(), container_path = %mount.mount_path, "preopening volume mount");
-            let (dir_perms, file_perms) = match mount.read_only {
-                true => (DirPerms::READ, FilePerms::READ),
-                false => (DirPerms::all(), FilePerms::all()),
-            };
-            wasi_ctx_builder.preopened_dir(&dir, &mount.mount_path, dir_perms, file_perms)?;
-        }
-
-        let mut ctx_builder = Ctx::builder(metadata.workload_id(), metadata.id())
-            .with_http_handler(self.http_handler.clone())
-            .with_wasi_ctx(wasi_ctx_builder.build())
-            .with_sockets(sockets_ctx)
-            .with_allowed_hosts(metadata.local_resources.allowed_hosts.clone());
-
-        if let Some(plugins) = &metadata.plugins {
-            ctx_builder = ctx_builder.with_plugins(plugins.clone());
-        }
-
-        #[cfg(feature = "wasi-tls")]
-        if let Some(provider) = self.tls_provider.clone() {
-            ctx_builder = ctx_builder.with_tls_provider(provider);
-        }
-
-        Ok(ctx_builder.build())
-    }
-
     /// Helper to create a new wasmtime Store for multiple components and set active given component in the workload.
+    ///
+    /// Builds the store under one read lock: cloning `WorkloadMetadata` would
+    /// deep-clone its by-value `Linker`, and `pre_instantiate_ref` needs only
+    /// read access, so concurrent callers don't serialize on a write lock.
+    /// Nothing is retained past the returned store.
     pub async fn new_store(
         &self,
         component_id: &str,
     ) -> anyhow::Result<wasmtime::Store<SharedCtx>> {
-        let components = self.components.read().await;
-        let component = components
-            .get(component_id)
-            .context("component ID not found in workload")?;
-        self.new_store_from_metadata(&component.metadata, false)
-            .await
+        let (engine, active_template, linked_templates, linked_instances) = {
+            let components = self.components.read().await;
+            let component = components
+                .get(component_id)
+                .context("component ID not found in workload")?;
+            let metadata = &component.metadata;
+            let active_template = self.component_ctx_template(metadata);
+            let mut linked_templates = Vec::with_capacity(metadata.linked_components.len());
+            let mut linked_instances = Vec::with_capacity(metadata.linked_components.len());
+            for linked_id in &metadata.linked_components {
+                let linked = components.get(linked_id).with_context(|| {
+                    format!("linked component '{linked_id}' not found in workload")
+                })?;
+                linked_templates.push(self.component_ctx_template(&linked.metadata));
+                linked_instances.push((linked_id.clone(), linked.pre_instantiate_ref()?));
+            }
+            (
+                metadata.engine().clone(),
+                active_template,
+                linked_templates,
+                linked_instances,
+            )
+        };
+        new_store_from_templates(
+            &engine,
+            self.http_handler.clone(),
+            &active_template,
+            &linked_templates,
+            &linked_instances,
+            false,
+        )
+        .await
     }
 
     /// Creates a new wasmtime Store for multiple components from the given workload metadata.
-    pub async fn new_store_from_metadata(
+    async fn new_store_from_metadata(
         &self,
         metadata: &WorkloadMetadata,
         is_service: bool,
     ) -> anyhow::Result<wasmtime::Store<SharedCtx>> {
-        let active_ctx = self.new_ctx_from_metadata(metadata, is_service).await?;
-        let mut shared_ctx = SharedCtx::new(active_ctx);
+        let recipe = self.service_store_recipe(metadata).await?;
+        new_store_from_templates(
+            &recipe.engine,
+            recipe.http_handler.clone(),
+            &recipe.active_template,
+            &recipe.linked_templates,
+            &recipe.linked_instances,
+            is_service,
+        )
+        .await
+    }
 
-        for linked_component_id in metadata.linked_components.iter() {
-            let linked_component_ctx = self.new_ctx(linked_component_id).await?;
-            shared_ctx
-                .contexts
-                .insert(linked_component_id.clone(), linked_component_ctx);
+    /// Capture everything needed to (re)build this service's store, so the
+    /// trigger-service supervisor can construct a fresh store per incarnation
+    /// without borrowing `self`.
+    async fn service_store_recipe(
+        &self,
+        metadata: &WorkloadMetadata,
+    ) -> anyhow::Result<ServiceStoreRecipe> {
+        let linked_component_ids = metadata
+            .linked_components
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let linked_metadata = {
+            let components = self.components.read().await;
+            linked_component_ids
+                .iter()
+                .map(|linked_component_id| {
+                    components
+                        .get(linked_component_id)
+                        .map(|component| component.metadata.clone())
+                        .with_context(|| {
+                            format!("linked component '{linked_component_id}' not found")
+                        })
+                })
+                .collect::<wasmtime::Result<Vec<_>>>()?
+        };
+        let active_template = self.component_ctx_template(metadata);
+        let linked_templates = linked_metadata
+            .iter()
+            .map(|metadata| self.component_ctx_template(metadata))
+            .collect::<Vec<_>>();
+        let mut linked_instances = Vec::with_capacity(linked_component_ids.len());
+        for linked_component_id in &linked_component_ids {
+            linked_instances.push((
+                linked_component_id.clone(),
+                self.instantiate_pre(linked_component_id.as_ref()).await?,
+            ));
         }
 
-        let store = wasmtime::Store::new(metadata.engine(), shared_ctx);
-
-        Ok(store)
+        Ok(ServiceStoreRecipe {
+            engine: metadata.engine().clone(),
+            http_handler: self.http_handler.clone(),
+            active_template,
+            linked_templates,
+            linked_instances,
+        })
     }
 
     pub async fn instantiate_pre(
@@ -1297,10 +1589,26 @@ impl ResolvedWorkload {
             }
 
             if component.exports_wasi_http() {
-                self.http_handler
-                    .on_workload_unbind(self.id())
-                    .await
-                    .context("failed to notify HTTP handler of workload")?;
+                anyhow::Context::context(
+                    self.http_handler.on_workload_unbind(self.id()).await,
+                    "failed to notify HTTP handler of workload",
+                )?;
+            }
+        }
+
+        // A trigger service registered its HTTP/messaging handlers at start
+        // (`execute_trigger_service`); drop those registrations on stop so it no
+        // longer receives host-invoked deliveries on a torn-down instance.
+        if self.service.is_some() {
+            if let Err(e) = self.http_handler.on_service_http_unbind(self.id()).await {
+                tracing::error!(workload.id = %self.id(), err = %e, "failed to unbind service HTTP handler, continuing");
+            }
+            if let Err(e) = self
+                .http_handler
+                .on_trigger_service_messaging_unbind(self.id())
+                .await
+            {
+                tracing::error!(workload.id = %self.id(), err = %e, "failed to unbind trigger service messaging handler, continuing");
             }
         }
 
@@ -1423,8 +1731,11 @@ impl UnresolvedWorkload {
         // This tracks which interfaces each component still needs to be bound
         let mut unmatched_interfaces: HashMap<IdFlavor, HashSet<WitInterface>> = HashMap::new();
         let host_interfaces = {
-            // filter out Plugins fulfilled by host
-            let http_iface = WitInterface::from("wasi:http/incoming-handler,outgoing-handler");
+            // filter out Plugins fulfilled by host. `handler` is the unified
+            // WASI P3 http interface (covers both incoming and outgoing);
+            // `incoming-handler`/`outgoing-handler` are its P2 equivalents.
+            let http_iface =
+                WitInterface::from("wasi:http/incoming-handler,outgoing-handler,handler");
             self.host_interfaces
                 .iter()
                 .filter(|wit_interface| !http_iface.contains(wit_interface))
@@ -1483,6 +1794,18 @@ impl UnresolvedWorkload {
                 for wit_interface in required_interfaces.iter() {
                     // Check if plugin supports this interface
                     if plugin_interfaces.includes_bidirectional(wit_interface) {
+                        // an `(implements ..)` named interface is served only
+                        // by a plugin that supports named instances.
+                        let defer_to_other = if wit_interface.name.is_some() {
+                            !p.supports_named_instances()
+                                && other_plugin_serves(plugins, plugin_id, wit_interface, true)
+                        } else {
+                            p.supports_named_instances()
+                                && other_plugin_serves(plugins, plugin_id, wit_interface, false)
+                        };
+                        if defer_to_other {
+                            continue;
+                        }
                         matching_interfaces.insert(wit_interface.clone());
                     }
                 }
@@ -1718,11 +2041,10 @@ impl UnresolvedWorkload {
         };
 
         let incoming_http_component = {
-            let http_iface = WitInterface::from("wasi:http/incoming-handler");
             match self
                 .host_interfaces
                 .iter()
-                .any(|hi| hi.contains(&http_iface))
+                .any(|hi| hi.is_incoming_http_handler())
             {
                 // http was not part of the requested interfaces
                 false => None,
@@ -1757,6 +2079,19 @@ impl UnresolvedWorkload {
             let _ = resolved_workload.unbind_all_plugins().await;
             bail!(e);
         }
+
+        // Canonicalize component volume mounts up front so bad paths fail at
+        // deploy time, not on first request (the service resolves its own).
+        let all_component_ids: Vec<Arc<str>> = resolved_workload
+            .components
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect();
+        resolved_workload
+            .resolve_component_volume_mounts(&all_component_ids)
+            .await?;
 
         // Notify plugins of the resolved workload
         for (plugin, component_ids) in bound_plugins.iter() {
@@ -1825,20 +2160,6 @@ impl UnresolvedWorkload {
     }
 }
 
-/// Performs a topological sort on components based on their inter-component dependencies.
-///
-/// This function uses Kahn's algorithm to produce an ordering where components
-/// that export interfaces are processed before components that import those interfaces.
-/// This ensures that when linking components, the exporting component's linker has
-/// already been fully configured before it needs to be pre-instantiated.
-///
-/// # Arguments
-/// * `dependencies` - A map from component ID to the set of component IDs it depends on
-///   (i.e., components whose exports it imports)
-///
-/// # Returns
-/// A vector of component IDs in topological order (dependencies first), or an error
-/// if a circular dependency is detected.
 /// Builds the export→component map used to wire intra-workload component
 /// imports. An interface exported by exactly one component is registered for
 /// linking; an interface exported by more than one component is "ambiguous" —
@@ -1877,6 +2198,26 @@ fn build_export_map(
     (interface_map, ambiguous)
 }
 
+/// Returns whether some *other* registered plugin (not `self_id`) with
+/// `supports_named_instances() == want_named` can serve `iface`.
+/// Used to determine whether a plugin can defer an `(implements ..)`
+///  interface to a named-capable one, and vice versa).
+fn other_plugin_serves(
+    plugins: &HashMap<&'static str, Arc<dyn HostPlugin + 'static>>,
+    self_id: &str,
+    iface: &WitInterface,
+    want_named: bool,
+) -> bool {
+    plugins.iter().any(|(id, q)| {
+        *id != self_id
+            && q.supports_named_instances() == want_named
+            && q.world().includes_bidirectional(iface)
+    })
+}
+
+/// Topologically sort components (Kahn's algorithm) so exporters come before
+/// importers, a component's linker must be fully configured before anything
+/// that imports from it is pre-instantiated. Errors on a dependency cycle.
 fn topological_sort_components(
     dependencies: &HashMap<Arc<str>, HashSet<Arc<str>>>,
 ) -> anyhow::Result<Vec<Arc<str>>> {
@@ -1933,6 +2274,22 @@ fn topological_sort_components(
     }
 
     Ok(result)
+}
+
+/// Expand `direct_links` into the full transitive closure. One hop suffices
+/// because components are processed in topological order, so each
+/// `resolved_links[dep]` already holds that dep's complete closure.
+fn expand_link_closure(
+    direct_links: &HashSet<Arc<str>>,
+    resolved_links: &HashMap<Arc<str>, HashSet<Arc<str>>>,
+) -> HashSet<Arc<str>> {
+    let mut linked_components = direct_links.clone();
+    for linked_component_id in direct_links {
+        if let Some(nested_links) = resolved_links.get(linked_component_id) {
+            linked_components.extend(nested_links.iter().cloned());
+        }
+    }
+    linked_components
 }
 
 // Helper enum to differentiate between component and service IDs
@@ -2136,8 +2493,6 @@ mod tests {
             Vec::new(),
             local_resources,
             Arc::default(),
-            #[cfg(feature = "wasip3")]
-            false,
         )
     }
 
@@ -2160,8 +2515,6 @@ mod tests {
             Vec::new(),
             local_resources,
             Arc::default(),
-            #[cfg(feature = "wasip3")]
-            false,
         )
     }
 
@@ -2184,8 +2537,6 @@ mod tests {
             local_resources,
             3,
             Arc::default(),
-            #[cfg(feature = "wasip3")]
-            false,
         )
     }
 
@@ -2236,8 +2587,6 @@ mod tests {
                 Vec::new(),
                 LocalResources::default(),
                 Arc::default(),
-                #[cfg(feature = "wasip3")]
-                false,
             )
         };
         for (plugin, iface) in cases {
@@ -2270,20 +2619,15 @@ mod tests {
     /// Verifies that `on_workload_bind` is called before `on_workload_item_bind`.
     #[tokio::test]
     async fn test_single_plugin_single_component() {
-        // Use the actual interfaces that http_counter.wasm uses
-        let http_interface = WitInterface {
-            namespace: "wasi".to_string(),
-            package: "blobstore".to_string(),
-            interfaces: ["container".to_string()].into_iter().collect(),
-            version: Some(semver::Version::parse("0.2.0-draft").unwrap()),
-            config: std::collections::HashMap::new(),
-            name: None,
-        };
+        // An interface the http_counter.wasm fixture actually imports. Declared
+        // without a version so the test tracks the fixture across rebuilds; a
+        // versionless interface matches any version (see WitInterface::same_package).
+        let blobstore_interface = WitInterface::from("wasi:blobstore/container");
 
         let plugin = Arc::new(MockPlugin::new(
             "blobstore-plugin",
             vec![],
-            vec![http_interface.clone()],
+            vec![blobstore_interface.clone()],
         ));
 
         let mut plugins = HashMap::new();
@@ -2298,7 +2642,7 @@ mod tests {
             "test-namespace".to_string(),
             None,
             components,
-            vec![http_interface.clone()],
+            vec![blobstore_interface.clone()],
         );
 
         let bound_plugins = workload.bind_plugins(&plugins).await.unwrap();
@@ -2326,9 +2670,9 @@ mod tests {
     /// Verifies that each plugin gets called once for workload binding.
     #[tokio::test]
     async fn test_multiple_plugins_multiple_components() {
-        let http_interface = WitInterface::from("wasi:http/incoming-handler@0.2.0");
-        let blobstore_interface = WitInterface::from("wasi:blobstore/blobstore@0.2.0");
-        let keyvalue_interface = WitInterface::from("wasi:keyvalue/store@0.2.0");
+        let http_interface = WitInterface::from("wasi:http/incoming-handler");
+        let blobstore_interface = WitInterface::from("wasi:blobstore/blobstore");
+        let keyvalue_interface = WitInterface::from("wasi:keyvalue/store");
 
         let http_plugin = Arc::new(MockPlugin::new(
             "http-plugin",
@@ -2388,7 +2732,7 @@ mod tests {
     /// only one plugin gets bound to avoid duplicate interface handling.
     #[tokio::test]
     async fn test_no_duplicate_bindings() {
-        let http_interface = WitInterface::from("wasi:http/incoming-handler@0.2.0");
+        let http_interface = WitInterface::from("wasi:http/incoming-handler");
 
         // Two plugins that both provide HTTP
         let plugin1 = Arc::new(MockPlugin::new(
@@ -2436,8 +2780,8 @@ mod tests {
     /// The binding should fail gracefully with a descriptive error message.
     #[tokio::test]
     async fn test_missing_interface_fails() {
-        let http_interface = WitInterface::from("wasi:http/incoming-handler@0.2.0");
-        let blobstore_interface = WitInterface::from("wasi:blobstore/blobstore@0.2.0");
+        let http_interface = WitInterface::from("wasi:http/incoming-handler");
+        let blobstore_interface = WitInterface::from("wasi:blobstore/blobstore");
 
         // Plugin only provides HTTP
         let plugin = Arc::new(MockPlugin::new(
@@ -2463,19 +2807,74 @@ mod tests {
             vec![http_interface.clone(), blobstore_interface.clone()],
         );
 
-        // This should fail if a component actually needs blobstore but it's not provided
-        // Note: The actual failure depends on what the component's world() returns
-        let _result = workload.bind_plugins(&plugins).await;
+        // The component imports wasi:blobstore but no plugin provides it, so
+        // binding must fail. (The http interface is host-served and never
+        // requires a plugin.)
+        let err = match workload.bind_plugins(&plugins).await {
+            Ok(_) => panic!("binding should fail for an unprovided interface"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("not available on this host"),
+            "unexpected error: {err}"
+        );
+    }
 
-        // The test verifies the error path exists and works correctly
-        // In practice, this would fail if a component imports blobstore but no plugin provides it
+    /// A component exporting the unified WASI P3 `wasi:http/handler` interface
+    /// must bind with no HTTP plugin present, exactly like a P2
+    /// `incoming-handler` component: HTTP is served by the host, so the
+    /// requested interface must not fall through to plugin matching.
+    #[tokio::test]
+    async fn test_p3_http_handler_served_by_host() {
+        let engine = wasmtime::Engine::default();
+        let wasm = wat::parse_str(
+            r#"(component
+                (component $empty)
+                (instance $i (instantiate $empty))
+                (export "wasi:http/handler@0.3.0" (instance $i))
+            )"#,
+        )
+        .unwrap();
+        let component = Component::new(&engine, &wasm).unwrap();
+        let workload_component = WorkloadComponent::new(
+            "workload-p3-http".to_string(),
+            "test-workload-p3-http".to_string(),
+            "test-namespace".to_string(),
+            "test-component".to_string(),
+            component,
+            Linker::new(&engine),
+            Vec::new(),
+            LocalResources::default(),
+            Arc::default(),
+        );
+
+        let mut http_interface = WitInterface::from("wasi:http/handler");
+        http_interface
+            .config
+            .insert("host".to_string(), "localhost".to_string());
+        assert!(http_interface.is_incoming_http_handler());
+
+        let mut workload = UnresolvedWorkload::new(
+            "test-workload-id".to_string(),
+            "test-workload".to_string(),
+            "test-namespace".to_string(),
+            None,
+            vec![workload_component],
+            vec![http_interface],
+        );
+
+        let bound_plugins = workload.bind_plugins(&HashMap::new()).await.unwrap();
+        assert!(
+            bound_plugins.is_empty(),
+            "host-served wasi:http/handler must not require a plugin"
+        );
     }
 
     /// Tests that plugin callbacks are invoked in the correct order:
     /// `on_workload_bind` first, then `on_workload_item_bind` for each component.
     #[tokio::test]
     async fn test_plugin_callback_order() {
-        let interface1 = WitInterface::from("test:interface/handler@0.1.0");
+        let interface1 = WitInterface::from("test:interface/handler");
 
         let plugin = Arc::new(MockPlugin::new(
             "test-plugin",
@@ -2525,16 +2924,14 @@ mod tests {
     #[tokio::test]
     async fn test_world_includes_bidirectional() {
         let world = WitWorld {
-            imports: HashSet::from([WitInterface::from("wasmcloud:messaging/handler@0.1.0")]),
-            exports: HashSet::from([WitInterface::from(
-                "wasmcloud:messaging/consumer,types@0.1.0",
-            )]),
+            imports: HashSet::from([WitInterface::from("wasmcloud:messaging/handler")]),
+            exports: HashSet::from([WitInterface::from("wasmcloud:messaging/consumer,types")]),
         };
 
-        let interface1 = WitInterface::from("wasmcloud:messaging/handler@0.1.0");
-        let interface2 = WitInterface::from("wasmcloud:messaging/consumer,types@0.1.0");
-        let interface3 = WitInterface::from("wasmcloud:messaging/handler,consumer,types@0.1.0");
-        let interface4 = WitInterface::from("wasmcloud:messaging/producer@0.1.0");
+        let interface1 = WitInterface::from("wasmcloud:messaging/handler");
+        let interface2 = WitInterface::from("wasmcloud:messaging/consumer,types");
+        let interface3 = WitInterface::from("wasmcloud:messaging/handler,consumer,types");
+        let interface4 = WitInterface::from("wasmcloud:messaging/producer");
 
         assert!(world.includes_bidirectional(&interface1));
         assert!(world.includes_bidirectional(&interface2));
@@ -2597,6 +2994,28 @@ mod tests {
         let (map, ambiguous) = build_export_map(&exports);
         assert!(!map.contains_key(&iface));
         assert!(ambiguous.contains(&iface));
+    }
+
+    #[test]
+    fn expand_link_closure_adds_nested_links_only() {
+        let a: Arc<str> = Arc::from("component-a");
+        let b: Arc<str> = Arc::from("component-b");
+        let c: Arc<str> = Arc::from("component-c");
+        let unrelated: Arc<str> = Arc::from("unrelated");
+
+        let direct_links = HashSet::from([a.clone()]);
+        let resolved_links = HashMap::from([
+            (a.clone(), HashSet::from([b.clone(), c.clone()])),
+            (unrelated.clone(), HashSet::from([Arc::from("ignored")])),
+        ]);
+
+        let closure = expand_link_closure(&direct_links, &resolved_links);
+
+        assert_eq!(closure.len(), 3);
+        assert!(closure.contains(&a));
+        assert!(closure.contains(&b));
+        assert!(closure.contains(&c));
+        assert!(!closure.contains(&unrelated));
     }
 
     #[test]
@@ -2942,6 +3361,57 @@ mod tests {
         if let Err(e) = result {
             panic!("Single named entry should not require named instance support: {e}");
         }
+    }
+
+    /// Coexistence: a regular (standalone) plugin and a named-capable
+    /// (multiplexed) plugin both matching the same package bind together, with
+    /// the unnamed interface routed to the regular plugin and the `(implements
+    /// ..)` named interfaces routed to the named-capable one. Without the
+    /// name-aware dispatch this errors (the regular plugin would claim the two
+    /// named entries it cannot serve).
+    #[tokio::test]
+    async fn test_named_and_regular_plugins_coexist() {
+        let regular = Arc::new(MockPlugin::new(
+            "kv-standalone",
+            vec![],
+            vec![keyvalue_interface(None)],
+        ));
+        let multiplexed = Arc::new(
+            MockPlugin::new("kv-multiplexed", vec![], vec![keyvalue_interface(None)])
+                .with_named_instance_support(),
+        );
+
+        let mut plugins = HashMap::new();
+        plugins.insert(regular.id(), regular.clone() as Arc<dyn HostPlugin>);
+        plugins.insert(multiplexed.id(), multiplexed.clone() as Arc<dyn HostPlugin>);
+
+        let mut workload = UnresolvedWorkload::new(
+            "test-workload-id".to_string(),
+            "test-workload".to_string(),
+            "test-namespace".to_string(),
+            None,
+            vec![create_test_component("component1")],
+            vec![
+                keyvalue_interface(None),
+                keyvalue_interface(Some("cache")),
+                keyvalue_interface(Some("sessions")),
+            ],
+        );
+
+        let bound = workload
+            .bind_plugins(&plugins)
+            .await
+            .expect("standalone + multiplexed plugins should bind together");
+        let bound_ids: std::collections::HashSet<&str> =
+            bound.iter().map(|(p, _)| p.id()).collect();
+        assert!(
+            bound_ids.contains("kv-standalone"),
+            "regular plugin must bind the unnamed interface"
+        );
+        assert!(
+            bound_ids.contains("kv-multiplexed"),
+            "named-capable plugin must bind the named interfaces"
+        );
     }
 
     /// Existing unnamed entries -> no change in behavior

@@ -9,7 +9,6 @@ use bytes::BytesMut;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use io_lifetimes::AsSocketlike as _;
-use std::io::Cursor;
 use std::net::{Shutdown, SocketAddr};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
@@ -123,7 +122,7 @@ impl ReceiveStreamProducer {
 
 impl<D> StreamProducer<D> for ReceiveStreamProducer {
     type Item = u8;
-    type Buffer = Cursor<BytesMut>;
+    type Buffer = BytesMut;
 
     fn poll_produce<'a>(
         mut self: Pin<&mut Self>,
@@ -248,8 +247,8 @@ impl types::Host for WasiSocketsCtxView<'_> {
     }
 }
 
-impl HostTcpSocketWithStore for WasiSockets {
-    async fn connect<T>(
+impl<T: Send> HostTcpSocketWithStore<T> for WasiSockets {
+    async fn connect(
         store: &Accessor<T, Self>,
         socket: Resource<UpstreamTcpSocket>,
         remote_address: IpSocketAddress,
@@ -294,11 +293,30 @@ impl HostTcpSocketWithStore for WasiSockets {
         })
     }
 
-    fn listen<T: 'static>(
+    async fn listen(
         mut store: Access<'_, T, Self>,
         socket: Resource<UpstreamTcpSocket>,
     ) -> SocketResult<StreamReader<Resource<UpstreamTcpSocket>>> {
         let getter = store.getter();
+
+        // A socket that has not been explicitly bound implicitly binds to an
+        // ephemeral port during `listen`. Run the host's `socket_addr_check`
+        // against that implicit bind address first — the same check `bind`
+        // performs — so `listen` cannot be used to bind to an address the
+        // network policy would otherwise deny. (bytecodealliance/wasmtime#13677)
+        let implicit_addr = {
+            let view = store.get();
+            let socket_ref = get_socket_mut(view.table, &socket)?;
+            socket_ref
+                .needs_implicit_bind()
+                .then(|| crate::sockets::util::implicit_bind_addr(socket_ref.address_family()))
+        };
+        if let Some(addr) = implicit_addr {
+            let check = store.get().ctx.socket_addr_check.clone();
+            if !check(addr, SocketAddrUse::TcpBind).await {
+                return Err(types::ErrorCode::AccessDenied.into());
+            }
+        }
 
         // Scope: do the listen and extract info
         enum ListenKind {
@@ -396,7 +414,7 @@ impl HostTcpSocketWithStore for WasiSockets {
         }
     }
 
-    fn send<T: 'static>(
+    fn send(
         mut store: Access<'_, T, Self>,
         socket: Resource<UpstreamTcpSocket>,
         mut data: StreamReader<u8>,
@@ -437,7 +455,7 @@ impl HostTcpSocketWithStore for WasiSockets {
         }
     }
 
-    fn receive<T: 'static>(
+    fn receive(
         mut store: Access<T, Self>,
         socket: Resource<UpstreamTcpSocket>,
     ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<Result<(), types::ErrorCode>>)> {
@@ -851,7 +869,7 @@ impl Drop for LoopbackReceiveStreamProducer {
 
 impl<D> StreamProducer<D> for LoopbackReceiveStreamProducer {
     type Item = u8;
-    type Buffer = Cursor<BytesMut>;
+    type Buffer = BytesMut;
 
     fn poll_produce<'a>(
         mut self: Pin<&mut Self>,

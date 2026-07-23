@@ -22,15 +22,16 @@ jobs:
     outputs:
       relevant: ${{ steps.filter.outputs.relevant }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
+      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
         id: filter
         with:
           filters: |
             relevant:
               - 'charts/**'
+              - '.github/workflows/charts.yml'
 
   test:
     needs:
@@ -40,16 +41,107 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-go
       - name: Render
         run: make helm-render
 
+  # Runs `helm lint` + yamllint on the chart. The chart `version` is
+  # release-driven (see .github/ct.yaml), so this does not enforce a version bump.
+  lint:
+    needs:
+      - changes
+    if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    name: ct lint (helm + yaml)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # ct diffs against `target-branch` to detect which charts changed so
+          # it only lints those, so it needs full history, not a shallow clone.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: helm/chart-testing-action@6ec842c01de15ebb84c8627d2744a0c2f2755c9f # v2.8.0
+      - name: Lint charts
+        run: ct lint --config .github/ct.yaml
+
+  # Schema-validates the rendered manifests against the Kubernetes API.
+  kubeconform:
+    needs:
+      - changes
+    if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    name: kubeconform (manifest schema)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-go
+      - name: Install kubeconform
+        run: go install github.com/yannh/kubeconform/cmd/kubeconform@v0.6.7
+      - name: Validate rendered manifests
+        # -ignore-missing-schemas skips kinds with no published schema (CRDs such
+        # as runtime.wasmcloud.dev and cert-manager Certificate); everything with
+        # a known schema is validated strictly.
+        run: |
+          helm template -n example-ns example-name charts/runtime-operator \
+            | kubeconform -strict -summary -ignore-missing-schemas \
+                -kubernetes-version 1.30.0 -schema-location default
+
+  # Security / best-practice scanners, blocking via `gate` below.
+  trivy:
+    needs:
+      - changes
+    if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    name: trivy config
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: charts/runtime-operator
+          severity: HIGH,CRITICAL
+          trivyignores: charts/runtime-operator/.trivyignore
+          exit-code: '1'
+
+  checkov:
+    needs:
+      - changes
+    if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    name: checkov
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: bridgecrewio/checkov-action@7b972723c44fb3d256283fac96fae5d7c1894bb7 # v12.3114.0
+        with:
+          directory: charts/runtime-operator
+          framework: helm
+          config_file: charts/runtime-operator/.checkov.yaml
+          output_format: cli
+          soft_fail: false
+
   gate:
     needs:
       - test
+      - lint
+      - kubeconform
+      - trivy
+      - checkov
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
@@ -78,7 +170,7 @@ jobs:
       packages: write
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
       - uses: ./.github/actions/helm-publish
@@ -104,7 +196,7 @@ jobs:
       packages: write
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
       - uses: ./.github/actions/helm-publish

@@ -27,7 +27,7 @@ use std::future::Future;
 
 use crate::engine::workload::WorkloadItem;
 use crate::{
-    engine::workload::{ResolvedWorkload, UnresolvedWorkload, WorkloadComponent},
+    engine::workload::{ResolvedWorkload, UnresolvedWorkload, WorkloadMetadata},
     wit::WitWorld,
 };
 
@@ -50,6 +50,15 @@ pub mod wasmcloud_postgres;
 pub mod wasi_otel;
 
 pub mod wasmcloud_messaging;
+
+/// Host capabilities provided by a WebAssembly component running in its own
+/// supervised store (rather than by a Rust plugin running in-store).
+#[cfg(feature = "host-component-plugins")]
+pub mod component_host;
+
+/// Shared `(implements ..)` multiplexing core
+#[cfg(feature = "wasm_component_model_implements")]
+pub mod multiplex;
 
 #[cfg(all(
     feature = "wasi-webgpu",
@@ -335,9 +344,12 @@ impl<T, Y> WorkloadTracker<T, Y> {
         }
     }
 
-    pub fn add_component(&mut self, workload_component: &WorkloadComponent, data: Y) {
-        let component_id = workload_component.id();
-        let workload_id = workload_component.workload_id();
+    /// Track an item (a component or a long-lived service) by its metadata. Both
+    /// `WorkloadComponent` and `WorkloadService` deref to `WorkloadMetadata`, so
+    /// existing `&WorkloadComponent` callers coerce unchanged.
+    pub fn add_component(&mut self, metadata: &WorkloadMetadata, data: Y) {
+        let component_id = metadata.id();
+        let workload_id = metadata.workload_id();
         let item = self
             .workloads
             .entry(workload_id.to_string())

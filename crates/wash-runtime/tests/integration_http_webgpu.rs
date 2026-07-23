@@ -9,7 +9,11 @@
 //! Note: This is a basic integration test that verifies plugin loading and host functionality.
 //! Full component binding and request routing would require proper WIT interface configuration.
 //!
-#![cfg(feature = "wasi-webgpu")]
+#![cfg(all(
+    feature = "wasi-webgpu",
+    not(target_os = "windows"),
+    not(target_arch = "s390x")
+))]
 
 use anyhow::{Context, Result};
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -95,17 +99,9 @@ async fn test_http_webgpu_integration() -> Result<()> {
                 },
                 WitInterface {
                     namespace: "wasi".to_string(),
-                    package: "graphics-context".to_string(),
-                    interfaces: ["graphics-context".to_string()].into_iter().collect(),
-                    version: Some(semver::Version::parse("0.0.1").unwrap()),
-                    config: HashMap::new(),
-                    name: None,
-                },
-                WitInterface {
-                    namespace: "wasi".to_string(),
                     package: "webgpu".to_string(),
                     interfaces: ["webgpu".to_string()].into_iter().collect(),
-                    version: Some(semver::Version::parse("0.0.1").unwrap()),
+                    version: Some(semver::Version::parse("0.3.0-rc.2").unwrap()),
                     config: HashMap::new(),
                     name: None,
                 },

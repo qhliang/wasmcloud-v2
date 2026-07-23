@@ -8,7 +8,6 @@
 //! - Mixed P2/P3 components in same workload
 //! - P2 regression with P3 engine enabled
 
-#![cfg(feature = "wasip3")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use anyhow::{Context, Result};
@@ -26,7 +25,7 @@ mod common;
 use common::{
     http_blobstore_host_interfaces as p3_http_blobstore_host_interfaces,
     http_counter_host_interfaces, http_only_host_interfaces as p3_http_host_interfaces,
-    start_host_with_p3 as start_p3_host,
+    start_host_with_p3_http_handler as start_p3_host,
 };
 
 // P3 fixtures
@@ -47,7 +46,6 @@ const P2_CALLEE_WASM: &[u8] = include_bytes!("wasm/inter_component_call_callee.w
 
 fn engine_with_p3() -> Engine {
     Engine::builder()
-        .with_wasip3(true)
         .build()
         .expect("failed to build engine with wasip3")
 }

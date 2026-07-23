@@ -40,8 +40,8 @@ fn get_socket_mut<'a>(
         .map_err(SocketError::trap)
 }
 
-impl HostUdpSocketWithStore for WasiSockets {
-    async fn send<T>(
+impl<T> HostUdpSocketWithStore<T> for WasiSockets {
+    async fn send(
         store: &Accessor<T, Self>,
         socket: Resource<UpstreamUdpSocket>,
         data: Vec<u8>,
@@ -56,6 +56,35 @@ impl HostUdpSocketWithStore for WasiSockets {
             let check = store.with(|mut view| view.get().ctx.socket_addr_check.clone());
             if !check(addr, SocketAddrUse::UdpOutgoingDatagram).await {
                 return Err(ErrorCode::AccessDenied.into());
+            }
+
+            // An unbound socket implicitly binds to an ephemeral local port on
+            // its first `send-to`. Mirror wasmtime's p3 UDP send: check that
+            // implicit bind against the network policy (as an explicit `bind`
+            // is checked) and then perform it, leaving the socket bound so this
+            // runs once rather than on every datagram. (bytecodealliance/wasmtime#13677)
+            let implicit_family = store.with(|mut store| {
+                let view = store.get();
+                let sock = get_socket_mut(view.table, &socket)?;
+                SocketResult::Ok(sock.needs_implicit_bind().then(|| sock.address_family()))
+            })?;
+            if let Some(family) = implicit_family {
+                let implicit_addr = crate::sockets::util::implicit_bind_addr(family);
+                if !check(implicit_addr, SocketAddrUse::UdpBind).await {
+                    return Err(ErrorCode::AccessDenied.into());
+                }
+                store.with(|mut store| {
+                    let view = store.get();
+                    let mut loopback = view
+                        .ctx
+                        .loopback
+                        .lock()
+                        .map_err(|e| SocketError::trap(wasmtime::format_err!("{e}")))?;
+                    let sock = get_socket_mut(view.table, &socket)?;
+                    sock.bind(implicit_addr, &mut loopback).map_err(se)?;
+                    sock.finish_bind().map_err(se)?;
+                    SocketResult::Ok(())
+                })?;
             }
         }
 
@@ -152,7 +181,7 @@ impl HostUdpSocketWithStore for WasiSockets {
         Ok(())
     }
 
-    async fn receive<T>(
+    async fn receive(
         store: &Accessor<T, Self>,
         socket: Resource<UpstreamUdpSocket>,
     ) -> SocketResult<(Vec<u8>, IpSocketAddress)> {

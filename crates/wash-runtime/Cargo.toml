@@ -8,11 +8,7 @@ repository = "https://github.com/wasmCloud/wasmCloud"
 authors = ["The wasmCloud Team"]
 categories = ["wasm"]
 readme = "README.md"
-# Not published to crates.io: the optional `wasi-webgpu` feature pulls in
-# git-only deps (`wasi-graphics-context-wasmtime`, `wasi-webgpu-wasmtime`
-# from wasi-gfx/wasi-gfx-runtime) that have no crates.io release, and
-# cargo's publish manifest check rejects deps without a version
-# requirement. Revisit once those crates are on crates.io or vendored.
+# Not published to crates.io: this is an internal runtime crate.
 publish = false
 # Allowlist preserved for the eventual re-enable of publishing. Cargo
 # always includes Cargo.toml, Cargo.lock, Cargo.toml.orig, and
@@ -37,7 +33,7 @@ path = "src/lib.rs"
 workspace = true
 
 [features]
-default = ["wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "wasmcloud-postgres", "washlet", "wasi-otel"]
+default = ["wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "wasmcloud-postgres", "washlet", "wasi-otel", "wasi-webgpu"]
 oci = ["dep:oci-client", "dep:oci-wasm", "dep:docker_credential", "dep:sha2", "dep:wit-component"]
 wasi-otel = []
 washlet = ["oci"]
@@ -45,7 +41,13 @@ wasi-config = []
 wasi-logging = []
 wasi-blobstore = []
 wasi-keyvalue = []
-wasi-webgpu = ["dep:wasi-webgpu-wasmtime", "dep:wasi-graphics-context-wasmtime"]
+# Component-model `(implements ..)` / `named_imports` multiplexing
+wasm_component_model_implements = []
+# Host component plugins: a component providing a host capability from its own
+# long-lived, supervised store, serving cross-store capability calls.
+# See `plugin::component_host` for the adapter and how it wires up.
+host-component-plugins = []
+wasi-webgpu = ["dep:wasi-webgpu-wasmtime"]
 wasmcloud-postgres = [
     "dep:tokio-postgres", "dep:tokio-postgres-rustls",
     "dep:deadpool-postgres", "dep:postgres-types",
@@ -53,15 +55,11 @@ wasmcloud-postgres = [
     "dep:bit-vec", "dep:cidr", "dep:geo-types",
     "dep:ulid",
 ]
-wasip3 = [
-    "wasmtime-wasi/p3",
-    "wasmtime-wasi-http/p3",
-    "wasmtime-wasi-http/component-model-async",
-]
-wasi-tls = ["dep:wasmtime-wasi-tls", "wasip3"]
+wasi-tls = ["dep:wasmtime-wasi-tls"]
 
 [dependencies]
 anyhow = { workspace = true }
+arc-swap = { workspace = true }
 async-nats = { workspace = true, features = ["aws-lc-rs"] }
 async-trait = { workspace = true }
 bon = { workspace = true }
@@ -81,10 +79,10 @@ uuid = { workspace = true, features = ["v4"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["sync", "net", "macros"] }
 tracing = { workspace = true }
-wasmtime = { workspace = true, features = ["anyhow", "component-model", "component-model-async", "cranelift", "pooling-allocator", "gc", "gc-null"] }
-wasmtime-wasi = { workspace = true }
+wasmtime = { workspace = true, features = ["anyhow", "component-model", "component-model-async", "cranelift", "pooling-allocator", "gc", "gc-null", "threads"] }
+wasmtime-wasi = { workspace = true, features = ["p3"] }
 wasmtime-wasi-io = { workspace = true }
-wasmtime-wasi-http = { workspace = true, features = ["default-send-request", "p2"] }
+wasmtime-wasi-http = { workspace = true, features = ["default-send-request", "p2", "p3", "component-model-async"] }
 wasmtime-wasi-tls = { workspace = true, optional = true, features = ["p3", "rustls"] }
 cap-net-ext = { workspace = true }
 cap-std = { workspace = true }
@@ -117,12 +115,10 @@ opentelemetry-http = { workspace = true }
 # Otel dependencies (optional, behind 'wasi-otel' feature)
 opentelemetry-otlp = { workspace = true, features = ["grpc-tonic","http-proto", "trace", "metrics", "logs"] }
 opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_experimental"] }
-wasi-graphics-context-wasmtime = { git = "https://github.com/wasi-gfx/wasi-gfx-runtime.git", rev = "24ac92e1a2fff283b2326a8607dd9b96c302237d", optional = true }
-wasi-webgpu-wasmtime = { git = "https://github.com/wasi-gfx/wasi-gfx-runtime.git", rev = "24ac92e1a2fff283b2326a8607dd9b96c302237d", optional = true }
 
 # OCI dependencies (optional, behind 'oci' feature)
 docker_credential = { workspace = true, optional = true }
-oci-client = { workspace = true, optional = true, features = ["rustls-tls", "rustls-tls-native-roots"] }
+oci-client = { workspace = true, optional = true, features = ["rustls-tls"] }
 oci-wasm = { workspace = true, optional = true, features = ["rustls-tls"] }
 sha2 = { workspace = true, optional = true }
 wit-component = { workspace = true, optional = true }
@@ -141,6 +137,13 @@ ulid = { optional = true, workspace = true, features = ["std"] }
 url = { workspace = true }
 webpki-roots = { workspace = true }
 
+# wasi-webgpu dependencies (optional, behind 'wasi-webgpu' feature). Pulled in
+# only on platforms where the `wasi_webgpu` plugin module compiles: wgpu-hal
+# fails to build on Windows and s390x, so the deps are gated to match the
+# `#[cfg]` on `plugin::wasi_webgpu`.
+[target.'cfg(all(not(target_os = "windows"), not(target_arch = "s390x")))'.dependencies]
+wasi-webgpu-wasmtime = { version = "0.2", optional = true }
+
 # Proto codegen only. Wasm fixtures are built by `cargo xtask
 # build-fixtures` (see /xtask), which owns wit-component and the WASI
 # adapter provider.
@@ -155,7 +158,10 @@ custom_plugin_kv = { path = "../custom_plugin_kv" }
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-reqwest = { workspace = true }
+# `stream` (bytes_stream / Body::wrap_stream) is used by the blobstore
+# integration tests; enable it explicitly rather than relying on another dep
+# transitively turning it on (oci-client 0.17 no longer does).
+reqwest = { workspace = true, features = ["stream"] }
 wat = { workspace = true, features = ["component-model"] }
 bytes = { workspace = true }
 http-body-util = { workspace = true }
@@ -164,6 +170,10 @@ wasmtime-wasi-http = { workspace = true, features = ["p2"] }
 gag = "1.0"
 rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "aws_lc_rs", "pem"] }
 testcontainers = { workspace = true }
+# redis client for the keyvalue redis interop test
+redis = { workspace = true }
+# postgres client for admin setup (create roles/tables) in tests
+tokio-postgres = { workspace = true, features = ["runtime"] }
 criterion = { version = "0.5", features = ["async_tokio", "html_reports"] }
 # Pinned to match the gungraun-runner version the bench host's Ansible
 # playbook installs (scripts/bench/ansible/provision.yml). gungraun
@@ -174,20 +184,16 @@ gungraun = "0.19.1"
 [[bench]]
 name = "http_invoke"
 harness = false
-required-features = ["wasip3"]
 
 [[bench]]
 name = "gungraun"
 harness = false
-required-features = ["wasip3"]
 
 [[bench]]
 name = "wasmtime_baseline"
 harness = false
-required-features = ["wasip3"]
 
 [[bench]]
 name = "wasmtime_serve"
 harness = false
-required-features = ["wasip3"]
 

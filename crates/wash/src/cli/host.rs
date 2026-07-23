@@ -2,13 +2,11 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Context as _;
 use clap::Args;
-use custom_plugin_blobstore::CustomBlobstore;
 use custom_plugin_cf_d1::CloudflareD1;
-use custom_plugin_kv::MultiBackendKeyValue;
 use custom_plugin_llm_gateway_provider::LlmGateway;
 use tracing::info;
 use wash_runtime::{
-    engine::Engine,
+    engine::{Engine, WasmProposal},
     observability::Meters,
     plugin::{self},
 };
@@ -91,7 +89,11 @@ pub struct HostCommand {
     pub tls_ca_path: Option<PathBuf>,
 
     /// Enable WASI WebGPU support
-    #[cfg(all(not(target_os = "windows"), not(target_arch = "s390x")))]
+    #[cfg(all(
+        not(target_os = "windows"),
+        not(target_arch = "s390x"),
+        feature = "wasi-webgpu"
+    ))]
     #[arg(long = "wasi-webgpu", default_value_t = false)]
     pub wasi_webgpu: bool,
 
@@ -116,10 +118,16 @@ pub struct HostCommand {
     #[arg(long = "wasi-otel", default_value_t = false)]
     pub wasi_otel: bool,
 
-    /// Enable WASIP3 support for components that target wasi@0.3 interfaces
-    #[cfg(feature = "wasip3")]
-    #[arg(long = "wasip3", env = "WASH_WASIP3", default_value_t = false)]
-    pub wasip3: bool,
+    /// Enable additional wasm proposals on the engine. Accepts a comma-separated
+    /// list and/or repeated flags, e.g. `--wasm-proposal gc,threads`. Accepted
+    /// names: component-model-async, gc, exception-handling, wide-arithmetic,
+    /// threads, tail-call.
+    #[arg(
+        long = "wasm-proposal",
+        env = "WASH_WASM_PROPOSALS",
+        value_delimiter = ','
+    )]
+    pub wasm_proposals: Vec<WasmProposal>,
 }
 
 impl CliCommand for HostCommand {
@@ -161,13 +169,11 @@ impl CliCommand for HostCommand {
             oci_cache_dir: self.oci_cache_dir.clone(),
         };
 
-        #[allow(unused_mut)]
         let mut engine_builder = Engine::builder()
             .with_pooling_allocator(true)
             .with_fuel_consumption(ctx.enable_meters());
-        #[cfg(feature = "wasip3")]
-        {
-            engine_builder = engine_builder.with_wasip3(self.wasip3);
+        for proposal in &self.wasm_proposals {
+            engine_builder = engine_builder.with_wasm_proposal(*proposal);
         }
         let engine = engine_builder.build()?;
 
@@ -187,16 +193,40 @@ impl CliCommand for HostCommand {
             )))?
             .with_meters(Meters::new(ctx.enable_meters()));
 
-        // Enable multi-backend KV plugin
-        cluster_host_builder =
-            cluster_host_builder.with_plugin(Arc::new(MultiBackendKeyValue::new()))?;
-        tracing::info!("Multi-backend KV plugin enabled");
-
-        // Enable multi-backend blobstore plugin
-        cluster_host_builder =
-            cluster_host_builder.with_plugin(Arc::new(CustomBlobstore::new()))?;
-        tracing::info!("Multi-backend blobstore plugin enabled");
-
+        #[cfg(feature = "wasm_component_model_implements")]
+        {
+            cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(
+                plugin::wasi_keyvalue::MultiplexedKeyValue::new()
+                    .with_provider(Arc::new(plugin::wasi_keyvalue::InMemoryProvider))
+                    .with_provider(Arc::new(plugin::wasi_keyvalue::RedisProvider))
+                    .with_provider(Arc::new(plugin::wasi_keyvalue::NatsProvider))
+                    .with_provider(Arc::new(plugin::wasi_keyvalue::FilesystemProvider)),
+            ))?;
+            cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(
+                plugin::wasmcloud_messaging::MultiplexedMessaging::new()
+                    .with_provider(Arc::new(plugin::wasmcloud_messaging::InMemoryMsgProvider))
+                    .with_provider(Arc::new(plugin::wasmcloud_messaging::NatsMsgProvider)),
+            ))?;
+            cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(
+                plugin::wasi_blobstore::MultiplexedBlobstore::new()
+                    .with_provider(Arc::new(plugin::wasi_blobstore::InMemoryProvider))
+                    .with_provider(Arc::new(plugin::wasi_blobstore::FilesystemProvider))
+                    .with_provider(Arc::new(plugin::wasi_blobstore::NatsBlobProvider)),
+            ))?;
+            cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(
+                plugin::wasi_blobstore::MultiplexedAsyncBlobstore::new()
+                    .with_provider(Arc::new(plugin::wasi_blobstore::InMemoryProvider))
+                    .with_provider(Arc::new(plugin::wasi_blobstore::FilesystemProvider))
+                    .with_provider(Arc::new(plugin::wasi_blobstore::NatsBlobProvider)),
+            ))?;
+            cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(
+                plugin::wasi_keyvalue::MultiplexedAsyncKeyValue::new()
+                    .with_provider(Arc::new(plugin::wasi_keyvalue::InMemoryProvider))
+                    .with_provider(Arc::new(plugin::wasi_keyvalue::RedisProvider))
+                    .with_provider(Arc::new(plugin::wasi_keyvalue::NatsProvider))
+                    .with_provider(Arc::new(plugin::wasi_keyvalue::FilesystemProvider)),
+            ))?;
+        }
         // Enable Cloudflare D1 plugin (always loaded by default)
         cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(CloudflareD1::new()))?;
         tracing::info!("Cloudflare D1 plugin enabled");
@@ -245,6 +275,15 @@ impl CliCommand for HostCommand {
                 plugin::wasmcloud_postgres::WasmcloudPostgres::new(postgres_url)
                     .context("failed to configure postgres plugin")?,
             ))?;
+        } else {
+            // register postgres for `(implements ..)` named imports (each
+            // carrying its own URL) are served.
+            #[cfg(feature = "wasm_component_model_implements")]
+            {
+                cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(
+                    plugin::wasmcloud_postgres::WasmcloudPostgres::multiplex_only(),
+                ))?;
+            }
         }
 
         if let Some(host_name) = &self.host_name {
@@ -278,7 +317,11 @@ impl CliCommand for HostCommand {
         }
 
         // Enable WASI WebGPU if requested
-        #[cfg(all(not(target_os = "windows"), not(target_arch = "s390x")))]
+        #[cfg(all(
+            not(target_os = "windows"),
+            not(target_arch = "s390x"),
+            feature = "wasi-webgpu"
+        ))]
         if self.wasi_webgpu {
             tracing::info!("WASI WebGPU support enabled");
             cluster_host_builder = cluster_host_builder

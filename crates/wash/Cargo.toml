@@ -12,9 +12,19 @@ rust-version.workspace = true
 version.workspace = true
 
 [features]
-default = ["wasip3"]
-wasip3 = ["wash-runtime/wasip3"]
+default = ["wasi-webgpu"]
 wasi-tls = ["wash-runtime/wasi-tls"]
+# Route component-model `(implements ..)` named imports to per-import backends.
+# When enabled, `wash host`/`wash dev` additionally register the multiplexed
+# keyvalue plugin (the unnamed/default import keeps its standalone backend, so
+# normal workloads are unaffected). Needs a wasmtime build with resource-implements.
+wasm_component_model_implements = ["wash-runtime/wasm_component_model_implements"]
+# Host component plugins: host capabilities provided by wasm components running
+# in their own supervised stores (wash-runtime's `plugin::component_host`).
+host-component-plugins = ["wash-runtime/host-component-plugins"]
+# On by default. Pulls in git-only wasi-gfx deps (no crates.io release);
+# disable with `--no-default-features` for a build without the git sources.
+wasi-webgpu = ["wash-runtime/wasi-webgpu"]
 
 [lints]
 workspace = true
@@ -58,13 +68,12 @@ tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true, features = ["attributes"] }
 url = { workspace = true }
 uuid = { workspace = true }
+wasi-preview1-component-adapter-provider = "46"
 wasm-metadata = { workspace = true }
 wasm-pkg-client = { workspace = true }
 wasm-pkg-core = { workspace = true }
-wash-runtime = { workspace = true, features = ["washlet", "oci", "wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "wasmcloud-postgres", "wasi-otel"] }
+wash-runtime = { workspace = true, features = ["washlet", "oci", "wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "wasmcloud-postgres", "wasi-otel", "wasm_component_model_implements"] }
 wit-component = { workspace = true }
-custom_plugin_kv = { path = "../custom_plugin_kv" }
-custom_plugin_blobstore = { path = "../custom_plugin_blobstore" }
 custom_plugin_cf_d1 = { path = "../custom_plugin_cf_d1" }
 custom_plugin_llm_gateway_provider = { path = "../custom_plugin_llm_gateway_provider" }
 custom_plugin_mail = { path = "../custom_plugin_mail" }
@@ -74,13 +83,6 @@ custom_plugin_feishu = { path = "../custom_plugin_feishu" }
 custom_plugin_codex = { path = "../custom_plugin_codex" }
 custom_plugin_wechat = { path = "../custom_plugin_wechat" }
 custom_plugin_telegram = { path = "../custom_plugin_telegram" }
-
-# Enable WebGPU support on non-Windows platforms.
-# WebGPU is disabled on Windows due to dependency version conflicts with the windows crate.
-# It is also disabled on s390x because naga pulls in `half` (f16) and the zigbuild LLVM
-# backend can't lower the f16 conversions for the s390x target (LLVM ERROR in __fixhfsi).
-[target.'cfg(all(not(target_os = "windows"), not(target_arch = "s390x")))'.dependencies]
-wash-runtime = { workspace = true, features = ["wasi-webgpu"] }
 
 # `O_NOFOLLOW` for the secret-file-open hardening in `crate::workload`.
 # Unix-only. Windows has no portable equivalent.
