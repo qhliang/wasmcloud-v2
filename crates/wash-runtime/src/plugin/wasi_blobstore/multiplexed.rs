@@ -554,14 +554,14 @@ impl<'a> bindings::wasi::blobstore::types::Host for ActiveCtx<'a> {}
 
 mod filesystem;
 mod in_memory;
-mod s3;
 mod nats;
+mod s3;
 
 pub use filesystem::{FilesystemBackend, FilesystemProvider};
-#[allow(unused_imports)]
-pub use s3::{OpenDalBlobBackend, OpenDalBlobProvider};
 pub use in_memory::{InMemoryBackend, InMemoryProvider};
 pub use nats::{NatsBlobBackend, NatsBlobProvider};
+#[allow(unused_imports)]
+pub use s3::{OpenDalBlobBackend, OpenDalBlobProvider};
 
 /// A blobstore backend provider: a [`BackendProvider`] producing [`BlobId`]s.
 pub type BlobProvider = dyn BackendProvider<BlobId>;

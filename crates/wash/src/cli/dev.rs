@@ -90,7 +90,6 @@ impl CliCommand for DevCommand {
 
         // Add blobstore plugin (multi-backend: memory, filesystem, S3, WebDAV, FTP, NATS)
 
-
         let http_handler = wash_runtime::host::http::DevRouter::default();
         // TODO(#19): Only spawn the server if the component exports wasi:http
         // Configure HTTP server with optional TLS, enable HTTP Server
@@ -167,6 +166,7 @@ impl CliCommand for DevCommand {
             ))?;
             debug!("wasmcloud:messaging plugin registered with in-memory backend");
         }
+        #[cfg(not(feature = "wasm_component_model_implements"))]
         // Standalone blobstore plugin — NATS when `dev.data_nats_url` is set,
         // otherwise the in-memory backend. Handles the default (unnamed)
         // `wasi:blobstore/blobstore` import.
@@ -181,6 +181,7 @@ impl CliCommand for DevCommand {
             debug!("WASI Blobstore plugin registered with in-memory backend");
         }
 
+        #[cfg(not(feature = "wasm_component_model_implements"))]
         // Standalone keyvalue plugin — NATS when `dev.data_nats_url` is set,
         // otherwise the in-memory backend. Handles the default (unnamed)
         // `wasi:keyvalue/store` import.
@@ -193,7 +194,6 @@ impl CliCommand for DevCommand {
                 .with_plugin(Arc::new(plugin::wasi_keyvalue::InMemoryKeyValue::default()))?;
             debug!("WASI KeyValue plugin registered with in-memory backend");
         }
-
 
         #[cfg(feature = "wasm_component_model_implements")]
         {
@@ -632,10 +632,11 @@ fn build_workload_host_interfaces(
             if interface.namespace == "wasi" && interface.package == "config" {
                 any_imports_wasi_config = true;
             }
-            if !base
-                .iter()
-                .any(|i| i.namespace == interface.namespace && i.package == interface.package)
-            {
+            if !base.iter().any(|i| {
+                i.namespace == interface.namespace
+                    && i.package == interface.package
+                    && i.name == interface.name
+            }) {
                 base.push(interface.clone());
             }
         }
@@ -1229,5 +1230,38 @@ mod tests {
             .filter(|i| i.namespace == "wasi" && i.package == "http")
             .count();
         assert_eq!(http_count, 1);
+    }
+
+    #[test]
+    fn named_and_unnamed_same_namespace_package_coexist() {
+        // A component imports wasi:keyvalue unnamed, and the user declared a
+        // named wasi:keyvalue entry in dev.host_interfaces. Both must appear.
+        let comp = HashSet::from([iface("wasi", "keyvalue")]);
+        let mut named_kv = WitInterface {
+            name: Some("my-kv".into()),
+            ..iface("wasi", "keyvalue")
+        };
+        named_kv
+            .config
+            .insert("backend".into(), "cloudflare".into());
+
+        let result = build_workload_host_interfaces(vec![named_kv], &[comp], &HashMap::new());
+
+        let kv_entries: Vec<_> = result
+            .iter()
+            .filter(|i| i.namespace == "wasi" && i.package == "keyvalue")
+            .collect();
+        assert_eq!(
+            kv_entries.len(),
+            2,
+            "expected both named and unnamed keyvalue entries to coexist"
+        );
+        let named = kv_entries
+            .iter()
+            .find(|i| i.name.as_deref() == Some("my-kv"))
+            .unwrap();
+        assert_eq!(named.config.get("backend").unwrap(), "cloudflare");
+        let unnamed = kv_entries.iter().find(|i| i.name.is_none()).unwrap();
+        assert!(unnamed.config.get("backend").is_none());
     }
 }

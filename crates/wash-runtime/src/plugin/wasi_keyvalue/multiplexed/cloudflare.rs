@@ -3,9 +3,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use base64::Engine;
-use crate::plugin::multiplex::BackendProvider;
 use super::{KeyResponse, KvBackend, KvId, StoreError};
+use crate::plugin::multiplex::BackendProvider;
+use base64::Engine;
 
 /// A Cloudflare Workers KV [`KvBackend`]. Each namespace maps to a Cloudflare
 /// KV namespace; values are stored as UTF-8 strings, with binary values
@@ -31,13 +31,20 @@ impl CloudflareKvBackend {
         )
     }
 
-    async fn request(&self, method: reqwest::Method, url: &str, body: Option<String>) -> Result<reqwest::Response, StoreError> {
+    async fn request(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        body: Option<String>,
+    ) -> Result<reqwest::Response, StoreError> {
         let mut req = self
             .client
             .request(method, url)
             .header("Authorization", format!("Bearer {}", self.api_token));
         if let Some(b) = body {
-            req = req.header("Content-Type", "application/octet-stream").body(b);
+            req = req
+                .header("Content-Type", "application/octet-stream")
+                .body(b);
         }
         req.send().await.map_err(Self::err)
     }
@@ -152,7 +159,7 @@ impl KvBackend for CloudflareKvBackend {
             Some(_) => 0,
             None => 0,
         };
-        let new = value.wrapping_add(delta).min(i64::MAX);
+        let new = value.saturating_add(delta);
         self.set(bucket, key, new.to_le_bytes().to_vec()).await?;
         Ok(new)
     }
@@ -201,15 +208,15 @@ impl BackendProvider<KvId> for CloudflareKvProvider {
     }
 
     async fn instantiate(&self, config: &HashMap<String, String>) -> anyhow::Result<KvId> {
-        let account_id = config
-            .get("account_id")
-            .ok_or_else(|| anyhow::anyhow!("cloudflare keyvalue backend requires 'account_id' config"))?;
-        let api_token = config
-            .get("api_token")
-            .ok_or_else(|| anyhow::anyhow!("cloudflare keyvalue backend requires 'api_token' config"))?;
-        let namespace_id = config
-            .get("namespace_id")
-            .ok_or_else(|| anyhow::anyhow!("cloudflare keyvalue backend requires 'namespace_id' config"))?;
+        let account_id = config.get("account_id").ok_or_else(|| {
+            anyhow::anyhow!("cloudflare keyvalue backend requires 'account_id' config")
+        })?;
+        let api_token = config.get("api_token").ok_or_else(|| {
+            anyhow::anyhow!("cloudflare keyvalue backend requires 'api_token' config")
+        })?;
+        let namespace_id = config.get("namespace_id").ok_or_else(|| {
+            anyhow::anyhow!("cloudflare keyvalue backend requires 'namespace_id' config")
+        })?;
 
         Ok(Arc::new(CloudflareKvBackend {
             client: reqwest::Client::new(),

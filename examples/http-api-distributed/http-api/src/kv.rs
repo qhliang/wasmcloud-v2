@@ -1,5 +1,5 @@
 use crate::LOG_CTX;
-use crate::bindings::wasi::keyvalue::store;
+use crate::bindings::kv;
 use crate::bindings::wasi::logging::logging::{Level, log};
 use crate::helpers;
 use crate::templates;
@@ -13,8 +13,8 @@ pub async fn home(_req: Request<Body>) -> anyhow::Result<Response<Body>> {
     helpers::html_response(templates::render(KV_HTML))
 }
 
-fn get_bucket() -> Result<store::Bucket, String> {
-    store::open(DEFAULT_BUCKET).map_err(|e| {
+fn get_bucket() -> Result<kv::Bucket, String> {
+    kv::open(DEFAULT_BUCKET).map_err(|e| {
         let err_msg = format!("Failed to open bucket: {:?}", e);
         log(Level::Error, LOG_CTX, &err_msg);
         err_msg

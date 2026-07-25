@@ -11,10 +11,10 @@ mod redis;
 pub use filesystem::FilesystemKeyValue;
 pub use in_memory::InMemoryKeyValue;
 #[cfg(feature = "wasm_component_model_implements")]
-pub use multiplexed::{CloudflareKvBackend, CloudflareKvProvider, 
-    FilesystemBackend, FilesystemProvider, InMemoryBackend, InMemoryProvider, KeyResponse,
-    KvBackend, KvId, KvProvider, MultiplexedKeyValue, NatsBackend, NatsProvider, RedisBackend,
-    RedisProvider, StoreError,
+pub use multiplexed::{
+    CloudflareKvBackend, CloudflareKvProvider, FilesystemBackend, FilesystemProvider,
+    InMemoryBackend, InMemoryProvider, KeyResponse, KvBackend, KvId, KvProvider,
+    MultiplexedKeyValue, NatsBackend, NatsProvider, RedisBackend, RedisProvider, StoreError,
 };
 #[cfg(feature = "wasm_component_model_implements")]
 pub use multiplexed_async::MultiplexedAsyncKeyValue;

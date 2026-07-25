@@ -1,5 +1,5 @@
 use crate::LOG_CTX;
-use crate::bindings::wasi::blobstore::blobstore;
+use crate::bindings::r2;
 use crate::bindings::wasi::blobstore::types::{IncomingValue, OutgoingValue};
 use crate::bindings::wasi::logging::logging::{Level, log};
 use crate::helpers;
@@ -14,8 +14,8 @@ pub async fn home(_req: Request<Body>) -> anyhow::Result<Response<Body>> {
 pub async fn containers(_req: Request<Body>) -> anyhow::Result<Response<Body>> {
     log(Level::Debug, LOG_CTX, "R2: listing containers");
     let containers = vec!["wasmcloud-v2".to_string()];
-    if !blobstore::container_exists("wasmcloud-v2").unwrap_or(false) {
-        let _ = blobstore::create_container("wasmcloud-v2");
+    if !r2::container_exists("wasmcloud-v2").unwrap_or(false) {
+        let _ = r2::create_container("wasmcloud-v2");
     }
     let json = serde_json::to_string(&containers)?;
     helpers::json_response(json)
@@ -30,7 +30,7 @@ pub async fn container_create(req: Request<Body>) -> anyhow::Result<Response<Bod
         LOG_CTX,
         &format!("R2 CREATE CONTAINER: {}", name),
     );
-    blobstore::create_container(name)
+    r2::create_container(name)
         .map_err(|e| anyhow::anyhow!("Failed to create container: {:?}", e))?;
     helpers::text_response(StatusCode::OK, "OK")
 }
@@ -44,7 +44,7 @@ pub async fn container_delete(req: Request<Body>) -> anyhow::Result<Response<Bod
         LOG_CTX,
         &format!("R2 DELETE CONTAINER: {}", name),
     );
-    blobstore::delete_container(name)
+    r2::delete_container(name)
         .map_err(|e| anyhow::anyhow!("Failed to delete container: {:?}", e))?;
     helpers::text_response(StatusCode::OK, "OK")
 }
@@ -58,7 +58,7 @@ pub async fn objects(req: Request<Body>) -> anyhow::Result<Response<Body>> {
         LOG_CTX,
         &format!("R2 LIST OBJECTS: container={}", container_name),
     );
-    let container = blobstore::get_container(container_name)
+    let container = r2::get_container(container_name)
         .map_err(|e| anyhow::anyhow!("Failed to get container: {:?}", e))?;
     let stream = container
         .list_objects()
@@ -90,7 +90,7 @@ pub async fn object_get(req: Request<Body>) -> anyhow::Result<Response<Body>> {
             container_name, object_name
         ),
     );
-    let container = blobstore::get_container(container_name)
+    let container = r2::get_container(container_name)
         .map_err(|e| anyhow::anyhow!("Failed to get container: {:?}", e))?;
     let incoming_value = container
         .get_data(object_name, 0, u64::MAX)
@@ -129,7 +129,7 @@ pub async fn object_put(mut req: Request<Body>) -> anyhow::Result<Response<Body>
             put_req.data.len()
         ),
     );
-    let container = blobstore::get_container(&put_req.container)
+    let container = r2::get_container(&put_req.container)
         .map_err(|e| anyhow::anyhow!("Failed to get container: {:?}", e))?;
     let outgoing_value = OutgoingValue::new_outgoing_value();
     let stream = outgoing_value
@@ -184,7 +184,7 @@ pub async fn object_delete(req: Request<Body>) -> anyhow::Result<Response<Body>>
             container_name, object_name
         ),
     );
-    let container = blobstore::get_container(container_name)
+    let container = r2::get_container(container_name)
         .map_err(|e| anyhow::anyhow!("Failed to get container: {:?}", e))?;
     container
         .delete_object(object_name)

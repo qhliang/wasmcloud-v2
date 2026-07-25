@@ -24,8 +24,8 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
 use std::path::Path;
+use std::path::PathBuf;
 
 use crate::engine::workload::WorkloadItem;
 use crate::{
@@ -381,7 +381,6 @@ impl<T, Y> WorkloadTracker<T, Y> {
         item.components.get_mut(component_id)
     }
 }
-
 
 /// Locks an untrusted path to be within the given root directory.
 pub(crate) fn lock_root(root: impl AsRef<Path>, untrusted: &str) -> Result<PathBuf, &'static str> {

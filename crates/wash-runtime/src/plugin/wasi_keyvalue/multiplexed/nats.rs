@@ -325,7 +325,10 @@ pub struct NatsProvider;
 #[async_trait::async_trait]
 impl BackendProvider<KvId> for NatsProvider {
     fn pool_key(&self, config: &HashMap<String, String>) -> Option<String> {
-        config.get("url").or_else(|| config.get("nats_url")).cloned()
+        config
+            .get("url")
+            .or_else(|| config.get("nats_url"))
+            .cloned()
     }
     fn backend_type(&self) -> &'static str {
         "nats"
@@ -336,7 +339,9 @@ impl BackendProvider<KvId> for NatsProvider {
         let url = config
             .get("url")
             .or_else(|| config.get("nats_url"))
-            .ok_or_else(|| anyhow::anyhow!("nats keyvalue backend requires 'url' or 'nats_url' config"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("nats keyvalue backend requires 'url' or 'nats_url' config")
+            })?;
 
         let mut opts = async_nats::ConnectOptions::new();
 
@@ -364,8 +369,7 @@ impl BackendProvider<KvId> for NatsProvider {
         if let Some(ca_path) = config.get("nats_tls_ca") {
             opts = opts.add_root_certificates(ca_path.into());
         }
-        if let (Some(cert), Some(key)) = (config.get("nats_tls_cert"), config.get("nats_tls_key"))
-        {
+        if let (Some(cert), Some(key)) = (config.get("nats_tls_cert"), config.get("nats_tls_key")) {
             opts = opts.add_client_certificate(cert.into(), key.into());
         }
 
