@@ -111,7 +111,11 @@ impl KvBackend for CloudflareKvBackend {
                 let body: serde_json::Value =
                     serde_json::from_slice(&resp.bytes().await.map_err(Self::err)?)
                         .map_err(Self::err)?;
-                let results = body.get("result").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                let results = body
+                    .get("result")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
                 Ok(results > 0)
             }
             Ok(_) => Ok(false),
@@ -130,7 +134,8 @@ impl KvBackend for CloudflareKvBackend {
                 let body: serde_json::Value =
                     serde_json::from_slice(&resp.bytes().await.map_err(Self::err)?)
                         .map_err(Self::err)?;
-                let keys: Vec<String> = body.get("result")
+                let keys: Vec<String> = body
+                    .get("result")
                     .and_then(|v| v.as_array())
                     .unwrap_or(&vec![])
                     .iter()
