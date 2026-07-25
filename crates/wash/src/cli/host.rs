@@ -191,6 +191,16 @@ impl CliCommand for HostCommand {
             .with_plugin(Arc::new(plugin::wasmcloud_messaging::NatsMessaging::new(
                 data_nats_client.clone(),
             )))?
+            // Standalone keyvalue plugin — NATS backend for the default (unnamed)
+            // `wasi:keyvalue/store` import.
+            .with_plugin(Arc::new(plugin::wasi_keyvalue::NatsKeyValue::new(
+                &data_nats_client,
+            )))?
+            // Standalone blobstore plugin — NATS backend for the default (unnamed)
+            // `wasi:blobstore/blobstore` import.
+            .with_plugin(Arc::new(plugin::wasi_blobstore::NatsBlobstore::new(
+                &data_nats_client,
+            )))?
             .with_meters(Meters::new(ctx.enable_meters()));
 
         #[cfg(feature = "wasm_component_model_implements")]

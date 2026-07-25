@@ -3,13 +3,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use base64::Engine as _;
+use base64::Engine;
 use crate::plugin::multiplex::BackendProvider;
 use super::{KeyResponse, KvBackend, KvId, StoreError};
 
 /// A Cloudflare Workers KV [`KvBackend`]. Each namespace maps to a Cloudflare
 /// KV namespace; values are stored as UTF-8 strings, with binary values
 /// transparently base64-encoded.
+#[allow(dead_code)]
 pub struct CloudflareKvBackend {
     client: reqwest::Client,
     account_id: String,
@@ -17,6 +18,7 @@ pub struct CloudflareKvBackend {
     api_token: String,
 }
 
+#[allow(dead_code)]
 impl CloudflareKvBackend {
     fn err(e: impl std::fmt::Display) -> StoreError {
         StoreError::Other(format!("Cloudflare KV error: {e}"))
@@ -188,6 +190,7 @@ impl KvBackend for CloudflareKvBackend {
 }
 
 /// Provider for [`CloudflareKvBackend`], selected by `config.backend = "cloudflare"`.
+#[allow(dead_code)]
 #[derive(Default)]
 pub struct CloudflareKvProvider;
 

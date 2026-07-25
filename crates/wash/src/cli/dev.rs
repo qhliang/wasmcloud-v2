@@ -167,6 +167,33 @@ impl CliCommand for DevCommand {
             ))?;
             debug!("wasmcloud:messaging plugin registered with in-memory backend");
         }
+        // Standalone blobstore plugin — NATS when `dev.data_nats_url` is set,
+        // otherwise the in-memory backend. Handles the default (unnamed)
+        // `wasi:blobstore/blobstore` import.
+        if let Some(client) = &data_nats_client {
+            host_builder = host_builder
+                .with_plugin(Arc::new(plugin::wasi_blobstore::NatsBlobstore::new(client)))?;
+            debug!("WASI Blobstore plugin registered with NATS backend (data_nats_url)");
+        } else {
+            host_builder = host_builder.with_plugin(Arc::new(
+                plugin::wasi_blobstore::InMemoryBlobstore::default(),
+            ))?;
+            debug!("WASI Blobstore plugin registered with in-memory backend");
+        }
+
+        // Standalone keyvalue plugin — NATS when `dev.data_nats_url` is set,
+        // otherwise the in-memory backend. Handles the default (unnamed)
+        // `wasi:keyvalue/store` import.
+        if let Some(client) = &data_nats_client {
+            host_builder = host_builder
+                .with_plugin(Arc::new(plugin::wasi_keyvalue::NatsKeyValue::new(client)))?;
+            debug!("WASI KeyValue plugin registered with NATS backend (data_nats_url)");
+        } else {
+            host_builder = host_builder
+                .with_plugin(Arc::new(plugin::wasi_keyvalue::InMemoryKeyValue::default()))?;
+            debug!("WASI KeyValue plugin registered with in-memory backend");
+        }
+
 
         #[cfg(feature = "wasm_component_model_implements")]
         {

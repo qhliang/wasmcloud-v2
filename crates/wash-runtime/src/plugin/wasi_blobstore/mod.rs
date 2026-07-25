@@ -9,7 +9,7 @@ mod nats;
 pub use filesystem::FilesystemBlobstore;
 pub use in_memory::InMemoryBlobstore;
 #[cfg(feature = "wasm_component_model_implements")]
-pub use multiplexed::{
+pub use multiplexed::{OpenDalBlobBackend, OpenDalBlobProvider, 
     BlobBackend, BlobBackendError, BlobId, BlobProvider, FilesystemBackend, FilesystemProvider,
     InMemoryBackend, InMemoryProvider, MultiplexedBlobstore, NatsBlobBackend, NatsBlobProvider,
 };
