@@ -110,8 +110,8 @@ impl KvBackend for CloudflareKvBackend {
             Ok(resp) if resp.status().is_success() => {
                 let body: serde_json::Value =
                     serde_json::from_slice(&resp.bytes().await.map_err(Self::err)?)
-                        .map_err(|e| Self::err(e))?;
-                let results = body["result"].as_array().map(|a| a.len()).unwrap_or(0);
+                        .map_err(Self::err)?;
+                let results = body.get("result").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
                 Ok(results > 0)
             }
             Ok(_) => Ok(false),
@@ -129,12 +129,12 @@ impl KvBackend for CloudflareKvBackend {
             Ok(resp) if resp.status().is_success() => {
                 let body: serde_json::Value =
                     serde_json::from_slice(&resp.bytes().await.map_err(Self::err)?)
-                        .map_err(|e| Self::err(e))?;
-                let keys: Vec<String> = body["result"]
-                    .as_array()
+                        .map_err(Self::err)?;
+                let keys: Vec<String> = body.get("result")
+                    .and_then(|v| v.as_array())
                     .unwrap_or(&vec![])
                     .iter()
-                    .filter_map(|v| v["name"].as_str().map(String::from))
+                    .filter_map(|v| v.get("name").and_then(|n| n.as_str()).map(String::from))
                     .collect();
                 Ok(KeyResponse {
                     keys,
