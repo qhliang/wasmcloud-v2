@@ -272,6 +272,13 @@ jobs:
           cache-from: |
             type=gha,scope=wash-release-arm64-${{ github.head_ref || github.ref_name }}
             type=gha,scope=wash-release-arm64-main
+      - name: Login to Aliyun ACR
+        if: github.event_name != 'pull_request'
+        uses: aliyun/acr-login@v1
+        with:
+          login-server: https://registry.cn-hangzhou.aliyuncs.com
+          username: "${{ secrets.ALIYUN_ACR_USERNAME }}"
+          password: "${{ secrets.ALIYUN_ACR_PASSWORD }}"
       - name: Copy wash image to Aliyun ACR
         if: github.event_name != 'pull_request'
         env:
@@ -301,13 +308,6 @@ jobs:
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
-      - name: Login to Aliyun ACR
-        if: github.event_name != 'pull_request'
-        uses: aliyun/acr-login@v1
-        with:
-          login-server: https://registry.cn-hangzhou.aliyuncs.com
-          username: "${{ secrets.ALIYUN_ACR_USERNAME }}"
-          password: "${{ secrets.ALIYUN_ACR_PASSWORD }}"
       - name: Upload release image tarball
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -575,20 +575,6 @@ jobs:
           # Operator and wash images are already built above; the suite
           # just needs to load them into kind.
           SKIP_IMAGE_BUILD: "true"
-          BUILD_RUNTIME_IMAGE: "true"
-          SKIP_RUNTIME_BUILD: "true"
-          # Both legs run the in-cluster registry. The default (fixture) hostgroup
-          # runs default_tag; the registry hostgroup runs registry_tag (always
-          # all-features). implements self-skips when they differ (release leg).
-          E2E_IN_CLUSTER_REGISTRY: "true"
-          E2E_RUNTIME_IMAGE_TAG: ${{ matrix.default_tag }}
-          E2E_REGISTRY_HOST_IMAGE_TAG: ${{ matrix.registry_tag }}
-          # Reuse the components + wash the e2e-fixtures job built (downloaded
-          # above): `make e2e-images` pushes them rather than rebuilding.
-          E2E_IMAGES_MODE: push
-          E2E_FIXTURES_DIR: ${{ runner.temp }}/e2e-fixtures
-          PROMETHEUS_INSTALL_SKIP: "true"
-          CERT_MANAGER_INSTALL_SKIP: "true"
           KIND_CLUSTER_NAME: wasmcloud-e2e
       - name: Dump diagnostics
         if: failure()
