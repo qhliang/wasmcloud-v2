@@ -233,9 +233,9 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Login to Aliyun ACR
         if: github.event_name != 'pull_request'
-        uses: aliyun/acr-login@v1
+        uses: aliyun/acr-login@v2.0.3
         with:
-          login-server: https://registry.cn-hangzhou.aliyuncs.com
+          login-server: registry.cn-hangzhou.aliyuncs.com
           username: "${{ secrets.ALIYUN_ACR_USERNAME }}"
           password: "${{ secrets.ALIYUN_ACR_PASSWORD }}"
       - name: Set up Docker Buildx
@@ -375,9 +375,9 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Login to Aliyun ACR
-        uses: aliyun/acr-login@v1
+        uses: aliyun/acr-login@v2.0.3
         with:
-          login-server: https://registry.cn-hangzhou.aliyuncs.com
+          login-server: registry.cn-hangzhou.aliyuncs.com
           username: "${{ secrets.ALIYUN_ACR_USERNAME }}"
           password: "${{ secrets.ALIYUN_ACR_PASSWORD }}"
       - name: Set up Docker Buildx
@@ -680,9 +680,9 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Login to Aliyun ACR
-        uses: aliyun/acr-login@v1
+        uses: aliyun/acr-login@v2.0.3
         with:
-          login-server: https://registry.cn-hangzhou.aliyuncs.com
+          login-server: registry.cn-hangzhou.aliyuncs.com
           username: "${{ secrets.ALIYUN_ACR_USERNAME }}"
           password: "${{ secrets.ALIYUN_ACR_PASSWORD }}"
       - name: Set up Docker Buildx
