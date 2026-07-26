@@ -1125,9 +1125,8 @@ mod tests {
             duplicate.workload_status.workload_state,
             WorkloadState::Error
         );
-        assert_eq!(
-            duplicate.workload_status.message,
-            "Workload ID already exists"
+        assert!(
+            duplicate.workload_status.message.starts_with("Workload ID [duplicate] already exists")
         );
 
         let workloads = host.workloads.read().await;
