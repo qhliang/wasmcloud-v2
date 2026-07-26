@@ -279,15 +279,15 @@ jobs:
           cache-from: |
             type=gha,scope=wash-release-arm64-${{ github.head_ref || github.ref_name }}
             type=gha,scope=wash-release-arm64-main
-      - name: Push wash runtime image to Aliyun ACR by digest
+      - name: Copy wash image to Aliyun ACR
         if: github.event_name != 'pull_request'
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
-        with:
-          context: .
-          outputs: type=image,name=registry.cn-hangzhou.aliyuncs.com/big_bumblebee/wash,push-by-digest=true,name-canonical=true,push=true
-          cache-from: |
-            type=gha,scope=wash-release-arm64-${{ github.head_ref || github.ref_name }}
-            type=gha,scope=wash-release-arm64-main
+        env:
+          DIGEST: ${{ steps.build_push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          SRC="ghcr.io/${{ github.repository_owner }}/wash@${DIGEST}"
+          DST="registry.cn-hangzhou.aliyuncs.com/big_bumblebee/wash:${DIGEST#sha256:}"
+          docker buildx imagetools create -t "${DST}" "${SRC}"
       - name: Export digest
         if: github.event_name != 'pull_request'
         env:
@@ -404,15 +404,14 @@ jobs:
             type=gha,scope=wash-release-amd64-${{ github.head_ref || github.ref_name }}
             type=gha,scope=wash-release-amd64-main
           cache-to: type=gha,scope=wash-release-amd64-${{ github.head_ref || github.ref_name }},mode=max
-      - name: Push wash runtime image to Aliyun ACR by digest
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
-        with:
-          context: .
-          outputs: type=image,name=registry.cn-hangzhou.aliyuncs.com/big_bumblebee/wash,push-by-digest=true,name-canonical=true,push=true
-          cache-from: |
-            type=gha,scope=wash-release-amd64-${{ github.head_ref || github.ref_name }}
-            type=gha,scope=wash-release-amd64-main
-          cache-to: type=gha,scope=wash-release-amd64-${{ github.head_ref || github.ref_name }},mode=max
+      - name: Copy wash image to Aliyun ACR
+        env:
+          DIGEST: ${{ steps.build_push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          SRC="ghcr.io/${{ github.repository_owner }}/wash@${DIGEST}"
+          DST="registry.cn-hangzhou.aliyuncs.com/big_bumblebee/wash:${DIGEST#sha256:}"
+          docker buildx imagetools create -t "${DST}" "${SRC}"
       - name: Export digest
         env:
           DIGEST: ${{ steps.build_push.outputs.digest }}
