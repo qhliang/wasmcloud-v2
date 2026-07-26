@@ -233,11 +233,11 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Login to Aliyun ACR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
-        with:
-          registry: registry.cn-hangzhou.aliyuncs.com
-          username: ${{ secrets.ALIYUN_ACR_USERNAME }}
-          password: ${{ secrets.ALIYUN_ACR_PASSWORD }}
+        env:
+          ACR_USER: ${{ secrets.ALIYUN_ACR_USERNAME }}
+          ACR_PASS: ${{ secrets.ALIYUN_ACR_PASSWORD }}
+        run: |
+          echo "${ACR_PASS}" | docker login registry.cn-hangzhou.aliyuncs.com -u "${ACR_USER}" --password-stdin
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
       # Split into two single-output builds: dual `type=image`+`type=docker`
@@ -375,11 +375,11 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Login to Aliyun ACR
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
-        with:
-          registry: registry.cn-hangzhou.aliyuncs.com
-          username: ${{ secrets.ALIYUN_ACR_USERNAME }}
-          password: ${{ secrets.ALIYUN_ACR_PASSWORD }}
+        env:
+          ACR_USER: ${{ secrets.ALIYUN_ACR_USERNAME }}
+          ACR_PASS: ${{ secrets.ALIYUN_ACR_PASSWORD }}
+        run: |
+          echo "${ACR_PASS}" | docker login registry.cn-hangzhou.aliyuncs.com -u "${ACR_USER}" --password-stdin
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
       # Single build+push: no tarball is exported on amd64 (nothing loads it),
@@ -680,11 +680,11 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Login to Aliyun ACR
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
-        with:
-          registry: registry.cn-hangzhou.aliyuncs.com
-          username: ${{ secrets.ALIYUN_ACR_USERNAME }}
-          password: ${{ secrets.ALIYUN_ACR_PASSWORD }}
+        env:
+          ACR_USER: ${{ secrets.ALIYUN_ACR_USERNAME }}
+          ACR_PASS: ${{ secrets.ALIYUN_ACR_PASSWORD }}
+        run: |
+          echo "${ACR_PASS}" | docker login registry.cn-hangzhou.aliyuncs.com -u "${ACR_USER}" --password-stdin
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
       - name: Docker meta
