@@ -466,6 +466,11 @@ pub struct DevConfig {
     /// exception-handling, wide-arithmetic, threads, tail-call.
     #[serde(default)]
     pub wasm_proposals: Vec<String>,
+
+    /// Allow outbound HTTP(S) requests to skip TLS certificate verification.
+    /// When true, self-signed or otherwise invalid certificates are accepted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_outbound_http_insecure: Option<bool>,
 }
 
 impl DevConfig {

@@ -833,6 +833,9 @@ impl std::fmt::Debug for Host {
 #[derive(Clone, Debug)]
 pub struct HostConfig {
     pub allow_oci_insecure: bool,
+    /// Allow outbound HTTP(S) requests to skip TLS certificate verification.
+    /// When true, self-signed or otherwise invalid certificates are accepted.
+    pub allow_outbound_http_insecure: bool,
     pub oci_pull_timeout: Option<Duration>,
     pub oci_cache_dir: Option<PathBuf>,
 }
@@ -841,6 +844,7 @@ impl Default for HostConfig {
     fn default() -> Self {
         Self {
             allow_oci_insecure: false,
+            allow_outbound_http_insecure: false,
             oci_pull_timeout: Duration::from_secs(30).into(),
             oci_cache_dir: None,
         }

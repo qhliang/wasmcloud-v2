@@ -59,7 +59,12 @@ use wasmtime_wasi_http::{
 };
 
 use rustls::ServerConfig;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+use rustls::{
+    DigitallySignedStruct, Error as RustlsError, SignatureScheme,
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    crypto::aws_lc_rs::default_provider,
+    pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime, pem::PemObject},
+};
 use tokio::sync::{RwLock, mpsc};
 use tokio_rustls::TlsAcceptor;
 
@@ -336,10 +341,62 @@ pub trait OutgoingHandler: Send + Sync + 'static {
     ) -> crate::host::http_p3::P3SendFuture;
 }
 
+/// A TLS certificate verifier that accepts any certificate, including self-signed ones.
+#[derive(Debug)]
+#[allow(dead_code)]
+struct NoCertificateVerification;
+
+impl ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 /// Default [`OutgoingHandler`] — defers to `wasmtime_wasi_http::p2::default_send_request` (P2)
 /// and `wasmtime_wasi_http::p3::default_send_request` (P3).
 #[derive(Default)]
-pub struct DefaultOutgoingHandler;
+pub struct DefaultOutgoingHandler {
+    allow_insecure: bool,
+}
+
+impl DefaultOutgoingHandler {
+    /// Enable or disable skipping TLS certificate verification for outbound requests.
+    pub fn with_allow_insecure(mut self, allow: bool) -> Self {
+        self.allow_insecure = allow;
+        self
+    }
+}
 
 impl OutgoingHandler for DefaultOutgoingHandler {
     fn send_request(
@@ -752,10 +809,17 @@ impl<T: Router> HttpServerBuilder<T, DefaultOutgoingHandler> {
     fn new(router: T, addr: SocketAddr) -> Self {
         Self {
             router,
-            outgoing_handler: DefaultOutgoingHandler,
+            outgoing_handler: DefaultOutgoingHandler::default(),
             addr,
             tls: None,
         }
+    }
+
+    /// Skip TLS certificate verification for outbound HTTP(S) requests.
+    /// When true, self-signed and otherwise invalid certificates are accepted.
+    pub fn allow_outbound_http_insecure(mut self, allow: bool) -> Self {
+        self.outgoing_handler = self.outgoing_handler.with_allow_insecure(allow);
+        self
     }
 }
 
@@ -1851,6 +1915,120 @@ async fn send_grpc_request_handler(
 
     // Strip scheme/authority from URI for the actual HTTP/2 request
     // The URI was already validated, so rebuilding with just path+query is safe
+    if let Ok(uri) = hyper::Uri::builder()
+        .path_and_query(
+            request
+                .uri()
+                .path_and_query()
+                .map(|p| p.as_str())
+                .unwrap_or("/"),
+        )
+        .build()
+    {
+        *request.uri_mut() = uri;
+    }
+
+    let resp = timeout(first_byte_timeout, sender.send_request(request))
+        .await
+        .map_err(|_| ErrorCode::ConnectionReadTimeout)?
+        .map_err(hyper_request_error)?
+        .map(|body| body.map_err(hyper_request_error).boxed_unsync());
+
+    Ok(IncomingResponse {
+        resp,
+        worker: Some(worker),
+        between_bytes_timeout,
+    })
+}
+
+/// Async handler that sends an outbound HTTP request with TLS certificate
+/// verification disabled — accepts self-signed and otherwise invalid certs.
+/// Mirrors `wasmtime_wasi_http::p2::default_send_request_handler` but uses
+/// a `NoCertificateVerification` verifier for the TLS connection.
+#[allow(dead_code)]
+async fn send_request_insecure(
+    mut request: hyper::Request<HyperOutgoingBody>,
+    OutgoingRequestConfig {
+        use_tls: _use_tls,
+        connect_timeout,
+        first_byte_timeout,
+        between_bytes_timeout,
+    }: OutgoingRequestConfig,
+) -> Result<IncomingResponse, wasmtime_wasi_http::p2::bindings::http::types::ErrorCode> {
+    use http_body_util::BodyExt;
+    use rustls::pki_types::ServerName;
+    use tokio::net::TcpStream;
+    use tokio::time::timeout;
+    use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
+    use wasmtime_wasi_http::p2::hyper_request_error;
+
+    if !request.headers().contains_key(hyper::header::HOST)
+        && let Some(authority) = request.uri().authority()
+        && let Ok(value) = hyper::header::HeaderValue::from_str(authority.as_str())
+    {
+        request.headers_mut().insert(hyper::header::HOST, value);
+    }
+
+    let authority = if let Some(authority) = request.uri().authority() {
+        if authority.port().is_some() {
+            authority.to_string()
+        } else {
+            // Always use TLS (443) — the caller ensures this is only invoked
+            // for HTTPS requests.
+            format!("{authority}:443")
+        }
+    } else {
+        return Err(ErrorCode::HttpRequestUriInvalid);
+    };
+
+    let tcp_stream = timeout(connect_timeout, TcpStream::connect(&authority))
+        .await
+        .map_err(|_| ErrorCode::ConnectionTimeout)?
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::AddrNotAvailable => ErrorCode::ConnectionRefused,
+            _ => ErrorCode::ConnectionRefused,
+        })?;
+
+    // Build TLS config that accepts any certificate (including self-signed)
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(NoCertificateVerification))
+        .with_no_client_auth();
+
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+    let mut parts = authority.split(':');
+    let host = parts.next().unwrap_or(&authority);
+    if host.is_empty() {
+        return Err(ErrorCode::HttpRequestUriInvalid);
+    }
+    let domain = ServerName::try_from(host)
+        .map_err(|e| {
+            tracing::warn!("invalid server name '{host}': {e:?}");
+            ErrorCode::HttpRequestUriInvalid
+        })?
+        .to_owned();
+    let stream = connector.connect(domain, tcp_stream).await.map_err(|e| {
+        tracing::warn!("tls protocol error: {e:?}");
+        ErrorCode::TlsProtocolError
+    })?;
+    let stream = TokioIo::new(stream);
+
+    let (mut sender, conn) = timeout(
+        connect_timeout,
+        hyper::client::conn::http1::handshake(stream),
+    )
+    .await
+    .map_err(|_| ErrorCode::ConnectionTimeout)?
+    .map_err(hyper_request_error)?;
+
+    let worker = wasmtime_wasi::runtime::spawn(async move {
+        match conn.await {
+            Ok(()) => {}
+            Err(e) => tracing::warn!("dropping error {e}"),
+        }
+    });
+
+    // Strip scheme/authority from URI — the HTTP/1.1 request only needs path+query
     if let Ok(uri) = hyper::Uri::builder()
         .path_and_query(
             request

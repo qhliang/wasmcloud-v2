@@ -93,6 +93,7 @@ impl CliCommand for DevCommand {
         let http_handler = wash_runtime::host::http::DevRouter::default();
         // TODO(#19): Only spawn the server if the component exports wasi:http
         // Configure HTTP server with optional TLS, enable HTTP Server
+        let allow_insecure = dev_config.allow_outbound_http_insecure.unwrap_or(false);
         let protocol = if let (Some(cert_path), Some(key_path)) =
             (&dev_config.tls_cert_path, &dev_config.tls_key_path)
         {
@@ -119,12 +120,12 @@ impl CliCommand for DevCommand {
             if let Some(ca) = dev_config.tls_ca_path.as_deref() {
                 tls = tls.with_ca(ca);
             }
-            let http_server = wash_runtime::host::http::HttpServer::new_with_tls(
-                http_handler,
-                http_addr.parse()?,
-                tls,
-            )
-            .await?;
+            let http_server =
+                wash_runtime::host::http::HttpServer::builder(http_handler, http_addr.parse()?)
+                    .tls(tls)
+                    .allow_outbound_http_insecure(allow_insecure)
+                    .build()
+                    .await?;
 
             host_builder = host_builder.with_http_handler(Arc::new(http_server));
 
@@ -133,7 +134,10 @@ impl CliCommand for DevCommand {
         } else {
             debug!("No TLS configuration provided - server will use HTTP");
             let http_server =
-                wash_runtime::host::http::HttpServer::new(http_handler, http_addr.parse()?).await?;
+                wash_runtime::host::http::HttpServer::builder(http_handler, http_addr.parse()?)
+                    .allow_outbound_http_insecure(allow_insecure)
+                    .build()
+                    .await?;
             host_builder = host_builder.with_http_handler(Arc::new(http_server));
             "http"
         };

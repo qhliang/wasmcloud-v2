@@ -106,6 +106,11 @@ pub struct HostCommand {
     #[arg(long = "allow-insecure-registries", default_value_t = false)]
     pub allow_insecure_registries: bool,
 
+    /// Allow outbound HTTP(S) requests to skip TLS certificate verification.
+    /// When true, self-signed or otherwise invalid certificates are accepted.
+    #[arg(long = "allow-outbound-http-insecure", default_value_t = false)]
+    pub allow_outbound_http_insecure: bool,
+
     /// Timeout for pulling artifacts from OCI registries
     #[arg(long = "registry-pull-timeout", value_parser = humantime::parse_duration, default_value = "30s")]
     pub registry_pull_timeout: Duration,
@@ -165,6 +170,7 @@ impl CliCommand for HostCommand {
 
         let host_config = wash_runtime::host::HostConfig {
             allow_oci_insecure: self.allow_insecure_registries,
+            allow_outbound_http_insecure: self.allow_outbound_http_insecure,
             oci_pull_timeout: Some(self.registry_pull_timeout),
             oci_cache_dir: self.oci_cache_dir.clone(),
         };
@@ -316,9 +322,16 @@ impl CliCommand for HostCommand {
                 if let Some(ca) = self.tls_ca_path.as_deref() {
                     tls = tls.with_ca(ca);
                 }
-                wash_runtime::host::http::HttpServer::new_with_tls(http_router, addr, tls).await?
+                wash_runtime::host::http::HttpServer::builder(http_router, addr)
+                    .tls(tls)
+                    .allow_outbound_http_insecure(self.allow_outbound_http_insecure)
+                    .build()
+                    .await?
             } else {
-                wash_runtime::host::http::HttpServer::new(http_router, addr).await?
+                wash_runtime::host::http::HttpServer::builder(http_router, addr)
+                    .allow_outbound_http_insecure(self.allow_outbound_http_insecure)
+                    .build()
+                    .await?
             };
             cluster_host_builder = cluster_host_builder.with_http_handler(Arc::new(http_server));
         }
