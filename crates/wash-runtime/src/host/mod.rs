@@ -565,6 +565,26 @@ impl Host {
     ) -> anyhow::Result<ResolvedWorkload> {
         let service_present = request.workload.service.is_some();
 
+        // Honor the workload's per-workload opt-in for skipping TLS
+        // certificate verification on outbound HTTP(S) requests. The value
+        // comes from any component/service `localResources.config`
+        // `allowOutboundHttpInsecure` entry (case-insensitive boolean).
+        let outbound_http_insecure = request.workload.components.iter().any(|c| {
+            c.local_resources
+                .config
+                .get("allowOutboundHttpInsecure")
+                .is_some_and(|v| {
+                    matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on")
+                })
+        }) || request.workload.service.iter().any(|c| {
+            c.local_resources
+                .config
+                .get("allowOutboundHttpInsecure")
+                .is_some_and(|v| {
+                    matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on")
+                })
+        });
+
         // Initialize the workload using the engine, receiving the unresolved workload
         let unresolved_workload = self
             .engine
@@ -573,6 +593,11 @@ impl Host {
         let mut resolved_workload = unresolved_workload
             .resolve(Some(&self.plugins), self.http_handler.clone())
             .await?;
+
+        self.http_handler
+            .set_workload_outbound_http_insecure(&request.workload_id, outbound_http_insecure)
+            .await
+            .context("failed to configure outbound TLS verification for workload")?;
 
         // If the service didn't run and we had one, warn
         if service_present && resolved_workload.execute_service().await?.is_none() {

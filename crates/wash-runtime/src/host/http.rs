@@ -343,7 +343,6 @@ pub trait OutgoingHandler: Send + Sync + 'static {
 
 /// A TLS certificate verifier that accepts any certificate, including self-signed ones.
 #[derive(Debug)]
-#[allow(dead_code)]
 struct NoCertificateVerification;
 
 impl ServerCertVerifier for NoCertificateVerification {
@@ -406,6 +405,12 @@ impl OutgoingHandler for DefaultOutgoingHandler {
         config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
     ) -> wasmtime_wasi_http::p2::HttpResult<wasmtime_wasi_http::p2::types::HostFutureIncomingResponse>
     {
+        // When insecure mode is enabled, use our custom handler that skips
+        // TLS certificate verification (accepts self-signed certs).
+        if self.allow_insecure {
+            return spawn_send_request_insecure(request, config);
+        }
+
         // Spawn the default handler ourselves (rather than calling
         // `default_send_request`) so the request can be wrapped in a client
         // span and the response status recorded once it arrives.
@@ -538,6 +543,18 @@ pub trait HostHandler: Send + Sync + 'static {
     ) -> anyhow::Result<()>;
     /// Unregister a workload
     async fn on_workload_unbind(&self, workload_id: &str) -> anyhow::Result<()>;
+
+    /// Configure whether outbound HTTP(S) requests for `workload_id` skip TLS
+    /// certificate verification (accepts self-signed and otherwise invalid
+    /// certificates). Read from the workload's `localResources.config`
+    /// `allowOutboundHttpInsecure` entry at start time. Default: no-op.
+    async fn set_workload_outbound_http_insecure(
+        &self,
+        _workload_id: &str,
+        _allow: bool,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// Register a long-lived service instance that serves HTTP ingress: inbound
     /// requests for `workload_id` are delivered over `sender` instead of
@@ -739,6 +756,12 @@ pub struct HttpServer<T: Router, O: OutgoingHandler = DefaultOutgoingHandler> {
     tls_acceptor: Option<TlsAcceptor>,
     listener: Arc<tokio::sync::Mutex<Option<TcpListener>>>,
     meters: RwLock<Meters>,
+    /// Per-workload opt-in to skipping TLS certificate verification for
+    /// outbound HTTP(S) requests (`workload_id -> allow`). Populated from the
+    /// workload's `localResources.config["allowOutboundHttpInsecure"]`.
+    /// Read on the synchronous `outgoing_request` hot path, hence
+    /// `std::sync::RwLock` rather than tokio's async variant.
+    outbound_http_insecure: Arc<std::sync::RwLock<HashMap<String, bool>>>,
 }
 
 impl<T: Router, O: OutgoingHandler> std::fmt::Debug for HttpServer<T, O> {
@@ -867,6 +890,7 @@ impl<T: Router, O: OutgoingHandler> HttpServerBuilder<T, O> {
             tls_acceptor,
             listener: Arc::new(tokio::sync::Mutex::new(Some(listener))),
             meters: Default::default(),
+            outbound_http_insecure: Arc::new(std::sync::RwLock::new(HashMap::new())),
         })
     }
 }
@@ -991,7 +1015,22 @@ impl<T: Router, O: OutgoingHandler> HostHandler for HttpServer<T, O> {
         self.workload_handles.write().await.remove(workload_id);
         self.service_handlers.write().await.remove(workload_id);
         self.messaging_handlers.write().await.remove(workload_id);
+        if let Ok(mut guard) = self.outbound_http_insecure.write() {
+            guard.remove(workload_id);
+        }
 
+        Ok(())
+    }
+
+    async fn set_workload_outbound_http_insecure(
+        &self,
+        workload_id: &str,
+        allow: bool,
+    ) -> anyhow::Result<()> {
+        self.outbound_http_insecure
+            .write()
+            .map_err(|e| anyhow::anyhow!("outbound_http_insecure lock poisoned: {e}"))?
+            .insert(workload_id.to_string(), allow);
         Ok(())
     }
 
@@ -1091,6 +1130,17 @@ impl<T: Router, O: OutgoingHandler> HostHandler for HttpServer<T, O> {
         }
         if is_grpc_request(&request) {
             return Ok(send_grpc_request(request, config));
+        }
+        // Per-workload opt-in (workload's `localResources.config`
+        // `allowOutboundHttpInsecure`): bypass TLS certificate verification.
+        let allow_insecure = self
+            .outbound_http_insecure
+            .read()
+            .ok()
+            .and_then(|g| g.get(workload_id).copied())
+            .unwrap_or(false);
+        if allow_insecure {
+            return spawn_send_request_insecure(request, config);
         }
         self.outgoing_handler
             .send_request(workload_id, request, config)
@@ -1945,18 +1995,16 @@ async fn send_grpc_request_handler(
 /// verification disabled — accepts self-signed and otherwise invalid certs.
 /// Mirrors `wasmtime_wasi_http::p2::default_send_request_handler` but uses
 /// a `NoCertificateVerification` verifier for the TLS connection.
-#[allow(dead_code)]
 async fn send_request_insecure(
     mut request: hyper::Request<HyperOutgoingBody>,
     OutgoingRequestConfig {
-        use_tls: _use_tls,
+        use_tls,
         connect_timeout,
         first_byte_timeout,
         between_bytes_timeout,
     }: OutgoingRequestConfig,
 ) -> Result<IncomingResponse, wasmtime_wasi_http::p2::bindings::http::types::ErrorCode> {
     use http_body_util::BodyExt;
-    use rustls::pki_types::ServerName;
     use tokio::net::TcpStream;
     use tokio::time::timeout;
     use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
@@ -1973,9 +2021,8 @@ async fn send_request_insecure(
         if authority.port().is_some() {
             authority.to_string()
         } else {
-            // Always use TLS (443) — the caller ensures this is only invoked
-            // for HTTPS requests.
-            format!("{authority}:443")
+            let port = if use_tls { 443 } else { 80 };
+            format!("{authority}:{port}")
         }
     } else {
         return Err(ErrorCode::HttpRequestUriInvalid);
@@ -1989,44 +2036,68 @@ async fn send_request_insecure(
             _ => ErrorCode::ConnectionRefused,
         })?;
 
-    // Build TLS config that accepts any certificate (including self-signed)
-    let config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(std::sync::Arc::new(NoCertificateVerification))
-        .with_no_client_auth();
+    let (mut sender, worker) = if use_tls {
+        use rustls::pki_types::ServerName;
 
-    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
-    let mut parts = authority.split(':');
-    let host = parts.next().unwrap_or(&authority);
-    if host.is_empty() {
-        return Err(ErrorCode::HttpRequestUriInvalid);
-    }
-    let domain = ServerName::try_from(host)
-        .map_err(|e| {
-            tracing::warn!("invalid server name '{host}': {e:?}");
-            ErrorCode::HttpRequestUriInvalid
-        })?
-        .to_owned();
-    let stream = connector.connect(domain, tcp_stream).await.map_err(|e| {
-        tracing::warn!("tls protocol error: {e:?}");
-        ErrorCode::TlsProtocolError
-    })?;
-    let stream = TokioIo::new(stream);
+        // Build TLS config that accepts any certificate (including self-signed)
+        let config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(NoCertificateVerification))
+            .with_no_client_auth();
 
-    let (mut sender, conn) = timeout(
-        connect_timeout,
-        hyper::client::conn::http1::handshake(stream),
-    )
-    .await
-    .map_err(|_| ErrorCode::ConnectionTimeout)?
-    .map_err(hyper_request_error)?;
-
-    let worker = wasmtime_wasi::runtime::spawn(async move {
-        match conn.await {
-            Ok(()) => {}
-            Err(e) => tracing::warn!("dropping error {e}"),
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+        let host = authority
+            .split_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(&authority);
+        if host.is_empty() {
+            return Err(ErrorCode::HttpRequestUriInvalid);
         }
-    });
+        let domain = ServerName::try_from(host)
+            .map_err(|e| {
+                tracing::warn!("invalid server name '{host}': {e:?}");
+                ErrorCode::HttpRequestUriInvalid
+            })?
+            .to_owned();
+        let stream = connector.connect(domain, tcp_stream).await.map_err(|e| {
+            tracing::warn!("tls protocol error: {e:?}");
+            ErrorCode::TlsProtocolError
+        })?;
+        let stream = TokioIo::new(stream);
+
+        let (sender, conn) = timeout(
+            connect_timeout,
+            hyper::client::conn::http1::handshake(stream),
+        )
+        .await
+        .map_err(|_| ErrorCode::ConnectionTimeout)?
+        .map_err(hyper_request_error)?;
+
+        let worker = wasmtime_wasi::runtime::spawn(async move {
+            if let Err(e) = conn.await {
+                tracing::warn!("dropping error {e}");
+            }
+        });
+
+        (sender, worker)
+    } else {
+        let stream = TokioIo::new(tcp_stream);
+        let (sender, conn) = timeout(
+            connect_timeout,
+            hyper::client::conn::http1::handshake(stream),
+        )
+        .await
+        .map_err(|_| ErrorCode::ConnectionTimeout)?
+        .map_err(hyper_request_error)?;
+
+        let worker = wasmtime_wasi::runtime::spawn(async move {
+            if let Err(e) = conn.await {
+                tracing::warn!("dropping error {e}");
+            }
+        });
+
+        (sender, worker)
+    };
 
     // Strip scheme/authority from URI — the HTTP/1.1 request only needs path+query
     if let Ok(uri) = hyper::Uri::builder()
@@ -2053,6 +2124,28 @@ async fn send_request_insecure(
         worker: Some(worker),
         between_bytes_timeout,
     })
+}
+
+/// Spawns [`send_request_insecure`] in the wasmtime runtime and returns a
+/// pending [`HostFutureIncomingResponse`], mirroring how the default handler
+/// wraps its async send so the caller gets a future immediately.
+fn spawn_send_request_insecure(
+    request: hyper::Request<HyperOutgoingBody>,
+    config: OutgoingRequestConfig,
+) -> wasmtime_wasi_http::p2::HttpResult<wasmtime_wasi_http::p2::types::HostFutureIncomingResponse> {
+    let span = outbound_client_span(request.method(), request.uri());
+    let handle = wasmtime_wasi::runtime::spawn(
+        async move {
+            let result = send_request_insecure(request, config).await;
+            match &result {
+                Ok(incoming) => record_outbound_status(incoming.resp.status()),
+                Err(_) => record_outbound_error(),
+            }
+            Ok(result)
+        }
+        .instrument(span),
+    );
+    Ok(HostFutureIncomingResponse::pending(handle))
 }
 
 /// P3 sibling of send_grpc_request: HTTP/2 sender for P3 outgoing gRPC.

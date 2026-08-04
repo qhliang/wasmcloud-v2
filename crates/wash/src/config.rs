@@ -236,6 +236,14 @@ pub struct WorkloadConfig {
     /// preserves the explicit-empty intent.
     #[serde(default = "default_allow_all_hosts")]
     pub allowed_hosts: Vec<AllowedHost>,
+
+    /// Opt-in to skipping TLS certificate verification for outbound HTTP(S)
+    /// requests (accepts self-signed and otherwise invalid certificates).
+    /// Surfaced to the runtime through the resolved `config` map under the
+    /// `allowOutboundHttpInsecure` key, matching the Kubernetes
+    /// `localResources.config` contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_outbound_http_insecure: Option<bool>,
 }
 
 /// One layer of environment variables.
@@ -936,6 +944,7 @@ workload:
     flag: "on"
   allowedHosts:
     - https://api.example.com
+  allowOutboundHttpInsecure: true
 "#;
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
         let workload = config.workload.expect("workload should parse");
@@ -951,6 +960,11 @@ workload:
         assert_eq!(
             workload.allowed_hosts,
             vec!["https://api.example.com".parse().unwrap()]
+        );
+        assert_eq!(
+            workload.allow_outbound_http_insecure,
+            Some(true),
+            "allowOutboundHttpInsecure should parse via camelCase"
         );
     }
 

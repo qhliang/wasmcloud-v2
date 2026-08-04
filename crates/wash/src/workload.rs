@@ -88,9 +88,16 @@ pub fn resolve_workload(
     // user's explicit list (including an explicit empty list, which the
     // runtime treats as deny-all). Either way, pass through unchanged.
     // The substitution lives on the serde default, not here.
+    let mut config = workload.config.clone();
+    // Surface the workload-level `allowOutboundHttpInsecure` opt-in through
+    // the config map so the runtime can pick it up from
+    // `localResources.config` uniformly across `wash dev` and Kubernetes.
+    if let Some(allow) = workload.allow_outbound_http_insecure {
+        config.insert("allowOutboundHttpInsecure".to_string(), allow.to_string());
+    }
     Ok(ResolvedWorkload {
         environment,
-        config: workload.config.clone(),
+        config,
         allowed_hosts: workload.allowed_hosts.clone(),
     })
 }
@@ -615,6 +622,37 @@ mod tests {
         assert!(resolved.ends_with("a.env"));
     }
 
+    #[test]
+    fn workload_allow_outbound_http_insecure_lands_in_config_map() {
+        let config = Config {
+            workload: Some(WorkloadConfig {
+                allow_outbound_http_insecure: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let dir = TempDir::new().unwrap();
+        let resolved = resolve_workload(&config, dir.path(), None).unwrap();
+        assert_eq!(
+            resolved
+                .config
+                .get("allowOutboundHttpInsecure")
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn workload_allow_outbound_http_insecure_omitted_stays_absent() {
+        let config = Config {
+            workload: Some(WorkloadConfig::default()),
+            ..Default::default()
+        };
+        let dir = TempDir::new().unwrap();
+        let resolved = resolve_workload(&config, dir.path(), None).unwrap();
+        assert!(!resolved.config.contains_key("allowOutboundHttpInsecure"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn secret_perms_too_loose_is_rejected() {
@@ -855,6 +893,7 @@ mod tests {
             }),
             config: HashMap::from([("WORKLOAD_CFG".into(), "cfg_value".into())]),
             allowed_hosts: vec!["https://api.example.com".parse().unwrap()],
+            allow_outbound_http_insecure: None,
         };
 
         let configs = BTreeMap::from([(
