@@ -20,12 +20,14 @@ world http-api {
   import custom:codex/executor@0.1.0;
   import custom:codex/session@0.1.0;
   import custom:telegram/sender@0.1.0;
+  import custom:event-monitor/watcher@0.1.0;
 
   export custom:dingtalk-stream/handler@0.1.0;
   export custom:feishu/handler@0.1.0;
   export custom:crontab/handler@0.1.0;
   export custom:wechat/handler@0.1.0;
   export custom:telegram/handler@0.1.0;
+  export custom:event-monitor/handler@0.1.0;
 }
 
 world task {

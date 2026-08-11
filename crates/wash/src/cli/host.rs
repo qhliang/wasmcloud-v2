@@ -3,6 +3,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use anyhow::Context as _;
 use clap::Args;
 use custom_plugin_cf_d1::CloudflareD1;
+use custom_plugin_event_monitor::EventMonitor;
 use custom_plugin_llm_gateway_provider::LlmGateway;
 use tracing::info;
 use wash_runtime::{
@@ -288,6 +289,11 @@ impl CliCommand for HostCommand {
         cluster_host_builder =
             cluster_host_builder.with_plugin(Arc::new(custom_plugin_telegram::Telegram::new()))?;
         tracing::info!("Telegram plugin enabled");
+
+        // Enable event monitor plugin
+        cluster_host_builder =
+            cluster_host_builder.with_plugin(Arc::new(EventMonitor::new()))?;
+        tracing::info!("Event monitor plugin enabled");
 
         if let Some(postgres_url) = &self.postgres_url {
             cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(

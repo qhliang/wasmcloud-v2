@@ -1,0 +1,29 @@
+[package]
+name = "custom_plugin_event_monitor"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+description = "Custom host plugin for Kubernetes event monitoring and dispatching to WASM components"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+kube = { workspace = true, features = ["client", "runtime", "rustls-tls"] }
+k8s-openapi = { workspace = true, default-features = false, features = ["v1_32"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+wasmtime = { workspace = true }
+
+http = { workspace = true }
+wash-runtime = { path = "../wash-runtime" }

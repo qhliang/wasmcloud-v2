@@ -83,6 +83,7 @@ custom_plugin_feishu = { path = "../custom_plugin_feishu" }
 custom_plugin_codex = { path = "../custom_plugin_codex" }
 custom_plugin_wechat = { path = "../custom_plugin_wechat" }
 custom_plugin_telegram = { path = "../custom_plugin_telegram" }
+custom_plugin_event_monitor = { path = "../custom_plugin_event_monitor" }
 
 # `O_NOFOLLOW` for the secret-file-open hardening in `crate::workload`.
 # Unix-only. Windows has no portable equivalent.

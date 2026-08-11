@@ -24,6 +24,7 @@ mod task;
 mod telegram;
 mod templates;
 mod wechat;
+mod event_monitor;
 
 use bindings::wasi::logging::logging::{Level, log};
 use wstd::http::{Body, Request, Response, StatusCode};
@@ -134,6 +135,37 @@ impl bindings::exports::custom::wechat::handler::Guest for CustomHandler {
     }
 }
 
+
+impl bindings::exports::custom::event_monitor::handler::Guest for CustomHandler {
+    fn handle_event(
+        event: bindings::exports::custom::event_monitor::handler::K8sEvent,
+    ) -> Result<(), String> {
+        let action_str = match event.action {
+            bindings::custom::event_monitor::types::EventAction::Applied => "applied",
+            bindings::custom::event_monitor::types::EventAction::Deleted => "deleted",
+        };
+
+        log(
+            Level::Info,
+            LOG_CTX,
+            &format!(
+                "EVENT: action={}, gvk={}/{}/{}, name={}, ns={:?}",
+                action_str, event.group, event.version, event.kind, event.name, event.namespace,
+            ),
+        );
+
+        event_monitor::push_event(
+            action_str,
+            &event.group,
+            &event.version,
+            &event.kind,
+            &event.name,
+            &event.namespace,
+        );
+
+        Ok(())
+    }
+}
 #[wstd::http_server]
 async fn main(req: Request<Body>) -> anyhow::Result<Response<Body>> {
     let path = req.uri().path();
@@ -246,6 +278,13 @@ async fn main(req: Request<Body>) -> anyhow::Result<Response<Body>> {
         "/telegram" | "/telegram/" => telegram::home(req).await,
         "/telegram/send-text" => telegram::send_text(req).await,
         "/telegram/send-media" => telegram::send_media(req).await,
+        "/event-monitor" | "/event-monitor/" => event_monitor::home(req).await,
+        "/event-monitor/create" => event_monitor::create(req).await,
+        "/event-monitor/resources" => event_monitor::list_resources(req).await,
+        "/event-monitor/watch" => event_monitor::watch_resources(req).await,
+        "/event-monitor/unwatch" => event_monitor::unwatch_resources(req).await,
+        "/event-monitor/log/clear" => event_monitor::clear_log(req).await,
+        "/event-monitor/log" => event_monitor::get_log(req).await,
         _ => {
             log(Level::Debug, LOG_CTX, &format!("Not found: {}", path));
 

@@ -1,0 +1,49 @@
+package custom:event-monitor@0.1.0;
+
+interface types {
+    variant event-action {
+        applied,
+        deleted,
+    }
+
+    record k8s-event {
+        group: string,
+        version: string,
+        kind: string,
+        name: string,
+        namespace: option<string>,
+        action: event-action,
+    }
+
+    record watchable-resource {
+        group: string,
+        version: string,
+        kind: string,
+    }
+}
+
+/// Host-provided API for managing watchers
+interface watcher {
+    use types.{k8s-event, watchable-resource};
+
+    /// Connect to a K8s cluster.
+    /// Must be called before watch-resources or list-all-resources.
+    create: func(api-server-url: string, token: string) -> result<_, string>;
+
+    /// List all watchable resources (including CRDs) from the connected cluster.
+    list-all-resources: func() -> result<list<watchable-resource>, string>;
+
+    /// Start watching the given resources.
+    /// Calling again cancels previous watchers and starts new ones.
+    watch-resources: func(resources: list<watchable-resource>) -> result<_, string>;
+
+    /// Cancel all active watchers.
+    unwatch-resources: func() -> result<_, string>;
+}
+
+/// Interface that the guest component must export.
+interface handler {
+    use types.{k8s-event};
+
+    handle-event: func(event: k8s-event) -> result<_, string>;
+}

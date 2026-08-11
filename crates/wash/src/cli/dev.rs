@@ -282,6 +282,11 @@ impl CliCommand for DevCommand {
         host_builder = host_builder.with_plugin(Arc::new(custom_plugin_mail::Mail::new()))?;
         debug!("Mail plugin enabled");
 
+        // Enable event monitor plugin
+        host_builder =
+            host_builder.with_plugin(Arc::new(custom_plugin_event_monitor::EventMonitor::new()))?;
+        debug!("Event monitor plugin enabled");
+
         // Add postgres plugin if configured
         if let Some(postgres_url) = &dev_config.postgres_url {
             host_builder = host_builder.with_plugin(Arc::new(

@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Event Monitor</title>
+        <style>
+            {BASE_CSS}
+            .log-area {
+                background: #1e1e1e;
+                color: #d4d4d4;
+                font-family: monospace;
+                font-size: 13px;
+                padding: 12px;
+                border-radius: 6px;
+                min-height: 200px;
+                max-height: 400px;
+                overflow-y: auto;
+                white-space: pre-wrap;
+                word-break: break-all;
+            }
+            .log-entry { padding: 2px 0; border-bottom: 1px solid #333; }
+            .log-entry.applied { color: #4ec9b0; }
+            .log-entry.deleted { color: #f14c4c; }
+            .checkbox-item { display: flex; align-items: center; gap: 8px; padding: 4px 0; }
+            .checkbox-item input { width: auto; margin: 0; }
+            .checkbox-item label { margin: 0; }
+        </style>
+    </head>
+    <body>
+        <h1>K8s Event Monitor</h1>
+        {NAV}
+
+        <div class="section">
+            <h2>Connect</h2>
+            <label for="apiServerUrl">API Server URL</label>
+            <input type="text" id="apiServerUrl" value="https://kubernetes.default.svc" />
+
+            <label for="token">Bearer Token</label>
+            <input type="password" id="token" placeholder="eyJhbGci..." style="font-family: monospace" />
+            <button id="connectBtn" onclick="connect()">Connect</button>
+            <span id="connectStatus" style="margin-left: 10px; font-size: 13px"></span>
+        </div>
+
+        <div class="section">
+            <h2>Resources</h2>
+            <p style="color: #666; font-size: 13px">
+                Discover and select resources to watch. Click "List" to fetch
+                all watchable types from the cluster, then select the ones you
+                want and click "Watch".
+            </p>
+            <button onclick="listResources()">List Resources</button>
+            <span id="listStatus" style="margin-left: 10px; font-size: 13px"></span>
+
+            <div id="resourceList" style="margin-top: 10px; max-height: 300px; overflow-y: auto; border: 1px solid #ccc; border-radius: 4px; padding: 8px"></div>
+
+            <div style="margin-top: 10px">
+                <button onclick="selectAll()" class="secondary">Select All</button>
+                <button onclick="deselectAll()" class="secondary">Deselect All</button>
+                <button id="watchBtn" onclick="watchResources()">Watch Selected</button>
+                <button id="unwatchBtn" onclick="unwatchAll()" class="secondary">Unwatch All</button>
+                <span id="watchStatus" style="margin-left: 10px; font-size: 13px"></span>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>Event Log</h2>
+            <div style="margin-bottom: 10px">
+                <button onclick="clearLogs()" class="secondary">Clear</button>
+                <span style="color: #666; font-size: 13px; margin-left: 10px" id="logCount">0 events</span>
+            </div>
+            <div class="log-area" id="logArea">
+                <div style="color: #888">Waiting for events...</div>
+            </div>
+        </div>
+
+        <script>
+            var eventCount = 0;
+
+            function show(id, text, isError) {
+                var el = document.getElementById(id);
+                el.textContent = text;
+                el.style.color = isError ? "#f14c4c" : "#4ec9b0";
+            }
+
+            function connect() {
+                var btn = document.getElementById("connectBtn");
+                btn.disabled = true;
+                btn.textContent = "Connecting...";
+
+                fetch("/event-monitor/create", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        "api-server-url": document.getElementById("apiServerUrl").value.trim(),
+                        "token": document.getElementById("token").value.trim(),
+                    }),
+                })
+                    .then(function(r) { return r.text().then(function(t) { return { ok: r.ok, text: t }; }); })
+                    .then(function(r) { show("connectStatus", r.ok ? "Connected" : "Error: " + r.text, !r.ok); })
+                    .catch(function(e) { show("connectStatus", e.message, true); })
+                    .finally(function() { btn.disabled = false; btn.textContent = "Connect"; });
+            }
+
+            function listResources() {
+                show("listStatus", "Loading...", false);
+                fetch("/event-monitor/resources")
+                    .then(function(r) { return r.json(); })
+                    .then(function(data) {
+                        var html = "";
+                        data.resources.forEach(function(r) {
+                            var gvk = r.group + "/" + r.version + "/" + r.kind;
+                            html += '<div class="checkbox-item"><input type="checkbox" value="' + gvk + '" data-group="' + r.group + '" data-version="' + r.version + '" data-kind="' + r.kind + '" /><label>' + gvk + '</label></div>';
+                        });
+                        document.getElementById("resourceList").innerHTML = html || "<div style='color: #888'>No watchable resources found</div>";
+                        show("listStatus", data.count + " resources", false);
+                    })
+                    .catch(function(e) { show("listStatus", e.message, true); });
+            }
+
+            function getSelectedResources() {
+                var result = [];
+                document.querySelectorAll("#resourceList input:checked").forEach(function(cb) {
+                    result.push({ group: cb.dataset.group, version: cb.dataset.version, kind: cb.dataset.kind });
+                });
+                return result;
+            }
+
+            function selectAll() {
+                document.querySelectorAll("#resourceList input").forEach(function(cb) { cb.checked = true; });
+            }
+
+            function deselectAll() {
+                document.querySelectorAll("#resourceList input").forEach(function(cb) { cb.checked = false; });
+            }
+
+            function watchResources() {
+                var resources = getSelectedResources();
+                if (resources.length === 0) { show("watchStatus", "No resources selected", true); return; }
+
+                var btn = document.getElementById("watchBtn");
+                btn.disabled = true;
+                btn.textContent = "Starting...";
+
+                fetch("/event-monitor/watch", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ resources: resources }),
+                })
+                    .then(function(r) { return r.text().then(function(t) { return { ok: r.ok, text: t }; }); })
+                    .then(function(r) { show("watchStatus", r.ok ? r.text : "Error: " + r.text, !r.ok); })
+                    .catch(function(e) { show("watchStatus", e.message, true); })
+                    .finally(function() { btn.disabled = false; btn.textContent = "Watch Selected"; });
+            }
+
+            function unwatchAll() {
+                fetch("/event-monitor/unwatch", { method: "POST" })
+                    .then(function(r) { return r.text(); })
+                    .then(function(t) { show("watchStatus", t, false); })
+                    .catch(function(e) { show("watchStatus", e.message, true); });
+            }
+
+            function clearLogs() {
+                eventCount = 0;
+                document.getElementById("logArea").innerHTML = '<div style="color: #888">Waiting for events...</div>';
+                document.getElementById("logCount").textContent = "0 events";
+                fetch("/event-monitor/log/clear", { method: "POST" }).catch(function() {});
+            }
+        </script>
+    </body>
+</html>
