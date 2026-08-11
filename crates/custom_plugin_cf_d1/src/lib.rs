@@ -13,7 +13,7 @@ use opentelemetry::metrics::Counter;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::debug;
+use tracing::{debug, error};
 use wasmtime::component::Resource;
 
 use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
@@ -394,6 +394,11 @@ impl<'a> bindings::custom::cf_d1::query::HostD1Client for ActiveCtx<'a> {
         let response = match client.post(&url).json(&request).send().await {
             Ok(r) => r,
             Err(e) => {
+                error!(
+                    database_id = %config_database_id,
+                    error = %e,
+                    "cf-d1 HTTP request failed"
+                );
                 return Ok(Err(QueryError::ConnectionError(format!(
                     "HTTP request failed: {e}"
                 ))));
@@ -403,16 +408,38 @@ impl<'a> bindings::custom::cf_d1::query::HostD1Client for ActiveCtx<'a> {
         let content = match response.text().await {
             Ok(c) => c,
             Err(err) => {
+                error!(
+                    database_id = %config_database_id,
+                    error = %err,
+                    "cf-d1 read response body failed"
+                );
                 return Ok(Err(QueryError::Unexpected(format!(
                     "Read HTTP response failed: {err}"
                 ))));
             }
         };
+        if !status_code.is_success() {
+            error!(
+                database_id = %config_database_id,
+                status = %status_code,
+                body = %content,
+                "cf-d1 non-200 HTTP status"
+            );
+            return Ok(Err(QueryError::ConnectionError(format!(
+                "HTTP {status_code}: {content}"
+            ))));
+        }
         debug!("d1 response status: {status_code}, content: {content}");
 
         let d1_response: D1Response = match serde_json::from_str(&content) {
             Ok(r) => r,
             Err(e) => {
+                error!(
+                    database_id = %config_database_id,
+                    error = %e,
+                    body = %content,
+                    "cf-d1 failed to parse response"
+                );
                 return Ok(Err(QueryError::Unexpected(format!(
                     "Failed to parse response: {e}"
                 ))));
@@ -425,6 +452,12 @@ impl<'a> bindings::custom::cf_d1::query::HostD1Client for ActiveCtx<'a> {
                 .first()
                 .map(|e| format!("{}: {}", e.code.unwrap_or(0), e.message))
                 .unwrap_or_else(|| "Unknown D1 error".to_string());
+            error!(
+                database_id = %config_database_id,
+                status = %status_code,
+                body = %content,
+                "cf-d1 query failed: {error_msg}"
+            );
             return Ok(Err(QueryError::DatabaseError(error_msg)));
         }
 
@@ -500,6 +533,11 @@ impl<'a> bindings::custom::cf_d1::query::HostD1Client for ActiveCtx<'a> {
         let response = match client.post(&url).json(&request).send().await {
             Ok(r) => r,
             Err(e) => {
+                error!(
+                    database_id = %config_database_id,
+                    error = %e,
+                    "cf-d1 batch HTTP request failed"
+                );
                 return Ok(Err(QueryError::ConnectionError(format!(
                     "HTTP request failed: {e}"
                 ))));
@@ -509,16 +547,38 @@ impl<'a> bindings::custom::cf_d1::query::HostD1Client for ActiveCtx<'a> {
         let content = match response.text().await {
             Ok(c) => c,
             Err(err) => {
+                error!(
+                    database_id = %config_database_id,
+                    error = %err,
+                    "cf-d1 batch read response body failed"
+                );
                 return Ok(Err(QueryError::Unexpected(format!(
                     "Read HTTP response failed: {err}"
                 ))));
             }
         };
+        if !status_code.is_success() {
+            error!(
+                database_id = %config_database_id,
+                status = %status_code,
+                body = %content,
+                "cf-d1 batch non-200 HTTP status"
+            );
+            return Ok(Err(QueryError::ConnectionError(format!(
+                "HTTP {status_code}: {content}"
+            ))));
+        }
         debug!("d1 response status: {status_code}, content: {content}");
 
         let d1_response: D1ResponseRaw = match serde_json::from_str(&content) {
             Ok(r) => r,
             Err(e) => {
+                error!(
+                    database_id = %config_database_id,
+                    error = %e,
+                    body = %content,
+                    "cf-d1 batch failed to parse response"
+                );
                 return Ok(Err(QueryError::Unexpected(format!(
                     "Failed to parse response: {e}"
                 ))));
@@ -531,6 +591,12 @@ impl<'a> bindings::custom::cf_d1::query::HostD1Client for ActiveCtx<'a> {
                 .first()
                 .map(|e| format!("{}: {}", e.code.unwrap_or(0), e.message))
                 .unwrap_or_else(|| "Unknown D1 error".to_string());
+            error!(
+                database_id = %config_database_id,
+                status = %status_code,
+                body = %content,
+                "cf-d1 batch query failed: {error_msg}"
+            );
             return Ok(Err(QueryError::DatabaseError(error_msg)));
         }
 
