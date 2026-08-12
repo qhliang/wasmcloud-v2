@@ -1,5 +1,6 @@
 use crate::bindings::custom::event_monitor::watcher;
 use crate::bindings::custom::event_monitor::types::WatchableResource;
+use crate::bindings::custom::event_monitor::watcher::WatchRule;
 use crate::bindings::wasi::logging::logging::{Level, log};
 use crate::helpers;
 use crate::templates;
@@ -16,6 +17,7 @@ const MAX_EVENTS: usize = 100;
 
 pub struct EventLogEntry {
     pub time: String,
+    pub id: String,
     pub action: String,
     pub group: String,
     pub kind: String,
@@ -25,6 +27,7 @@ pub struct EventLogEntry {
 }
 
 pub fn push_event(
+    id: &str,
     action: &str,
     group: &str,
     version: &str,
@@ -38,6 +41,7 @@ pub fn push_event(
     let mut list = EVENTS.lock().unwrap();
     list.push(EventLogEntry {
         time: time_short,
+        id: id.to_string(),
         action: action.to_string(),
         group: group.to_string(),
         version: version.to_string(),
@@ -111,7 +115,16 @@ pub async fn list_resources(_req: Request<Body>) -> anyhow::Result<Response<Body
 
 #[derive(Deserialize)]
 struct WatchResourcesRequest {
-    resources: Vec<WatchResourceItem>,
+    rules: Vec<WatchRuleItem>,
+}
+
+#[derive(Deserialize)]
+struct WatchRuleItem {
+    #[serde(rename = "id")]
+    id: String,
+    resource: WatchResourceItem,
+    #[serde(default)]
+    condition: String,
 }
 
 #[derive(Deserialize)]
@@ -124,27 +137,31 @@ struct WatchResourceItem {
 pub async fn watch_resources(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
     let body: WatchResourcesRequest = helpers::parse_json_body(&mut req).await?;
 
-    let resources: Vec<WatchableResource> = body
-        .resources
+    let rules: Vec<WatchRule> = body
+        .rules
         .iter()
-        .map(|r| WatchableResource {
-            group: r.group.clone(),
-            version: r.version.clone(),
-            kind: r.kind.clone(),
+        .map(|r| WatchRule {
+            id: r.id.clone(),
+            res: WatchableResource {
+                group: r.resource.group.clone(),
+                version: r.resource.version.clone(),
+                kind: r.resource.kind.clone(),
+            },
+            condition: r.condition.clone(),
         })
         .collect();
 
-    let count = resources.len();
+    let count = rules.len();
     log(
         Level::Info,
         LOG_CTX,
-        &format!("EVENT MONITOR WATCH: {count} resources"),
+        &format!("EVENT MONITOR WATCH: {count} rules"),
     );
 
-    match watcher::watch_resources(&resources) {
+    match watcher::watch_resources(&rules) {
         Ok(()) => helpers::text_response(
             StatusCode::OK,
-            format!("Watching {count} resources"),
+            format!("Watching {count} rules"),
         ),
         Err(e) => helpers::text_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -180,6 +197,7 @@ pub async fn get_log(_req: Request<Body>) -> anyhow::Result<Response<Body>> {
         .map(|e| {
             serde_json::json!({
                 "time": e.time,
+                "id": e.id,
                 "action": e.action,
                 "gvk": format!("{}/{}/{}", e.group, e.version, e.kind),
                 "name": e.name,

@@ -137,7 +137,7 @@ impl bindings::exports::custom::wechat::handler::Guest for CustomHandler {
 
 
 impl bindings::exports::custom::event_monitor::handler::Guest for CustomHandler {
-    fn handle_event(
+    fn handle_event(id: String, 
         event: bindings::exports::custom::event_monitor::handler::K8sEvent,
     ) -> Result<(), String> {
         let action_str = match event.action {
@@ -149,12 +149,12 @@ impl bindings::exports::custom::event_monitor::handler::Guest for CustomHandler 
             Level::Info,
             LOG_CTX,
             &format!(
-                "EVENT: action={}, gvk={}/{}/{}, name={}, ns={:?}",
-                action_str, event.group, event.version, event.kind, event.name, event.namespace,
+                "EVENT: rule={}, action={}, gvk={}/{}/{}, name={}, ns={:?}",
+                id, action_str, event.group, event.version, event.kind, event.name, event.namespace,
             ),
         );
 
-        event_monitor::push_event(
+        event_monitor::push_event(&id,
             action_str,
             &event.group,
             &event.version,

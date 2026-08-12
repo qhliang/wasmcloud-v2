@@ -1,6 +1,8 @@
 //! # Event Monitor Host Plugin
 //!
 //! Watches Kubernetes API server events and dispatches them to guest components.
+//! Supports jsonlogic-based conditional filtering on the host side to avoid
+//! unnecessary guest calls.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -8,6 +10,7 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use async_trait::async_trait;
 use futures::StreamExt;
+use jsonlogic::apply;
 use kube::{
     Api, Client as KubeClient, Config as KubeConfig,
     api::DynamicObject,
@@ -33,6 +36,7 @@ mod bindings {
 }
 
 use bindings::custom::event_monitor::types::{EventAction, K8sEvent, WatchableResource};
+use bindings::custom::event_monitor::watcher::WatchRule;
 
 const PLUGIN_ID: &str = "event-monitor";
 
@@ -46,6 +50,7 @@ struct WatcherState {
 
 /// A queued event to be dispatched serially.
 struct QueuedEvent {
+    id: String,
     gvk: GroupVersionKind,
     event: WatchEvent<DynamicObject>,
 }
@@ -55,8 +60,7 @@ struct ComponentData {
     workload: Option<ResolvedWorkload>,
     client: Option<KubeClient>,
     watchers: Vec<WatcherState>,
-    /// Serialized event dispatch channel: watchers push here, a single
-    /// consumer task creates stores and calls handle_event one at a time.
+    /// Serialized event dispatch channel.
     event_tx: Option<mpsc::UnboundedSender<QueuedEvent>>,
 }
 
@@ -75,8 +79,7 @@ impl EventMonitor {
     }
 
     /// Start a background serial consumer that reads from `event_rx` and
-    /// dispatches to the guest one event at a time, avoiding concurrent
-    /// store / instance access to the same component.
+    /// dispatches to the guest one event at a time.
     fn start_event_consumer(
         workload: ResolvedWorkload,
         component_id: String,
@@ -92,7 +95,7 @@ impl EventMonitor {
                         break;
                     }
                     msg = event_rx.recv() => match msg {
-                        Some(q) => dispatch_event(&workload, &component_id, &q.gvk, q.event).await,
+                        Some(q) => dispatch_event(&workload, &component_id, &q.id, &q.gvk, q.event).await,
                         None => { info!(component_id = %component_id, "Event channel closed"); break; }
                     }
                 }
@@ -104,13 +107,15 @@ impl EventMonitor {
         component_id: String,
         api: Api<DynamicObject>,
         gvk: GroupVersionKind,
+        id: String,
+        condition: Option<serde_json::Value>,
         cancel_token: CancellationToken,
         event_tx: mpsc::UnboundedSender<QueuedEvent>,
     ) {
         tokio::spawn(async move {
             let mut stream = Box::pin(watch(api, watcher::Config::default()));
             let gvk_str = format!("{}/{}/{}", gvk.group, gvk.version, gvk.kind);
-            info!(component_id = %component_id, gvk = %gvk_str, "Watcher started");
+            info!(component_id = %component_id, gvk = %gvk_str, id = %id, "Watcher started");
             loop {
                 tokio::select! {
                     _ = cancel_token.cancelled() => {
@@ -119,7 +124,18 @@ impl EventMonitor {
                     }
                     ev = stream.next() => match ev {
                         Some(Ok(e)) => {
-                            let _ = event_tx.send(QueuedEvent { gvk: gvk.clone(), event: e });
+                            // Evaluate jsonlogic condition on the host side
+                            if let Some(ref cond) = condition {
+                                if !evaluate_condition_for_event(cond, &e) {
+                                    debug!(component_id = %component_id, gvk = %gvk_str, id = %id, "Event filtered by condition");
+                                    continue;
+                                }
+                            }
+                            let _ = event_tx.send(QueuedEvent {
+                                id: id.clone(),
+                                gvk: gvk.clone(),
+                                event: e,
+                            });
                         }
                         Some(Err(e)) => warn!(component_id = %component_id, error = %e, "Stream error"),
                         None => { info!(component_id = %component_id, gvk = %gvk_str, "Stream ended"); break; }
@@ -127,6 +143,40 @@ impl EventMonitor {
                 }
             }
         });
+    }
+}
+
+/// Parse a jsonlogic condition string into a serde_json::Value.
+/// Returns None for empty/null conditions (match all).
+fn parse_condition(raw: &str) -> Option<serde_json::Value> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "null" || trimmed == "true" {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(trimmed).ok()
+}
+
+/// Evaluate a jsonlogic condition against a K8s watch event.
+fn evaluate_condition_for_event(condition: &serde_json::Value, event: &WatchEvent<DynamicObject>) -> bool {
+    let obj = match event {
+        WatchEvent::Apply(o) | WatchEvent::InitApply(o) | WatchEvent::Delete(o) => o,
+        _ => return false,
+    };
+
+    let data = match serde_json::to_value(obj) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "Failed to serialize DynamicObject for jsonlogic");
+            return false;
+        }
+    };
+
+    match apply(condition, &data) {
+        Ok(v) => v.as_bool().unwrap_or(false),
+        Err(e) => {
+            warn!(error = %e, "jsonlogic evaluation failed");
+            false
+        }
     }
 }
 
@@ -141,6 +191,7 @@ fn build_kube_config(url: &str, token: &str) -> anyhow::Result<KubeConfig> {
 async fn dispatch_event(
     workload: &ResolvedWorkload,
     component_id: &str,
+    id: &str,
     gvk: &GroupVersionKind,
     event: WatchEvent<DynamicObject>,
 ) {
@@ -159,39 +210,61 @@ async fn dispatch_event(
         action,
     };
 
-    debug!(component_id = %component_id, gvk = %format!("{}/{}", k8s.group, k8s.kind), name = %k8s.name, "Dispatching");
+    debug!(component_id = %component_id, id = %id, gvk = %format!("{}/{}", k8s.group, k8s.kind), name = %k8s.name, "Dispatching");
 
-    let Ok(mut store) = workload.new_store(component_id).await else { warn!(component_id = %component_id, "new_store failed"); return; };
-    let Ok(ip) = workload.instantiate_pre(component_id).await else { warn!(component_id = %component_id, "instantiate_pre failed"); return; };
-    let Ok(pre) = bindings::EventMonitorPre::new(ip) else { warn!(component_id = %component_id, "EventMonitorPre failed"); return; };
-    let Ok(proxy) = pre.instantiate_async(&mut store).await else { warn!(component_id = %component_id, "instantiate_async failed"); return; };
+    let Ok(mut store) = workload.new_store(component_id).await else {
+        warn!(component_id = %component_id, "new_store failed");
+        return;
+    };
+    let Ok(ip) = workload.instantiate_pre(component_id).await else {
+        warn!(component_id = %component_id, "instantiate_pre failed");
+        return;
+    };
+    let Ok(pre) = bindings::EventMonitorPre::new(ip) else {
+        warn!(component_id = %component_id, "EventMonitorPre failed");
+        return;
+    };
+    let Ok(proxy) = pre.instantiate_async(&mut store).await else {
+        warn!(component_id = %component_id, "instantiate_async failed");
+        return;
+    };
 
-    match proxy.custom_event_monitor_handler().call_handle_event(&mut store, &k8s).await {
-        Ok(Ok(())) => debug!(component_id = %component_id, "Event handled"),
-        Ok(Err(e)) => warn!(component_id = %component_id, error = %e, "Handler error"),
-        Err(e) => warn!(component_id = %component_id, error = %e, "Call failed"),
+    match proxy.custom_event_monitor_handler().call_handle_event(&mut store, id, &k8s).await {
+        Ok(Ok(())) => debug!(component_id = %component_id, id = %id, "Event handled"),
+        Ok(Err(e)) => warn!(component_id = %component_id, id = %id, error = %e, "Handler error"),
+        Err(e) => warn!(component_id = %component_id, id = %id, error = %e, "Call failed"),
     }
 }
 
 fn cancel_all_watchers(data: &mut ComponentData) {
-    for w in data.watchers.drain(..) { w.cancel_token.cancel(); }
+    for w in data.watchers.drain(..) {
+        w.cancel_token.cancel();
+    }
 }
 
 // ---------------------------------------------------------------------------
-// WIT watcher::Host
+// WIT implementation: watcher interface
 // ---------------------------------------------------------------------------
 
-impl<'a> bindings::custom::event_monitor::watcher::Host for ActiveCtx<'a> {
+impl bindings::custom::event_monitor::watcher::Host for ActiveCtx<'_> {
+
     async fn create(&mut self, api_server_url: String, token: String) -> wasmtime::Result<Result<(), String>> {
-        let Ok(plugin) = self.try_get_plugin::<EventMonitor>(PLUGIN_ID) else { return Ok(Err("plugin not available".into())); };
+        let Ok(plugin) = self.try_get_plugin::<EventMonitor>(PLUGIN_ID) else {
+            return Ok(Err("plugin not available".into()));
+        };
         let cid = self.component_id.as_ref().to_string();
 
-        let kcfg = build_kube_config(&api_server_url, &token).map_err(|e| wasmtime::Error::msg(format!("config: {e}")))?;
-        let client = KubeClient::try_from(kcfg).map_err(|e| wasmtime::Error::msg(format!("connect: {e}")))?;
-        client.apiserver_version().await.map_err(|e| wasmtime::Error::msg(format!("unreachable: {e}")))?;
+        let kcfg = build_kube_config(&api_server_url, &token)
+            .map_err(|e| wasmtime::Error::msg(format!("config: {e}")))?;
+        let client = KubeClient::try_from(kcfg)
+            .map_err(|e| wasmtime::Error::msg(format!("connect: {e}")))?;
+        client.apiserver_version().await
+            .map_err(|e| wasmtime::Error::msg(format!("unreachable: {e}")))?;
 
         let mut lock = plugin.tracker.write().await;
-        let Some(data) = lock.get_component_data_mut(&cid) else { return Ok(Err("not tracked".into())); };
+        let Some(data) = lock.get_component_data_mut(&cid) else {
+            return Ok(Err("not tracked".into()));
+        };
         cancel_all_watchers(data);
         data.client = Some(client);
 
@@ -200,7 +273,9 @@ impl<'a> bindings::custom::event_monitor::watcher::Host for ActiveCtx<'a> {
     }
 
     async fn list_all_resources(&mut self) -> wasmtime::Result<Result<Vec<WatchableResource>, String>> {
-        let Ok(plugin) = self.try_get_plugin::<EventMonitor>(PLUGIN_ID) else { return Ok(Err("plugin not available".into())); };
+        let Ok(plugin) = self.try_get_plugin::<EventMonitor>(PLUGIN_ID) else {
+            return Ok(Err("plugin not available".into()));
+        };
         let cid = self.component_id.as_ref().to_string();
 
         let client = {
@@ -210,66 +285,93 @@ impl<'a> bindings::custom::event_monitor::watcher::Host for ActiveCtx<'a> {
             c
         };
 
-        let discovery = Discovery::new(client).run().await.map_err(|e| wasmtime::Error::msg(format!("discovery: {e}")))?;
+        let discovery = Discovery::new(client).run().await
+            .map_err(|e| wasmtime::Error::msg(format!("discovery: {e}")))?;
 
         let mut resources = Vec::new();
-        let mut group_count = 0u32;
         for group in discovery.groups() {
-            group_count += 1;
-            let group_name = group.name().to_string();
             let by_stability = group.resources_by_stability();
-            info!(component_id = %cid, group = %group_name, count = by_stability.len(), "Discovered group");
             for (ar, caps) in by_stability {
                 if caps.supports_operation(verbs::WATCH) && caps.supports_operation(verbs::LIST) {
                     resources.push(WatchableResource {
-                        group: ar.group.clone(), version: ar.version.clone(), kind: ar.kind.clone(),
+                        group: ar.group.clone(),
+                        version: ar.version.clone(),
+                        kind: ar.kind.clone(),
                     });
                 }
             }
         }
 
-        info!(component_id = %cid, groups = group_count, resources = resources.len(), "Listed all watchable resources");
+        info!(component_id = %cid, count = resources.len(), "Resources listed");
         Ok(Ok(resources))
     }
 
-    async fn watch_resources(&mut self, resources: Vec<WatchableResource>) -> wasmtime::Result<Result<(), String>> {
-        let Ok(plugin) = self.try_get_plugin::<EventMonitor>(PLUGIN_ID) else { return Ok(Err("plugin not available".into())); };
+    async fn watch_resources(&mut self, rules: Vec<WatchRule>) -> wasmtime::Result<Result<(), String>> {
+        if rules.is_empty() {
+            return Ok(Err("no rules provided".into()));
+        }
+
+        let Ok(plugin) = self.try_get_plugin::<EventMonitor>(PLUGIN_ID) else {
+            return Ok(Err("plugin not available".into()));
+        };
         let cid = self.component_id.as_ref().to_string();
 
-        let (_workload, client, event_tx) = {
+        // Cancel any existing watchers
+        {
             let mut lock = plugin.tracker.write().await;
-            let Some(data) = lock.get_component_data_mut(&cid) else { return Ok(Err("not tracked".into())); };
-            cancel_all_watchers(data);
-            let Some(wl) = data.workload.clone() else { return Ok(Err("not resolved".into())); };
+            if let Some(data) = lock.get_component_data_mut(&cid) {
+                cancel_all_watchers(data);
+            }
+        }
+
+        let (client, wl) = {
+            let lock = plugin.tracker.read().await;
+            let Some(data) = lock.get_component_data(&cid) else { return Ok(Err("not tracked".into())); };
             let Some(c) = data.client.clone() else { return Ok(Err("not connected".into())); };
-
-            // Re-create the event channel to drain any stale events from
-            // previous watchers (old consumer already cancelled).
-            let (tx, rx) = mpsc::unbounded_channel();
-            data.event_tx = Some(tx.clone());
-
-            // Start a fresh serial consumer
-            let child = data.cancel_token.child_token();
-            EventMonitor::start_event_consumer(wl.clone(), cid.clone(), child, rx);
-
-            (wl, c, tx)
+            let Some(w) = data.workload.clone() else { return Ok(Err("no workload".into())); };
+            (c, w)
         };
 
-        let discovery = Discovery::new(client.clone()).run().await.map_err(|e| wasmtime::Error::msg(format!("discovery: {e}")))?;
+        // Create new serial event channel
+        let (tx, rx) = mpsc::unbounded_channel();
 
-        for res in &resources {
-            let gvk = GroupVersionKind { group: res.group.clone(), version: res.version.clone(), kind: res.kind.clone() };
+        {
+            let mut lock = plugin.tracker.write().await;
+            if let Some(data) = lock.get_component_data_mut(&cid) {
+                data.event_tx = Some(tx.clone());
+            }
+        }
+
+        // Start a fresh serial consumer
+        let child = {
+            let lock = plugin.tracker.read().await;
+            let Some(data) = lock.get_component_data(&cid) else { return Ok(Err("not tracked".into())); };
+            data.cancel_token.child_token()
+        };
+        EventMonitor::start_event_consumer(wl, cid.clone(), child, rx);
+
+        let discovery = Discovery::new(client.clone()).run().await
+            .map_err(|e| wasmtime::Error::msg(format!("discovery: {e}")))?;
+
+        for rule in &rules {
+            let res = &rule.res;
+            let gvk = GroupVersionKind {
+                group: res.group.clone(),
+                version: res.version.clone(),
+                kind: res.kind.clone(),
+            };
             let gvk_str = format!("{}/{}/{}", gvk.group, gvk.version, gvk.kind);
 
             let Some((ar, caps)) = discovery.resolve_gvk(&gvk) else {
-                warn!(component_id = %cid, gvk = %gvk_str, "Not found, skipping");
+                warn!(component_id = %cid, gvk = %gvk_str, id = %rule.id, "Not found, skipping");
                 continue;
             };
             if !caps.supports_operation(verbs::WATCH) {
-                warn!(component_id = %cid, gvk = %gvk_str, "No watch support, skipping");
+                warn!(component_id = %cid, gvk = %gvk_str, id = %rule.id, "No watch support, skipping");
                 continue;
             }
 
+            let condition = parse_condition(&rule.condition);
             let api = Api::<DynamicObject>::all_with(client.clone(), &ar);
             let child = {
                 let lock = plugin.tracker.read().await;
@@ -277,24 +379,36 @@ impl<'a> bindings::custom::event_monitor::watcher::Host for ActiveCtx<'a> {
                 data.cancel_token.child_token()
             };
 
-            EventMonitor::spawn_watcher(cid.clone(), api, gvk, child.clone(), event_tx.clone());
+            EventMonitor::spawn_watcher(
+                cid.clone(),
+                api,
+                gvk,
+                rule.id.clone(),
+                condition,
+                child.clone(),
+                tx.clone(),
+            );
 
             let mut lock = plugin.tracker.write().await;
             if let Some(data) = lock.get_component_data_mut(&cid) {
                 data.watchers.push(WatcherState { cancel_token: child });
             }
 
-            info!(component_id = %cid, gvk = %gvk_str, "Watcher created");
+            info!(component_id = %cid, gvk = %gvk_str, id = %rule.id, "Watcher created");
         }
 
         Ok(Ok(()))
     }
 
     async fn unwatch_resources(&mut self) -> wasmtime::Result<Result<(), String>> {
-        let Ok(plugin) = self.try_get_plugin::<EventMonitor>(PLUGIN_ID) else { return Ok(Err("plugin not available".into())); };
+        let Ok(plugin) = self.try_get_plugin::<EventMonitor>(PLUGIN_ID) else {
+            return Ok(Err("plugin not available".into()));
+        };
         let cid = self.component_id.as_ref().to_string();
         let mut lock = plugin.tracker.write().await;
-        let Some(data) = lock.get_component_data_mut(&cid) else { return Ok(Err("not tracked".into())); };
+        let Some(data) = lock.get_component_data_mut(&cid) else {
+            return Ok(Err("not tracked".into()));
+        };
         let n = data.watchers.len();
         cancel_all_watchers(data);
         info!(component_id = %cid, count = n, "Watchers cancelled");
@@ -372,5 +486,19 @@ mod tests {
     fn test_world_exports() {
         let w = EventMonitor::new().world();
         assert!(w.exports.iter().any(|i| i.namespace == "custom" && i.package == "event-monitor"));
+    }
+
+    #[test]
+    fn test_parse_condition_empty() {
+        assert!(parse_condition("").is_none());
+        assert!(parse_condition("  ").is_none());
+        assert!(parse_condition("null").is_none());
+        assert!(parse_condition("true").is_none());
+    }
+
+    #[test]
+    fn test_parse_condition_valid() {
+        let c = parse_condition(r#"{"==": [{"var": "type"}, "Normal"]}"#);
+        assert!(c.is_some());
     }
 }

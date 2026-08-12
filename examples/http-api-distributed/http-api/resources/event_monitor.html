@@ -22,9 +22,11 @@
             .log-entry { padding: 2px 0; border-bottom: 1px solid #333; }
             .log-entry.applied { color: #4ec9b0; }
             .log-entry.deleted { color: #f14c4c; }
-            .checkbox-item { display: flex; align-items: center; gap: 8px; padding: 4px 0; }
-            .checkbox-item input { width: auto; margin: 0; }
-            .checkbox-item label { margin: 0; }
+            .resource-row { display: flex; align-items: center; gap: 8px; padding: 4px 0; flex-wrap: wrap; }
+            .resource-row input[type="checkbox"] { width: auto; margin: 0; flex-shrink: 0; }
+            .resource-row label.gvk { width: 260px; flex-shrink: 0; font-size: 13px; margin: 0; }
+            .resource-row input.condition { width: 280px; font-size: 12px; padding: 2px 6px; }
+            .resource-row span.rule-id { font-size: 11px; color: #888; width: 80px; }
         </style>
     </head>
     <body>
@@ -46,8 +48,9 @@
             <h2>Resources</h2>
             <p style="color: #666; font-size: 13px">
                 Discover and select resources to watch. Click "List" to fetch
-                all watchable types from the cluster, then select the ones you
-                want and click "Watch".
+                all watchable types from the cluster. Optionally add a jsonlogic
+                condition (e.g. <code>{"==":[{"var":"type"},"Normal"]}</code>)
+                to filter events on the host side. Empty condition = match all.
             </p>
             <button onclick="listResources()">List Resources</button>
             <span id="listStatus" style="margin-left: 10px; font-size: 13px"></span>
@@ -108,9 +111,16 @@
                     .then(function(r) { return r.json(); })
                     .then(function(data) {
                         var html = "";
+                        var idx = 0;
                         data.resources.forEach(function(r) {
                             var gvk = r.group + "/" + r.version + "/" + r.kind;
-                            html += '<div class="checkbox-item"><input type="checkbox" value="' + gvk + '" data-group="' + r.group + '" data-version="' + r.version + '" data-kind="' + r.kind + '" /><label>' + gvk + '</label></div>';
+                            var rid = "r" + (++idx);
+                            html += '<div class="resource-row">'
+                                + '<input type="checkbox" value="' + gvk + '" data-group="' + r.group + '" data-version="' + r.version + '" data-kind="' + r.kind + '" data-id="' + rid + '" />'
+                                + '<label class="gvk">' + gvk + '</label>'
+                                + '<span class="id">' + rid + '</span>'
+                                + '<input class="condition" type="text" placeholder="jsonlogic condition (optional)" />'
+                                + '</div>';
                         });
                         document.getElementById("resourceList").innerHTML = html || "<div style='color: #888'>No watchable resources found</div>";
                         show("listStatus", data.count + " resources", false);
@@ -118,25 +128,35 @@
                     .catch(function(e) { show("listStatus", e.message, true); });
             }
 
-            function getSelectedResources() {
-                var result = [];
-                document.querySelectorAll("#resourceList input:checked").forEach(function(cb) {
-                    result.push({ group: cb.dataset.group, version: cb.dataset.version, kind: cb.dataset.kind });
+            function getSelectedRules() {
+                var rules = [];
+                document.querySelectorAll("#resourceList input[type=checkbox]:checked").forEach(function(cb) {
+                    var row = cb.parentElement;
+                    var condInput = row.querySelector("input.condition");
+                    rules.push({
+                        "id": cb.dataset.id,
+                        resource: {
+                            group: cb.dataset.group,
+                            version: cb.dataset.version,
+                            kind: cb.dataset.kind,
+                        },
+                        condition: condInput ? condInput.value.trim() : "",
+                    });
                 });
-                return result;
+                return rules;
             }
 
             function selectAll() {
-                document.querySelectorAll("#resourceList input").forEach(function(cb) { cb.checked = true; });
+                document.querySelectorAll("#resourceList input[type=checkbox]").forEach(function(cb) { cb.checked = true; });
             }
 
             function deselectAll() {
-                document.querySelectorAll("#resourceList input").forEach(function(cb) { cb.checked = false; });
+                document.querySelectorAll("#resourceList input[type=checkbox]").forEach(function(cb) { cb.checked = false; });
             }
 
             function watchResources() {
-                var resources = getSelectedResources();
-                if (resources.length === 0) { show("watchStatus", "No resources selected", true); return; }
+                var rules = getSelectedRules();
+                if (rules.length === 0) { show("watchStatus", "No resources selected", true); return; }
 
                 var btn = document.getElementById("watchBtn");
                 btn.disabled = true;
@@ -145,7 +165,7 @@
                 fetch("/event-monitor/watch", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ resources: resources }),
+                    body: JSON.stringify({ rules: rules }),
                 })
                     .then(function(r) { return r.text().then(function(t) { return { ok: r.ok, text: t }; }); })
                     .then(function(r) { show("watchStatus", r.ok ? r.text : "Error: " + r.text, !r.ok); })
