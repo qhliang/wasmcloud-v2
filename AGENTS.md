@@ -46,14 +46,20 @@ cargo machete                              # 未使用依赖检查
 - 错误消息：小写开头，无末尾句号
 - `warnings = 'deny'` — 任何警告都会导致编译失败
 
-## 新增 custom plugin 清单
+## 新增/修改 custom plugin 清单
+
+**新增 custom plugin：**
 
 1. 创建 `crates/custom_plugin_<name>/` 目录，包含 `Cargo.toml`、`src/lib.rs`、`wit/deps/<name>.wit`、`wit/world.wit`
 2. 在 workspace 根 `Cargo.toml` 的 `members` 中添加
 3. 在 `crates/wash/Cargo.toml` 中添加依赖
 4. 在 `crates/wash/src/cli/host.rs` 中 import 并 `with_plugin()`
 5. 在 `crates/wash/src/cli/dev.rs` 中同样注册
-6. 参考 `custom_plugin_crontab` 的实现模式
+6. 参考已有 plugin（如 `custom_plugin_crontab`、`custom_plugin_event_monitor`）的实现模式
+
+**修改 custom plugin 逻辑时：**
+
+7. **必须同步更新对应的 `README.md`**，包括接口变更、新增/删除 export/import、配置参数变化等
 
 ## 提交规范
 
