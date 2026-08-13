@@ -14,6 +14,7 @@ mod codex;
 mod crontab;
 mod d1;
 mod dingtalk;
+mod event_monitor;
 mod feishu;
 mod helpers;
 mod kv;
@@ -24,7 +25,6 @@ mod task;
 mod telegram;
 mod templates;
 mod wechat;
-mod event_monitor;
 mod workflow;
 
 use bindings::wasi::logging::logging::{Level, log};
@@ -136,9 +136,9 @@ impl bindings::exports::custom::wechat::handler::Guest for CustomHandler {
     }
 }
 
-
 impl bindings::exports::custom::event_monitor::handler::Guest for CustomHandler {
-    fn handle_event(id: String, 
+    fn handle_event(
+        id: String,
         event: bindings::exports::custom::event_monitor::handler::K8sEvent,
     ) -> Result<(), String> {
         let action_str = match event.action {
@@ -155,7 +155,8 @@ impl bindings::exports::custom::event_monitor::handler::Guest for CustomHandler 
             ),
         );
 
-        event_monitor::push_event(&id,
+        event_monitor::push_event(
+            &id,
             action_str,
             &event.group,
             &event.version,
@@ -170,22 +171,47 @@ impl bindings::exports::custom::event_monitor::handler::Guest for CustomHandler 
 
 impl bindings::exports::custom::workflow::handler::Guest for CustomHandler {
     fn on_start(event: bindings::custom::workflow::types::WorkflowEvent) -> Result<(), String> {
-        log(Level::Info, LOG_CTX, &format!("WF ON_START: pid={}, type={}, state={}, name={}", event.pid, event.event_type, event.state, event.name));
+        log(
+            Level::Info,
+            LOG_CTX,
+            &format!(
+                "WF ON_START: pid={}, type={}, state={}, name={}",
+                event.pid, event.event_type, event.state, event.name
+            ),
+        );
         Ok(())
     }
 
     fn on_message(event: bindings::custom::workflow::types::WorkflowEvent) -> Result<(), String> {
-        log(Level::Info, LOG_CTX, &format!("WF ON_MSG: pid={}, type={}, state={}, name={}", event.pid, event.event_type, event.state, event.name));
+        log(
+            Level::Info,
+            LOG_CTX,
+            &format!(
+                "WF ON_MSG: pid={}, type={}, state={}, name={}",
+                event.pid, event.event_type, event.state, event.name
+            ),
+        );
         Ok(())
     }
 
     fn on_complete(event: bindings::custom::workflow::types::WorkflowEvent) -> Result<(), String> {
-        log(Level::Info, LOG_CTX, &format!("WF ON_COMPLETE: pid={}, type={}, state={}, name={}", event.pid, event.event_type, event.state, event.name));
+        log(
+            Level::Info,
+            LOG_CTX,
+            &format!(
+                "WF ON_COMPLETE: pid={}, type={}, state={}, name={}",
+                event.pid, event.event_type, event.state, event.name
+            ),
+        );
         Ok(())
     }
 
     fn on_error(pid: String, error: String) -> Result<(), String> {
-        log(Level::Info, LOG_CTX, &format!("WF ON_ERROR: pid={}, error={}", pid, error));
+        log(
+            Level::Info,
+            LOG_CTX,
+            &format!("WF ON_ERROR: pid={}, error={}", pid, error),
+        );
         Ok(())
     }
 }

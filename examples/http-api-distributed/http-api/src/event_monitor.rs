@@ -1,5 +1,5 @@
-use crate::bindings::custom::event_monitor::watcher;
 use crate::bindings::custom::event_monitor::types::WatchableResource;
+use crate::bindings::custom::event_monitor::watcher;
 use crate::bindings::custom::event_monitor::watcher::WatchRule;
 use crate::bindings::wasi::logging::logging::{Level, log};
 use crate::helpers;
@@ -159,10 +159,7 @@ pub async fn watch_resources(mut req: Request<Body>) -> anyhow::Result<Response<
     );
 
     match watcher::watch_resources(&rules) {
-        Ok(()) => helpers::text_response(
-            StatusCode::OK,
-            format!("Watching {count} rules"),
-        ),
+        Ok(()) => helpers::text_response(StatusCode::OK, format!("Watching {count} rules")),
         Err(e) => helpers::text_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to watch: {e}"),

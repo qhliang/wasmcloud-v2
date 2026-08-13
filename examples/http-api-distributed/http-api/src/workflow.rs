@@ -46,9 +46,7 @@ pub async fn start(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
     log(Level::Info, LOG_CTX, "WORKFLOW START");
 
     match manager::start(&body.workflow_def, &pairs) {
-        Ok(pid) => helpers::json_response(
-            serde_json::json!({ "pid": pid }).to_string(),
-        ),
+        Ok(pid) => helpers::json_response(serde_json::json!({ "pid": pid }).to_string()),
         Err(e) => helpers::json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("Failed to start: {e}"),
@@ -105,9 +103,6 @@ pub async fn status(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
             })
             .to_string(),
         ),
-        Err(e) => helpers::json_error(
-            StatusCode::NOT_FOUND,
-            &format!("{e}"),
-        ),
+        Err(e) => helpers::json_error(StatusCode::NOT_FOUND, &format!("{e}")),
     }
 }
