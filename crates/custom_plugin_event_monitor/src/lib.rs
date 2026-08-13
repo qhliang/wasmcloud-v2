@@ -4,7 +4,7 @@
 //! Supports jsonlogic-based conditional filtering on the host side to avoid
 //! unnecessary guest calls.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Context as _;
@@ -14,8 +14,8 @@ use jsonlogic::apply;
 use kube::{
     Api, Client as KubeClient, Config as KubeConfig,
     api::DynamicObject,
-    core::GroupVersionKind,
-    discovery::{Discovery, Scope, verbs},
+    core::{GroupVersion, GroupVersionKind},
+    discovery::{self, ApiGroup, Discovery, Scope, verbs},
     runtime::watcher::{self, Event as WatchEvent, watcher as watch},
 };
 use tokio::sync::{RwLock, mpsc};
@@ -387,10 +387,25 @@ impl bindings::custom::event_monitor::watcher::Host for ActiveCtx<'_> {
         };
         EventMonitor::start_event_consumer(wl, cid.clone(), child, rx);
 
-        let discovery = Discovery::new(client.clone())
-            .run()
-            .await
-            .map_err(|e| wasmtime::Error::msg(format!("discovery: {e}")))?;
+        // Resolve only the group/version pairs referenced by the rules, instead of
+        // running a full API discovery. Each unique pair costs a single request.
+        let mut resolved: HashMap<(String, String), ApiGroup> = HashMap::new();
+        for rule in &rules {
+            let res = &rule.res;
+            let key = (res.group.clone(), res.version.clone());
+            if resolved.contains_key(&key) {
+                continue;
+            }
+            let gv = GroupVersion::gv(&res.group, &res.version);
+            match discovery::pinned_group(&client, &gv).await {
+                Ok(group) => {
+                    resolved.insert(key, group);
+                }
+                Err(e) => {
+                    warn!(component_id = %cid, group = %res.group, version = %res.version, error = %e, "Discovery failed, skipping group version");
+                }
+            }
+        }
 
         for rule in &rules {
             let res = &rule.res;
@@ -401,7 +416,15 @@ impl bindings::custom::event_monitor::watcher::Host for ActiveCtx<'_> {
             };
             let gvk_str = format!("{}/{}/{}", gvk.group, gvk.version, gvk.kind);
 
-            let Some((ar, caps)) = discovery.resolve_gvk(&gvk) else {
+            let Some(group) = resolved.get(&(res.group.clone(), res.version.clone())) else {
+                warn!(component_id = %cid, gvk = %gvk_str, id = %rule.id, "Not found, skipping");
+                continue;
+            };
+            let Some((ar, caps)) = group
+                .versioned_resources(&res.version)
+                .into_iter()
+                .find(|(ar, _)| ar.kind == res.kind)
+            else {
                 warn!(component_id = %cid, gvk = %gvk_str, id = %rule.id, "Not found, skipping");
                 continue;
             };
