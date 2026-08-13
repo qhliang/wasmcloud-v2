@@ -1,0 +1,56 @@
+package custom:workflow@0.1.0;
+
+interface types {
+    record var-pair {
+        key: string,
+        value: string,
+    }
+
+    record proc-info {
+        pid: string,
+        mid: string,
+        state: string,
+        start-time: s64,
+        end-time: s64,
+    }
+
+    record workflow-event {
+        pid: string,
+        mid: string,
+        event-type: string,
+        state: string,
+        name: string,
+        inputs: list<var-pair>,
+        outputs: list<var-pair>,
+    }
+}
+
+/// Host-provided API for workflow lifecycle management
+interface manager {
+    use types.{var-pair, proc-info};
+
+    /// Deploy and start a workflow.
+    /// workflow-def: YAML/JSON workflow definition string.
+    /// vars: initial variables passed to the process.
+    /// Returns the process id (pid).
+    start: func(workflow-def: string, vars: list<var-pair>) -> result<string, string>;
+
+    /// List all running process instances.
+    list-processes: func() -> result<list<proc-info>, string>;
+
+    /// Query a process status by pid.
+    process-status: func(pid: string) -> result<proc-info, string>;
+
+    /// Complete a pending task (e.g. human interaction node).
+    complete-task: func(pid: string, nid: string, outputs: list<var-pair>) -> result<_, string>;
+}
+
+/// Interface that the guest component must export.
+interface handler {
+    use types.{workflow-event};
+
+    on-start: func(event: workflow-event) -> result<_, string>;
+    on-message: func(event: workflow-event) -> result<_, string>;
+    on-complete: func(event: workflow-event) -> result<_, string>;
+    on-error: func(pid: string, error: string) -> result<_, string>;
+}

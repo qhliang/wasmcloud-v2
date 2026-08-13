@@ -25,6 +25,7 @@ mod telegram;
 mod templates;
 mod wechat;
 mod event_monitor;
+mod workflow;
 
 use bindings::wasi::logging::logging::{Level, log};
 use wstd::http::{Body, Request, Response, StatusCode};
@@ -166,6 +167,28 @@ impl bindings::exports::custom::event_monitor::handler::Guest for CustomHandler 
         Ok(())
     }
 }
+
+impl bindings::exports::custom::workflow::handler::Guest for CustomHandler {
+    fn on_start(event: bindings::custom::workflow::types::WorkflowEvent) -> Result<(), String> {
+        log(Level::Info, LOG_CTX, &format!("WF ON_START: pid={}, type={}, state={}, name={}", event.pid, event.event_type, event.state, event.name));
+        Ok(())
+    }
+
+    fn on_message(event: bindings::custom::workflow::types::WorkflowEvent) -> Result<(), String> {
+        log(Level::Info, LOG_CTX, &format!("WF ON_MSG: pid={}, type={}, state={}, name={}", event.pid, event.event_type, event.state, event.name));
+        Ok(())
+    }
+
+    fn on_complete(event: bindings::custom::workflow::types::WorkflowEvent) -> Result<(), String> {
+        log(Level::Info, LOG_CTX, &format!("WF ON_COMPLETE: pid={}, type={}, state={}, name={}", event.pid, event.event_type, event.state, event.name));
+        Ok(())
+    }
+
+    fn on_error(pid: String, error: String) -> Result<(), String> {
+        log(Level::Info, LOG_CTX, &format!("WF ON_ERROR: pid={}, error={}", pid, error));
+        Ok(())
+    }
+}
 #[wstd::http_server]
 async fn main(req: Request<Body>) -> anyhow::Result<Response<Body>> {
     let path = req.uri().path();
@@ -285,6 +308,10 @@ async fn main(req: Request<Body>) -> anyhow::Result<Response<Body>> {
         "/event-monitor/unwatch" => event_monitor::unwatch_resources(req).await,
         "/event-monitor/log/clear" => event_monitor::clear_log(req).await,
         "/event-monitor/log" => event_monitor::get_log(req).await,
+        "/workflow" | "/workflow/" => workflow::home(req).await,
+        "/workflow/start" => workflow::start(req).await,
+        "/workflow/list" => workflow::list(req).await,
+        "/workflow/status" => workflow::status(req).await,
         _ => {
             log(Level::Debug, LOG_CTX, &format!("Not found: {}", path));
 

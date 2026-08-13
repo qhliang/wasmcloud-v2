@@ -287,6 +287,11 @@ impl CliCommand for DevCommand {
             host_builder.with_plugin(Arc::new(custom_plugin_event_monitor::EventMonitor::new()))?;
         debug!("Event monitor plugin enabled");
 
+        // Enable workflow plugin
+        host_builder =
+            host_builder.with_plugin(Arc::new(custom_plugin_workflow::WorkflowPlugin::new()))?;
+        debug!("Workflow plugin enabled");
+
         // Add postgres plugin if configured
         if let Some(postgres_url) = &dev_config.postgres_url {
             host_builder = host_builder.with_plugin(Arc::new(

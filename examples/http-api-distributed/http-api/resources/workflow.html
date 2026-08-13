@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Workflow</title>
+        <style>
+            {BASE_CSS}
+            textarea { font-family: monospace; font-size: 13px; min-height: 200px; }
+            table { width: 100%; border-collapse: collapse; font-size: 13px; }
+            th, td { padding: 6px 10px; text-align: left; border-bottom: 1px solid #ddd; }
+            th { background: #f5f5f5; }
+            .proc-row { cursor: pointer; }
+            .proc-row:hover { background: #e8f0fe; }
+            #statusResult pre { background: #1e1e1e; color: #d4d4d4; padding: 12px; border-radius: 6px; font-size: 13px; overflow-x: auto; }
+        </style>
+    </head>
+    <body>
+        <h1>Workflow Engine</h1>
+        {NAV}
+
+        <div class="section">
+            <h2>Workflow Definition (YAML)</h2>
+            <textarea id="wfDef">id: my-workflow
+name: demo
+ver: "0.1.0"
+steps:
+  - id: step1
+    name: First Step
+    acts:
+      - id: act1
+        name: Print Message
+        uses: acts.core.msg
+        with:
+          message: Hello from workflow!</textarea>
+        </div>
+
+        <div class="section">
+            <h2>Initial Variables</h2>
+            <div id="varInputs">
+                <div style="display:flex; gap:8px; margin-bottom:4px">
+                    <input type="text" placeholder="key" class="var-key" style="flex:1" />
+                    <input type="text" placeholder="value" class="var-val" style="flex:1" />
+                    <button onclick="addVarRow()" class="secondary" type="button">+</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <button id="startBtn" onclick="startWorkflow()">Start Workflow</button>
+            <span id="startStatus" style="margin-left: 10px; font-size: 13px"></span>
+            <button onclick="listProcesses()" class="secondary" style="margin-left: 16px">List Processes</button>
+        </div>
+
+        <div class="section" id="processListSection" style="display:none">
+            <h2>Processes</h2>
+            <table><thead><tr><th>PID</th><th>Model</th><th>State</th><th>Start</th><th>End</th></tr></thead><tbody id="procTableBody"></tbody></table>
+        </div>
+
+        <div class="section" id="statusResult" style="display:none">
+            <h2>Process Detail</h2>
+            <pre id="statusPre"></pre>
+        </div>
+
+        <script>
+            function show(id, text, isError) {
+                var el = document.getElementById(id);
+                el.textContent = text;
+                el.style.color = isError ? "#f14c4c" : "#4ec9b0";
+            }
+
+            function addVarRow() {
+                var row = document.createElement("div");
+                row.style.display = "flex";
+                row.style.gap = "8px";
+                row.style.marginBottom = "4px";
+                row.innerHTML = '<input type="text" placeholder="key" class="var-key" style="flex:1" />'
+                    + '<input type="text" placeholder="value" class="var-val" style="flex:1" />'
+                    + '<button onclick="this.parentElement.remove()" class="secondary" type="button">-</button>';
+                document.getElementById("varInputs").appendChild(row);
+            }
+
+            function getVars() {
+                var vars = [];
+                document.querySelectorAll("#varInputs > div:not(:first-child)").forEach(function(row) {
+                    var key = row.querySelector(".var-key").value.trim();
+                    var val = row.querySelector(".var-val").value.trim();
+                    if (key) vars.push({ key: key, value: val });
+                });
+                return vars;
+            }
+
+            function startWorkflow() {
+                var def = document.getElementById("wfDef").value.trim();
+                if (!def) { show("startStatus", "Enter workflow definition", true); return; }
+
+                var btn = document.getElementById("startBtn");
+                btn.disabled = true;
+                btn.textContent = "Starting...";
+
+                fetch("/workflow/start", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        "workflow-def": def,
+                        vars: getVars(),
+                    }),
+                })
+                .then(function(r) { return r.json().then(function(j) { return { ok: r.ok, data: j }; }).catch(function() { return { ok: r.ok, text: "parse error" }; }); })
+                .then(function(r) {
+                    if (r.ok) {
+                        show("startStatus", "Started: pid=" + r.data.pid, false);
+                        listProcesses();
+                    } else {
+                        show("startStatus", "Error", true);
+                    }
+                })
+                .catch(function(e) { show("startStatus", e.message, true); })
+                .finally(function() { btn.disabled = false; btn.textContent = "Start Workflow"; });
+            }
+
+            function listProcesses() {
+                fetch("/workflow/list")
+                    .then(function(r) { return r.json(); })
+                    .then(function(data) {
+                        var section = document.getElementById("processListSection");
+                        var tbody = document.getElementById("procTableBody");
+                        if (data.processes.length === 0) {
+                            section.style.display = "none";
+                            return;
+                        }
+                        section.style.display = "";
+                        var html = "";
+                        data.processes.forEach(function(p) {
+                            var start = new Date(Number(p.start_time) / 1000).toLocaleString();
+                            var end = p.end_time > 0 ? new Date(Number(p.end_time) / 1000).toLocaleString() : "-";
+                            html += '<tr class="proc-row" onclick="showStatus(\'' + p.pid + '\')">'
+                                + '<td>' + p.pid + '</td>'
+                                + '<td>' + p.mid + '</td>'
+                                + '<td>' + p.state + '</td>'
+                                + '<td>' + start + '</td>'
+                                + '<td>' + end + '</td>'
+                                + '</tr>';
+                        });
+                        tbody.innerHTML = html;
+                    })
+                    .catch(function(e) { console.error(e); });
+            }
+
+            function showStatus(pid) {
+                fetch("/workflow/status", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ pid: pid }),
+                })
+                    .then(function(r) { return r.json(); })
+                    .then(function(data) {
+                        document.getElementById("statusResult").style.display = "";
+                        document.getElementById("statusPre").textContent = JSON.stringify(data, null, 2);
+                    })
+                    .catch(function(e) {
+                        document.getElementById("statusResult").style.display = "";
+                        document.getElementById("statusPre").textContent = "Error: " + e.message;
+                    });
+            }
+        </script>
+    </body>
+</html>
