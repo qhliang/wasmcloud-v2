@@ -15,8 +15,8 @@ use kube::{
     Api, Client as KubeClient, Config as KubeConfig,
     api::DynamicObject,
     core::GroupVersionKind,
-    discovery::{Discovery, verbs},
-    runtime::watcher::{self, watcher as watch, Event as WatchEvent},
+    discovery::{Discovery, Scope, verbs},
+    runtime::watcher::{self, Event as WatchEvent, watcher as watch},
 };
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -70,12 +70,16 @@ pub struct EventMonitor {
 }
 
 impl Default for EventMonitor {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EventMonitor {
     pub fn new() -> Self {
-        Self { tracker: Arc::new(RwLock::new(WorkloadTracker::default())) }
+        Self {
+            tracker: Arc::new(RwLock::new(WorkloadTracker::default())),
+        }
     }
 
     /// Start a background serial consumer that reads from `event_rx` and
@@ -125,11 +129,11 @@ impl EventMonitor {
                     ev = stream.next() => match ev {
                         Some(Ok(e)) => {
                             // Evaluate jsonlogic condition on the host side
-                            if let Some(ref cond) = condition {
-                                if !evaluate_condition_for_event(cond, &e) {
-                                    debug!(component_id = %component_id, gvk = %gvk_str, id = %id, "Event filtered by condition");
-                                    continue;
-                                }
+                            if let Some(ref cond) = condition
+                                && !evaluate_condition_for_event(cond, &e)
+                            {
+                                debug!(component_id = %component_id, gvk = %gvk_str, id = %id, "Event filtered by condition");
+                                continue;
                             }
                             let _ = event_tx.send(QueuedEvent {
                                 id: id.clone(),
@@ -157,7 +161,10 @@ fn parse_condition(raw: &str) -> Option<serde_json::Value> {
 }
 
 /// Evaluate a jsonlogic condition against a K8s watch event.
-fn evaluate_condition_for_event(condition: &serde_json::Value, event: &WatchEvent<DynamicObject>) -> bool {
+fn evaluate_condition_for_event(
+    condition: &serde_json::Value,
+    event: &WatchEvent<DynamicObject>,
+) -> bool {
     let obj = match event {
         WatchEvent::Apply(o) | WatchEvent::InitApply(o) | WatchEvent::Delete(o) => o,
         _ => return false,
@@ -198,7 +205,9 @@ async fn dispatch_event(
     let (action, obj) = match event {
         WatchEvent::Apply(p) | WatchEvent::InitApply(p) => (EventAction::Applied, p),
         WatchEvent::Delete(p) => (EventAction::Deleted, p),
-        WatchEvent::Init | WatchEvent::InitDone => { return; }
+        WatchEvent::Init | WatchEvent::InitDone => {
+            return;
+        }
     };
 
     let k8s = K8sEvent {
@@ -229,7 +238,11 @@ async fn dispatch_event(
         return;
     };
 
-    match proxy.custom_event_monitor_handler().call_handle_event(&mut store, id, &k8s).await {
+    match proxy
+        .custom_event_monitor_handler()
+        .call_handle_event(&mut store, id, &k8s)
+        .await
+    {
         Ok(Ok(())) => debug!(component_id = %component_id, id = %id, "Event handled"),
         Ok(Err(e)) => warn!(component_id = %component_id, id = %id, error = %e, "Handler error"),
         Err(e) => warn!(component_id = %component_id, id = %id, error = %e, "Call failed"),
@@ -247,8 +260,11 @@ fn cancel_all_watchers(data: &mut ComponentData) {
 // ---------------------------------------------------------------------------
 
 impl bindings::custom::event_monitor::watcher::Host for ActiveCtx<'_> {
-
-    async fn create(&mut self, api_server_url: String, token: String) -> wasmtime::Result<Result<(), String>> {
+    async fn create(
+        &mut self,
+        api_server_url: String,
+        token: String,
+    ) -> wasmtime::Result<Result<(), String>> {
         let Ok(plugin) = self.try_get_plugin::<EventMonitor>(PLUGIN_ID) else {
             return Ok(Err("plugin not available".into()));
         };
@@ -258,7 +274,9 @@ impl bindings::custom::event_monitor::watcher::Host for ActiveCtx<'_> {
             .map_err(|e| wasmtime::Error::msg(format!("config: {e}")))?;
         let client = KubeClient::try_from(kcfg)
             .map_err(|e| wasmtime::Error::msg(format!("connect: {e}")))?;
-        client.apiserver_version().await
+        client
+            .apiserver_version()
+            .await
             .map_err(|e| wasmtime::Error::msg(format!("unreachable: {e}")))?;
 
         let mut lock = plugin.tracker.write().await;
@@ -272,7 +290,9 @@ impl bindings::custom::event_monitor::watcher::Host for ActiveCtx<'_> {
         Ok(Ok(()))
     }
 
-    async fn list_all_resources(&mut self) -> wasmtime::Result<Result<Vec<WatchableResource>, String>> {
+    async fn list_all_resources(
+        &mut self,
+    ) -> wasmtime::Result<Result<Vec<WatchableResource>, String>> {
         let Ok(plugin) = self.try_get_plugin::<EventMonitor>(PLUGIN_ID) else {
             return Ok(Err("plugin not available".into()));
         };
@@ -280,12 +300,18 @@ impl bindings::custom::event_monitor::watcher::Host for ActiveCtx<'_> {
 
         let client = {
             let lock = plugin.tracker.read().await;
-            let Some(data) = lock.get_component_data(&cid) else { return Ok(Err("not tracked".into())); };
-            let Some(c) = data.client.clone() else { return Ok(Err("not connected".into())); };
+            let Some(data) = lock.get_component_data(&cid) else {
+                return Ok(Err("not tracked".into()));
+            };
+            let Some(c) = data.client.clone() else {
+                return Ok(Err("not connected".into()));
+            };
             c
         };
 
-        let discovery = Discovery::new(client).run().await
+        let discovery = Discovery::new(client)
+            .run()
+            .await
             .map_err(|e| wasmtime::Error::msg(format!("discovery: {e}")))?;
 
         let mut resources = Vec::new();
@@ -306,7 +332,10 @@ impl bindings::custom::event_monitor::watcher::Host for ActiveCtx<'_> {
         Ok(Ok(resources))
     }
 
-    async fn watch_resources(&mut self, rules: Vec<WatchRule>) -> wasmtime::Result<Result<(), String>> {
+    async fn watch_resources(
+        &mut self,
+        rules: Vec<WatchRule>,
+    ) -> wasmtime::Result<Result<(), String>> {
         if rules.is_empty() {
             return Ok(Err("no rules provided".into()));
         }
@@ -326,9 +355,15 @@ impl bindings::custom::event_monitor::watcher::Host for ActiveCtx<'_> {
 
         let (client, wl) = {
             let lock = plugin.tracker.read().await;
-            let Some(data) = lock.get_component_data(&cid) else { return Ok(Err("not tracked".into())); };
-            let Some(c) = data.client.clone() else { return Ok(Err("not connected".into())); };
-            let Some(w) = data.workload.clone() else { return Ok(Err("no workload".into())); };
+            let Some(data) = lock.get_component_data(&cid) else {
+                return Ok(Err("not tracked".into()));
+            };
+            let Some(c) = data.client.clone() else {
+                return Ok(Err("not connected".into()));
+            };
+            let Some(w) = data.workload.clone() else {
+                return Ok(Err("no workload".into()));
+            };
             (c, w)
         };
 
@@ -345,12 +380,16 @@ impl bindings::custom::event_monitor::watcher::Host for ActiveCtx<'_> {
         // Start a fresh serial consumer
         let child = {
             let lock = plugin.tracker.read().await;
-            let Some(data) = lock.get_component_data(&cid) else { return Ok(Err("not tracked".into())); };
+            let Some(data) = lock.get_component_data(&cid) else {
+                return Ok(Err("not tracked".into()));
+            };
             data.cancel_token.child_token()
         };
         EventMonitor::start_event_consumer(wl, cid.clone(), child, rx);
 
-        let discovery = Discovery::new(client.clone()).run().await
+        let discovery = Discovery::new(client.clone())
+            .run()
+            .await
             .map_err(|e| wasmtime::Error::msg(format!("discovery: {e}")))?;
 
         for rule in &rules {
@@ -372,10 +411,18 @@ impl bindings::custom::event_monitor::watcher::Host for ActiveCtx<'_> {
             }
 
             let condition = parse_condition(&rule.condition);
-            let api = Api::<DynamicObject>::all_with(client.clone(), &ar);
+            let api = if let Some(ns) = rule.namespace.as_deref().filter(|ns| !ns.is_empty())
+                && caps.scope == Scope::Namespaced
+            {
+                Api::<DynamicObject>::namespaced_with(client.clone(), ns, &ar)
+            } else {
+                Api::<DynamicObject>::all_with(client.clone(), &ar)
+            };
             let child = {
                 let lock = plugin.tracker.read().await;
-                let Some(data) = lock.get_component_data(&cid) else { break; };
+                let Some(data) = lock.get_component_data(&cid) else {
+                    break;
+                };
                 data.cancel_token.child_token()
             };
 
@@ -391,7 +438,9 @@ impl bindings::custom::event_monitor::watcher::Host for ActiveCtx<'_> {
 
             let mut lock = plugin.tracker.write().await;
             if let Some(data) = lock.get_component_data_mut(&cid) {
-                data.watchers.push(WatcherState { cancel_token: child });
+                data.watchers.push(WatcherState {
+                    cancel_token: child,
+                });
             }
 
             info!(component_id = %cid, gvk = %gvk_str, id = %rule.id, "Watcher created");
@@ -424,47 +473,87 @@ impl<'a> bindings::custom::event_monitor::types::Host for ActiveCtx<'a> {}
 
 #[async_trait]
 impl HostPlugin for EventMonitor {
-    fn id(&self) -> &'static str { PLUGIN_ID }
+    fn id(&self) -> &'static str {
+        PLUGIN_ID
+    }
 
     fn world(&self) -> wash_runtime::wit::WitWorld {
         wash_runtime::wit::WitWorld {
-            imports: HashSet::from([WitInterface::from("custom:event-monitor/watcher,types@0.1.0")]),
+            imports: HashSet::from([WitInterface::from(
+                "custom:event-monitor/watcher,types@0.1.0",
+            )]),
             exports: HashSet::from([WitInterface::from("custom:event-monitor/handler@0.1.0")]),
         }
     }
 
-    async fn on_workload_item_bind<'a>(&self, item: &mut WorkloadItem<'a>, interfaces: WitInterfaces<'_>) -> anyhow::Result<()> {
-        if interfaces.get("custom", "event-monitor", &[]).is_none() { return Ok(()); }
+    async fn on_workload_item_bind<'a>(
+        &self,
+        item: &mut WorkloadItem<'a>,
+        interfaces: WitInterfaces<'_>,
+    ) -> anyhow::Result<()> {
+        if interfaces.get("custom", "event-monitor", &[]).is_none() {
+            return Ok(());
+        }
 
-        bindings::custom::event_monitor::types::add_to_linker::<_, SharedCtx>(item.linker(), extract_active_ctx)?;
-        bindings::custom::event_monitor::watcher::add_to_linker::<_, SharedCtx>(item.linker(), extract_active_ctx)?;
+        bindings::custom::event_monitor::types::add_to_linker::<_, SharedCtx>(
+            item.linker(),
+            extract_active_ctx,
+        )?;
+        bindings::custom::event_monitor::watcher::add_to_linker::<_, SharedCtx>(
+            item.linker(),
+            extract_active_ctx,
+        )?;
 
-        let WorkloadItem::Component(ch) = item else { return Ok(()); };
+        let WorkloadItem::Component(ch) = item else {
+            return Ok(());
+        };
 
         debug!(component_id = ch.id(), "EventMonitor bound");
-        self.tracker.write().await.add_component(ch, ComponentData {
-            cancel_token: CancellationToken::new(),
-            workload: None,
-            client: None,
-            watchers: Vec::new(),
-            event_tx: None,
-        });
+        self.tracker.write().await.add_component(
+            ch,
+            ComponentData {
+                cancel_token: CancellationToken::new(),
+                workload: None,
+                client: None,
+                watchers: Vec::new(),
+                event_tx: None,
+            },
+        );
         Ok(())
     }
 
-    async fn on_workload_resolved(&self, workload: &ResolvedWorkload, component_id: &str) -> anyhow::Result<()> {
-        if let Some(data) = self.tracker.write().await.get_component_data_mut(component_id) {
+    async fn on_workload_resolved(
+        &self,
+        workload: &ResolvedWorkload,
+        component_id: &str,
+    ) -> anyhow::Result<()> {
+        if let Some(data) = self
+            .tracker
+            .write()
+            .await
+            .get_component_data_mut(component_id)
+        {
             data.workload = Some(workload.clone());
         }
         Ok(())
     }
 
-    async fn on_workload_unbind(&self, workload_id: &str, _interfaces: WitInterfaces<'_>) -> anyhow::Result<()> {
-        self.tracker.write().await.remove_workload_with_cleanup(
-            workload_id,
-            |_| async {},
-            |mut data: ComponentData| async move { cancel_all_watchers(&mut data); },
-        ).await;
+    async fn on_workload_unbind(
+        &self,
+        workload_id: &str,
+        _interfaces: WitInterfaces<'_>,
+    ) -> anyhow::Result<()> {
+        self.tracker
+            .write()
+            .await
+            .remove_workload_with_cleanup(
+                workload_id,
+                |_| async {},
+                |mut data: ComponentData| async move {
+                    cancel_all_watchers(&mut data);
+                },
+            )
+            .await;
         Ok(())
     }
 }
@@ -474,18 +563,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_plugin_id() { assert_eq!(EventMonitor::new().id(), PLUGIN_ID); }
+    fn test_plugin_id() {
+        assert_eq!(EventMonitor::new().id(), PLUGIN_ID);
+    }
 
     #[test]
     fn test_world_imports() {
         let w = EventMonitor::new().world();
-        assert!(w.imports.iter().any(|i| i.namespace == "custom" && i.package == "event-monitor"));
+        assert!(
+            w.imports
+                .iter()
+                .any(|i| i.namespace == "custom" && i.package == "event-monitor")
+        );
     }
 
     #[test]
     fn test_world_exports() {
         let w = EventMonitor::new().world();
-        assert!(w.exports.iter().any(|i| i.namespace == "custom" && i.package == "event-monitor"));
+        assert!(
+            w.exports
+                .iter()
+                .any(|i| i.namespace == "custom" && i.package == "event-monitor")
+        );
     }
 
     #[test]

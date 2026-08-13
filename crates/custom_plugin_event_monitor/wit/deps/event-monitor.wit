@@ -28,6 +28,8 @@ interface types {
         /// Unique identifier for this rule, used in handle-event callbacks.
         id: string,
         res: watchable-resource,
+        /// Optional namespace scope. Empty = watch across all namespaces.
+        namespace: option<string>,
         /// JSONLogic condition string (serialized JSON). Empty = always match.
         condition: string,
     }
