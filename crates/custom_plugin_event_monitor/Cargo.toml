@@ -12,6 +12,9 @@ path = "src/lib.rs"
 [lints]
 workspace = true
 
+[package.metadata.cargo-machete]
+ignored = ["k8s-openapi"]
+
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }

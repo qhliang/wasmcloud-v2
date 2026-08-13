@@ -144,6 +144,6 @@ watcher::unwatch_resources()?;
 | Crate | 用途 |
 |------|------|
 | `kube` + `kube-runtime` | K8s API 客户端和 watcher |
-| `k8s-openapi` | K8s 资源类型定义 |
+| `k8s-openapi` | K8s 资源类型定义（供 `kube` 使用，需启用版本 feature） |
 | `tokio` + `tokio-util` | 异步运行时和 `CancellationToken` |
 | `futures` | `StreamExt` 用于 watcher 流 |
