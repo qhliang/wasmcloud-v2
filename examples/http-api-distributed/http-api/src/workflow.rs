@@ -103,6 +103,6 @@ pub async fn status(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
             })
             .to_string(),
         ),
-        Err(e) => helpers::json_error(StatusCode::NOT_FOUND, &format!("{e}")),
+        Err(e) => helpers::json_error(StatusCode::NOT_FOUND, &e.to_string()),
     }
 }
