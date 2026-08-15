@@ -13,8 +13,8 @@ cargo build                                # 构建 wash CLI（默认 workspace 
 cargo build --workspace                    # 构建所有 workspace crate
 cargo build --release                      # Release 构建
 cargo test --workspace                     # 运行所有 crate 测试
-cargo test -p wash-runtime --features wasip3  # CI 必跑
-cargo clippy --workspace --features wasip3    # CI lint 命令
+cargo test -p wash-runtime --features wasi-tls,host-component-plugins  # CI 必跑
+cargo clippy --workspace --features wasi-tls,host-component-plugins    # CI lint 命令
 cargo +nightly fmt -- --check              # 代码格式检查
 cargo machete                              # 未使用依赖检查
 ```
@@ -29,7 +29,7 @@ cargo machete                              # 未使用依赖检查
 - `crates/custom_plugin_*` — 宿主端插件，编译进宿主二进制：
   - 存储/基础设施：`kv`, `blobstore`, `cf_d1`, `nats_utils`, `event_monitor`
   - LLM/通信：`llm_gateway_provider`, `mail`, `codex`
-  - 调度：`crontab`
+  - 调度：`crontab`, `workflow`
   - IM：`dingtalk_stream`, `feishu`, `wechat`, `telegram`
 - `crates/wash-runtime/src/plugin/mod.rs` — `HostPlugin` trait 定义
 - `crates/wash/src/cli/host.rs` — host 模式插件注册
@@ -65,10 +65,11 @@ cargo machete                              # 未使用依赖检查
 
 - 格式：`<type>: <description>`，类型：`feat` / `fix` / `docs` / `style` / `refactor` / `test` / `chore`
 - **禁止自动 push** — push 前必须征得用户明确同意
+- **更新代码后需同步更新 `AGENTS.md`** — 若改动影响构建命令、feature 标志、仓库结构、插件清单或代码规范，应同步更新本文件
 - commit 前必须执行（全 workspace 范围，不可用 `-p` 缩小）：
-  1. `cargo test --workspace` + `cargo test -p wash-runtime --features wasip3`
+  1. `cargo test --workspace` + `cargo test -p wash-runtime --features wasi-tls,host-component-plugins`
   2. `cargo +nightly fmt -- --check`
-  3. `cargo clippy --workspace --features wasip3`
+  3. `cargo clippy --workspace --features wasi-tls,host-component-plugins`
   4. `cargo machete`
 
 ## http-api-distributed example 编译
