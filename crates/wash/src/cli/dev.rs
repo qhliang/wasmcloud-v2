@@ -771,7 +771,7 @@ fn build_workload_host_interfaces(
                 .find(|i| i.instance() == interface.instance())
             {
                 Some(existing) => {
-                    existing.merge(&interface);
+                    existing.merge(interface);
                 }
                 None => base.push(interface.clone()),
             }
