@@ -62,13 +62,13 @@ fn workspace_dir() -> Result<PathBuf> {
 /// directly, `P3` builds a core module that we wrap with the WASI reactor
 /// adapter to produce a component.
 #[derive(Copy, Clone)]
-enum FixtureKind {
+pub(crate) enum FixtureKind {
     P2,
     P3,
 }
 
 impl FixtureKind {
-    fn target(self) -> &'static str {
+    pub(crate) fn target(self) -> &'static str {
         match self {
             FixtureKind::P2 => "wasm32-wasip2",
             FixtureKind::P3 => "wasm32-wasip1",
@@ -89,13 +89,18 @@ const P2_FIXTURES: &[&str] = &[
     "inter-component-call-callee",
     "inter-component-call-middleware",
     "http-allowed-hosts",
+    "http-egress-pool",
+    "http-ip-name-lookup",
     "keyvalue-counter",
     "keyvalue-implements",
     "postgres-implements",
 ];
 
 const P3_FIXTURES: &[&str] = &[
+    "messaging-echo-p3",
+    "messaging-dual-handler",
     "http-handler-p3",
+    "http-ip-name-lookup-p3",
     "http-blobstore-p3",
     "cli-service-p3",
     "socket-test-p3",
@@ -116,12 +121,26 @@ const P3_FIXTURES: &[&str] = &[
     "keyvalue-default-p3",
     "postgres-stream-p3",
     "svc-counter",
+    "svc-http-proxy",
+    "svc-tcp-echo",
+    "http-loopback-gateway",
+    "svc-no-run",
+    "http-sleeper",
     "msg-counter",
     "bridge-backend",
     "bridge-service",
     "http-webgpu",
     "kv-plugin",
     "kv-plugin-caller",
+    "kv-plugin-service",
+    "badlifecycle",
+    "secrets-caller",
+    "secrets-consumer-plugin",
+    "secrets-consumer-plugin-caller",
+    "http-egress-plugin",
+    "http-egress-plugin-caller",
+    "events-plugin",
+    "events-caller",
 ];
 
 fn build_fixtures(workspace: &Path) -> Result<()> {

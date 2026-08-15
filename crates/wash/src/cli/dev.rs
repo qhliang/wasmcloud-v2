@@ -13,6 +13,7 @@ use wash_runtime::{
     engine::{Engine, WasmProposal},
     host::{Host, HostApi},
     observability::Meters,
+    oci::OciConfig,
     plugin::{self},
     types::{
         Component, HostPathVolume, LocalResources, Service, Volume, VolumeMount, VolumeType,
@@ -22,7 +23,10 @@ use wash_runtime::{
 };
 
 use crate::{
-    cli::{CliCommand, CliContext, CommandOutput, component_build::build_dev_component},
+    cli::{
+        CliCommand, CliContext, CommandOutput, component_build::build_dev_component,
+        oci::OCI_CACHE_DIR,
+    },
     config::{Config, load_config},
     wit::WitConfig,
     workload::{ResolvedWorkload, resolve_component_workload, resolve_workload},
@@ -58,6 +62,13 @@ impl CliCommand for DevCommand {
 
         let dev_config = config.dev();
 
+        // Shared by every image source a dev session can name: the dev
+        // component's sidecars, its service, and the host component plugins.
+        // Cached under the same directory `wash oci pull` uses, so a pull here
+        // is a pull there.
+        let mut oci_config = OciConfig::new_with_cache(ctx.cache_dir().join(OCI_CACHE_DIR));
+        oci_config.insecure = dev_config.allow_insecure_registries;
+
         let http_addr = dev_config
             .address
             .clone()
@@ -75,7 +86,7 @@ impl CliCommand for DevCommand {
         let engine = engine_builder.build()?;
 
         let mut host_builder = Host::builder()
-            .with_engine(engine)
+            .with_engine(engine.clone())
             .with_meters(Meters::new(ctx.enable_meters()));
 
         // Enable wasi config. `copy_environment = true` surfaces each
@@ -88,12 +99,115 @@ impl CliCommand for DevCommand {
                 .build(),
         ))?;
 
-        // Add blobstore plugin (multi-backend: memory, filesystem, S3, WebDAV, FTP, NATS)
+        // `wasmcloud:secrets`, served from each workload's bind-time
+        // `secretFrom`-resolved config, same as `wash host`.
+        host_builder = host_builder
+            .with_plugin(Arc::new(plugin::wasmcloud_secrets::WasmcloudSecrets::new()))?;
+
+        // Shared data-plane NATS connection, mirroring `wash host`
+        // `--data-nats-url`. When `dev.data_nats_url` is set it backs
+        // blobstore, keyvalue, and messaging unless a per-plugin config overrides
+        // it. Connected once and shared across the three plugins.
+        // Through `washlet::connect_nats` rather than `async_nats::connect`, so
+        // dev installs the same event callback `wash host` does. `SlowConsumer`
+        // is the only signal that a subscription buffer overflowed and dropped
+        // messages; without the callback dev is the one place that failure stays
+        // silent, which is exactly backwards for the command people reproduce
+        // messaging problems in.
+        let data_nats_client = if let Some(url) = &dev_config.data_nats_url {
+            let client = wash_runtime::washlet::connect_nats(
+                url.as_str(),
+                wash_runtime::washlet::NatsConnectionOptions::default(),
+            )
+            .await
+            .context("failed to connect to NATS for dev.data_nats_url")?;
+            Some(Arc::new(client))
+        } else {
+            None
+        };
+
+        // One set of messaging ceilings for the dev host, derived from the pool
+        // the engine above actually installed — same construction as `wash
+        // host`, so a limit reproduced in dev is the limit production applies.
+        // Dev takes no messaging flags, hence `None` for both knobs.
+        let messaging_limits =
+            crate::config::wasmcloud_messaging_limits(None, None, engine.total_core_instances())?;
+
+        // Enable wasmcloud:messaging — NATS when data_nats_url is configured,
+        // otherwise the in-memory backend.
+        if let Some(client) = &data_nats_client {
+            host_builder = host_builder.with_plugin(Arc::new(
+                plugin::wasmcloud_messaging::NatsMessaging::with_limits(
+                    client.clone(),
+                    messaging_limits.clone(),
+                ),
+            ))?;
+            debug!("wasmcloud:messaging plugin registered with NATS backend (data_nats_url)");
+        } else {
+            host_builder = host_builder.with_plugin(Arc::new(
+                plugin::wasmcloud_messaging::InMemoryMessaging::with_limits(
+                    messaging_limits.clone(),
+                ),
+            ))?;
+            debug!("wasmcloud:messaging plugin registered with in-memory backend");
+        }
+
+        // Per-plugin settings override the in-memory default. The order of precedence is:
+        // use a filesystem backend if there is a path override,
+        // otherwise it uses NATS if `data_nats_url` is set, otherwise it falls back to
+        // the in-memory plugin.
+        if let Some(blobstore_path) = &dev_config.wasi_blobstore_path {
+            host_builder = host_builder.with_plugin(Arc::new(
+                plugin::wasi_blobstore::FilesystemBlobstore::new(blobstore_path.clone()),
+            ))?;
+            debug!(
+                path = %blobstore_path.display(),
+                "WASI Blobstore plugin registered with filesystem backend"
+            );
+        } else if let Some(client) = &data_nats_client {
+            host_builder = host_builder
+                .with_plugin(Arc::new(plugin::wasi_blobstore::NatsBlobstore::new(client)))?;
+            debug!("WASI Blobstore plugin registered with NATS backend (data_nats_url)");
+        } else {
+            host_builder = host_builder.with_plugin(Arc::new(
+                plugin::wasi_blobstore::InMemoryBlobstore::default(),
+            ))?;
+            debug!("WASI Blobstore plugin registered with in-memory backend");
+        }
+
+        #[cfg(not(feature = "host-component-plugins"))]
+        ensure!(
+            dev_config.host_plugins.is_empty(),
+            "dev.host_plugins requires a wash build with the `host-component-plugins` feature"
+        );
 
         let http_handler = wash_runtime::host::http::DevRouter::default();
+
+        // One registry for every surface: HTTP pool, raw sockets, inbound
+        // published ports.
+        let quotas = dev_config.connection_quotas()?;
+
+        // Outbound (egress) trust roots for the component's outgoing HTTPS
+        // calls. Distinct from `tls_*_path` below, which configure the ingress
+        // HTTP server.
+        let outgoing_handler = wash_runtime::host::http::DefaultOutgoingHandler::from_tls_options(
+            wash_runtime::host::http_client::ClientTlsOptions {
+                roots: dev_config.http_client_trust_roots.into(),
+                extra_ca_paths: dev_config.http_client_ca_paths.clone(),
+            },
+        )
+        .context("failed to load dev.http_client_ca_paths CA certificates")?
+        // The same registry the socket policy uses, so a component's HTTP
+        // pool and its raw sockets share one configured allowance.
+        .with_quotas(Arc::clone(&quotas));
+
         // TODO(#19): Only spawn the server if the component exports wasi:http
         // Configure HTTP server with optional TLS, enable HTTP Server
         let allow_insecure = dev_config.allow_outbound_http_insecure.unwrap_or(false);
+        let mut ingress_builder =
+            wash_runtime::host::http::Ingress::builder(http_handler, http_addr.parse()?)
+                .outgoing_handler(outgoing_handler)
+                .allow_outbound_http_insecure(allow_insecure);
         let protocol = if let (Some(cert_path), Some(key_path)) =
             (&dev_config.tls_cert_path, &dev_config.tls_key_path)
         {
@@ -120,27 +234,16 @@ impl CliCommand for DevCommand {
             if let Some(ca) = dev_config.tls_ca_path.as_deref() {
                 tls = tls.with_ca(ca);
             }
-            let http_server =
-                wash_runtime::host::http::HttpServer::builder(http_handler, http_addr.parse()?)
-                    .tls(tls)
-                    .allow_outbound_http_insecure(allow_insecure)
-                    .build()
-                    .await?;
-
-            host_builder = host_builder.with_http_handler(Arc::new(http_server));
+            ingress_builder = ingress_builder.tls(tls);
 
             debug!("TLS configured - server will use HTTPS");
             "https"
         } else {
             debug!("No TLS configuration provided - server will use HTTP");
-            let http_server =
-                wash_runtime::host::http::HttpServer::builder(http_handler, http_addr.parse()?)
-                    .allow_outbound_http_insecure(allow_insecure)
-                    .build()
-                    .await?;
-            host_builder = host_builder.with_http_handler(Arc::new(http_server));
             "http"
         };
+        let ingress = ingress_builder.build().await?;
+        host_builder = host_builder.with_http_handler(Arc::new(ingress));
 
         // Add logging plugin
         host_builder =
@@ -201,45 +304,8 @@ impl CliCommand for DevCommand {
 
         #[cfg(feature = "wasm_component_model_implements")]
         {
-            host_builder = host_builder.with_plugin(Arc::new(
-                plugin::wasi_keyvalue::MultiplexedKeyValue::new()
-                    .with_provider(Arc::new(plugin::wasi_keyvalue::CloudflareKvProvider))
-                    .with_provider(Arc::new(plugin::wasi_keyvalue::InMemoryProvider))
-                    .with_provider(Arc::new(plugin::wasi_keyvalue::RedisProvider))
-                    .with_provider(Arc::new(plugin::wasi_keyvalue::NatsProvider))
-                    .with_provider(Arc::new(plugin::wasi_keyvalue::FilesystemProvider)),
-            ))?;
-            debug!("WASI KeyValue multiplexed plugin registered (implements)");
-            host_builder = host_builder.with_plugin(Arc::new(
-                plugin::wasmcloud_messaging::MultiplexedMessaging::new()
-                    .with_provider(Arc::new(plugin::wasmcloud_messaging::InMemoryMsgProvider))
-                    .with_provider(Arc::new(plugin::wasmcloud_messaging::NatsMsgProvider)),
-            ))?;
-            debug!("wasmcloud:messaging multiplexed plugin registered (implements)");
-            host_builder = host_builder.with_plugin(Arc::new(
-                plugin::wasi_blobstore::MultiplexedBlobstore::new()
-                    .with_provider(Arc::new(plugin::wasi_blobstore::OpenDalBlobProvider))
-                    .with_provider(Arc::new(plugin::wasi_blobstore::InMemoryProvider))
-                    .with_provider(Arc::new(plugin::wasi_blobstore::FilesystemProvider))
-                    .with_provider(Arc::new(plugin::wasi_blobstore::NatsBlobProvider)),
-            ))?;
-            debug!("wasi:blobstore multiplexed plugin registered (implements)");
-            host_builder = host_builder.with_plugin(Arc::new(
-                plugin::wasi_blobstore::MultiplexedAsyncBlobstore::new()
-                    .with_provider(Arc::new(plugin::wasi_blobstore::OpenDalBlobProvider))
-                    .with_provider(Arc::new(plugin::wasi_blobstore::InMemoryProvider))
-                    .with_provider(Arc::new(plugin::wasi_blobstore::FilesystemProvider))
-                    .with_provider(Arc::new(plugin::wasi_blobstore::NatsBlobProvider)),
-            ))?;
-            debug!("wasmcloud:blobstore async multiplexed plugin registered (implements)");
-            host_builder = host_builder.with_plugin(Arc::new(
-                plugin::wasi_keyvalue::MultiplexedAsyncKeyValue::new()
-                    .with_provider(Arc::new(plugin::wasi_keyvalue::InMemoryProvider))
-                    .with_provider(Arc::new(plugin::wasi_keyvalue::RedisProvider))
-                    .with_provider(Arc::new(plugin::wasi_keyvalue::NatsProvider))
-                    .with_provider(Arc::new(plugin::wasi_keyvalue::FilesystemProvider)),
-            ))?;
-            debug!("wasmcloud:keyvalue async multiplexed plugin registered (implements)");
+            host_builder = host_builder.with_multiplexed_plugins()?;
+            debug!("multiplexed plugins registered (implements)");
         }
         // Enable Cloudflare D1 plugin (always loaded by default)
         host_builder =
@@ -331,6 +397,33 @@ impl CliCommand for DevCommand {
             debug!("WASI WebGPU plugin registered");
         }
 
+        // Host component plugins: WebAssembly components that provide host
+        // capabilities, each in its own supervised store. Fetched (local file or
+        // OCI) and registered before the host starts — last, so every native
+        // plugin above is already registered and a loading plugin's own
+        // capability imports (config, secrets, keyvalue, ...) can resolve
+        // against the full native set.
+        #[cfg(feature = "host-component-plugins")]
+        {
+            let native_plugins = host_builder.native_plugins();
+            let http_handler = host_builder.http_handler();
+            for hp in &dev_config.host_plugins {
+                let spec = hp.to_spec(&config, project_dir, Some(project_dir))?;
+                let plugin = wash_runtime::plugin::component_host::load_component_plugin(
+                    &spec,
+                    &engine,
+                    oci_config.clone(),
+                    &native_plugins,
+                    http_handler.clone(),
+                    None,
+                )
+                .await
+                .with_context(|| format!("failed to load host component plugin '{}'", spec.id))?;
+                host_builder = host_builder.with_plugin(plugin)?;
+                debug!(id = %spec.id, "host component plugin registered");
+            }
+        }
+
         // Build and start the host
         let host = host_builder.build()?.start().await?;
         host.log_interfaces();
@@ -375,6 +468,7 @@ impl CliCommand for DevCommand {
             project_dir,
             wasm_bytes.into(),
             &resolved_workload,
+            &oci_config,
         )
         .await?;
         // Running workload ID for reloads
@@ -418,24 +512,34 @@ impl CliCommand for DevCommand {
 /// extracted WIT interface set, and its resolved workload values (workload
 /// base merged with the component's overrides), so the pure assembly step
 /// needs no further I/O or host calls.
-struct LoadedComponent {
+/// What `Component.pool_size` / `max_invocations` carry when `wash dev` has
+/// nothing to say about them: they are `sint32` on the wire, and the runtime
+/// reads anything that is not a positive pool size as "do not keep instances".
+const UNSET_LIMIT: i32 = -1;
+
+struct SidecarComponent {
     name: String,
     bytes: Bytes,
     interfaces: HashSet<WitInterface>,
     workload: ResolvedWorkload,
+    /// Warm-instance limits from `dev.components[].poolSize` /
+    /// `maxInvocations`, `None` where the config left them unset.
+    pool_size: Option<i32>,
+    max_invocations: Option<i32>,
+    max_concurrency: Option<i32>,
 }
 
 /// Thin wrapper around [`build_workload`]: extracts dev-component
 /// interfaces, loads sidecar bytes + interfaces, resolves each sidecar's
 /// overrides over the workload-level base, and (when configured) loads the
-/// service-file bytes. All workload-construction logic lives in
-/// `build_workload`.
+/// service bytes. All workload-construction logic lives in `build_workload`.
 async fn create_workload(
     host: &Host,
     config: &Config,
     project_dir: &Path,
     bytes: Bytes,
     resolved_workload: &ResolvedWorkload,
+    oci_config: &OciConfig,
 ) -> anyhow::Result<Workload> {
     let dev_config = config.dev();
 
@@ -445,16 +549,15 @@ async fn create_workload(
 
     let mut sidecars = Vec::with_capacity(dev_config.components.len());
     for dev_component in &dev_config.components {
-        let comp_bytes = tokio::fs::read(&dev_component.file)
+        let name = &dev_component.name;
+        let loaded = dev_component
+            .source
+            .to_source(&format!("dev.components['{name}']"))?
+            .load(oci_config.clone())
             .await
-            .with_context(|| {
-                format!(
-                    "failed to read component file at {}",
-                    dev_component.file.display()
-                )
-            })?;
+            .with_context(|| format!("dev.components['{name}']"))?;
         let interfaces = host
-            .intersect_interfaces(&comp_bytes)
+            .intersect_interfaces(&loaded.bytes)
             .context("failed to extract component interfaces")?;
         // Errors already name the component.
         let workload = resolve_component_workload(
@@ -464,27 +567,31 @@ async fn create_workload(
             project_dir,
             Some(project_dir),
         )?;
-        sidecars.push(LoadedComponent {
-            name: dev_component.name.clone(),
-            bytes: Bytes::from(comp_bytes),
+        sidecars.push(SidecarComponent {
+            name: name.clone(),
+            bytes: loaded.bytes,
             interfaces,
             workload,
+            pool_size: dev_component.pool_size,
+            max_invocations: dev_component.max_invocations,
+            max_concurrency: dev_component.max_concurrency,
         });
     }
 
-    // The service file is only deployed as a service when the dev component
+    // The configured service is only deployed as one when the dev component
     // isn't itself the service (`dev.service = false`); see `build_workload`.
-    // When `dev.service` is true the file is ignored, so there's no point
-    // reading it or folding its imports into the workload host interfaces.
-    let (service_file_bytes, service_interfaces) = match &dev_config.service_file {
-        Some(service_path) if !dev_config.service => {
-            let raw = tokio::fs::read(service_path).await.with_context(|| {
-                format!("failed to read service file at {}", service_path.display())
-            })?;
+    // When `dev.service` is true it is ignored, so there's no point fetching it
+    // or folding its imports into the workload host interfaces.
+    let (service_bytes, service_interfaces) = match dev_config.service_source()? {
+        Some(source) if !dev_config.service => {
+            let loaded = source
+                .load(oci_config.clone())
+                .await
+                .context("failed to load the dev service component")?;
             let interfaces = host
-                .intersect_interfaces(&raw)
-                .context("failed to extract service file interfaces")?;
-            (Some(Bytes::from(raw)), Some(interfaces))
+                .intersect_interfaces(&loaded.bytes)
+                .context("failed to extract service interfaces")?;
+            (Some(loaded.bytes), Some(interfaces))
         }
         _ => (None, None),
     };
@@ -494,7 +601,7 @@ async fn create_workload(
         bytes,
         dev_interfaces,
         sidecars,
-        service_file_bytes,
+        service_bytes,
         service_interfaces,
         resolved_workload,
     ))
@@ -519,8 +626,8 @@ fn build_workload(
     dev_config: &crate::config::DevConfig,
     bytes: Bytes,
     dev_interfaces: HashSet<WitInterface>,
-    sidecars: Vec<LoadedComponent>,
-    service_file_bytes: Option<Bytes>,
+    sidecars: Vec<SidecarComponent>,
+    service_bytes: Option<Bytes>,
     service_interfaces: Option<HashSet<WitInterface>>,
     resolved_workload: &ResolvedWorkload,
 ) -> Workload {
@@ -563,6 +670,8 @@ fn build_workload(
         environment: w.environment.clone(),
         config: w.config.clone(),
         allowed_hosts: w.allowed_hosts.clone().into(),
+        allowed_ip_name_lookups: w.allowed_ip_name_lookups.clone().into(),
+        allowed_host_loopback_ports: w.allowed_host_loopback_ports.clone().into(),
         ..Default::default()
     };
 
@@ -581,11 +690,12 @@ fn build_workload(
             bytes,
             digest: None,
             local_resources: local_resources_for(resolved_workload),
-            pool_size: -1,
-            max_invocations: -1,
+            pool_size: UNSET_LIMIT,
+            max_invocations: UNSET_LIMIT,
+            max_concurrency: UNSET_LIMIT,
         });
 
-        if let Some(service_bytes) = service_file_bytes {
+        if let Some(service_bytes) = service_bytes {
             service = Some(Service {
                 bytes: service_bytes,
                 digest: None,
@@ -602,8 +712,12 @@ fn build_workload(
             bytes: sidecar.bytes,
             digest: None,
             local_resources: local_resources_for(&sidecar.workload),
-            pool_size: -1,
-            max_invocations: -1,
+            // `Component` carries these as `sint32`, where a negative means
+            // "not configured"; the runtime decodes the pair into an
+            // `InstancePolicy`.
+            pool_size: sidecar.pool_size.unwrap_or(UNSET_LIMIT),
+            max_invocations: sidecar.max_invocations.unwrap_or(UNSET_LIMIT),
+            max_concurrency: sidecar.max_concurrency.unwrap_or(UNSET_LIMIT),
         });
     }
 
@@ -646,12 +760,20 @@ fn build_workload_host_interfaces(
             if interface.namespace == "wasi" && interface.package == "config" {
                 any_imports_wasi_config = true;
             }
-            if !base.iter().any(|i| {
-                i.namespace == interface.namespace
-                    && i.package == interface.package
-                    && i.name == interface.name
-            }) {
-                base.push(interface.clone());
+            // Introspection yields one `WitInterface` per imported instance
+            // (e.g. `wasmcloud:secrets/store` and `.../reveal` arrive
+            // separately). Merge by `instance()` (namespace:package[/name]@version)
+            // so distinct interface names on the same package are unioned, while
+            // named and unnamed entries of the same namespace:package stay
+            // separate (they are distinct routing instances).
+            match base
+                .iter_mut()
+                .find(|i| i.instance() == interface.instance())
+            {
+                Some(existing) => {
+                    existing.merge(&interface);
+                }
+                None => base.push(interface.clone()),
             }
         }
     }
@@ -739,6 +861,17 @@ mod tests {
         i
     }
 
+    /// Like `iface`, but with one named interface set — introspection yields
+    /// one `WitInterface` per imported instance, so e.g.
+    /// `wasmcloud:secrets/store` and `.../reveal` arrive as two separate
+    /// values with the same namespace:package, each naming only its own
+    /// interface.
+    fn iface_named(namespace: &str, package: &str, interface: &str) -> WitInterface {
+        let mut i = iface(namespace, package);
+        i.interfaces.insert(interface.into());
+        i
+    }
+
     fn find_iface<'a>(
         list: &'a [WitInterface],
         namespace: &str,
@@ -760,12 +893,15 @@ mod tests {
 
     /// A sidecar input with the given pre-merged workload values, as
     /// `create_workload` would produce it.
-    fn loaded_sidecar(name: &str, workload: ResolvedWorkload) -> LoadedComponent {
-        LoadedComponent {
+    fn loaded_sidecar(name: &str, workload: ResolvedWorkload) -> SidecarComponent {
+        SidecarComponent {
             name: name.into(),
             bytes: fake_bytes(name),
             interfaces: HashSet::new(),
             workload,
+            pool_size: None,
+            max_invocations: None,
+            max_concurrency: None,
         }
     }
 
@@ -783,6 +919,8 @@ mod tests {
             environment: HashMap::from([("LOG".into(), "debug".into())]),
             config: HashMap::from([("flag".into(), "on".into())]),
             allowed_hosts: vec!["https://api.example.com".parse().unwrap()],
+            allowed_ip_name_lookups: vec!["*".parse().unwrap()],
+            allowed_host_loopback_ports: vec![],
         };
         let dev_cfg = DevConfig {
             components: vec![dev_component_named("sidecar-a")],
@@ -807,6 +945,10 @@ mod tests {
             &dev.local_resources.allowed_hosts[..],
             &["https://api.example.com".parse().unwrap()]
         );
+        assert_eq!(
+            &dev.local_resources.allowed_ip_name_lookups[..],
+            &["*".parse().unwrap()]
+        );
 
         let sidecar = find_component(&workload, "sidecar-a").unwrap();
         assert_eq!(
@@ -818,6 +960,61 @@ mod tests {
             &sidecar.local_resources.allowed_hosts[..],
             &["https://api.example.com".parse().unwrap()]
         );
+    }
+
+    /// `poolSize` / `maxInvocations` on a `dev.components` entry must reach the
+    /// workload component; the runtime reads them to decide whether to keep
+    /// instances warm. A sidecar that sets neither stays at `-1` (unset), which
+    /// the runtime reads as "no pooling".
+    #[test]
+    fn build_workload_carries_warm_instance_limits() {
+        let resolved = ResolvedWorkload::default();
+        let dev_cfg = DevConfig {
+            components: vec![
+                dev_component_named("pooled"),
+                dev_component_named("unpooled"),
+            ],
+            ..Default::default()
+        };
+        let mut pooled = loaded_sidecar("pooled", resolved.clone());
+        pooled.pool_size = Some(4);
+        pooled.max_invocations = Some(100);
+        let sidecars = vec![pooled, loaded_sidecar("unpooled", resolved.clone())];
+
+        let workload = build_workload(
+            &dev_cfg,
+            fake_bytes("dev"),
+            HashSet::new(),
+            sidecars,
+            None,
+            None,
+            &resolved,
+        );
+
+        let pooled = find_component(&workload, "pooled").unwrap();
+        assert_eq!(pooled.pool_size, 4);
+        assert_eq!(pooled.max_invocations, 100);
+
+        let unpooled = find_component(&workload, "unpooled").unwrap();
+        assert_eq!(unpooled.pool_size, UNSET_LIMIT);
+        assert_eq!(unpooled.max_invocations, UNSET_LIMIT);
+    }
+
+    /// The config keys are camelCase on the wire and optional, so a component
+    /// entry that omits them round-trips as "unset" rather than zero.
+    #[test]
+    fn dev_component_warm_instance_limits_deserialize() {
+        let with: DevComponent = serde_yaml_ng::from_str(
+            "name: pooled\nfile: pooled.wasm\npoolSize: 8\nmaxInvocations: 50",
+        )
+        .unwrap();
+        assert_eq!(with.pool_size, Some(8));
+        assert_eq!(with.max_invocations, Some(50));
+
+        let without: DevComponent =
+            serde_yaml_ng::from_str("name: plain\nfile: plain.wasm").unwrap();
+        assert_eq!(without.pool_size, None);
+        assert_eq!(without.max_invocations, None);
     }
 
     #[test]
@@ -836,6 +1033,8 @@ mod tests {
             ]),
             config: HashMap::from([("flag".into(), "on".into())]),
             allowed_hosts: vec!["https://api.example.com".parse().unwrap()],
+            allowed_ip_name_lookups: vec![],
+            allowed_host_loopback_ports: vec![],
         };
         let dev_cfg = DevConfig {
             components: vec![dev_component_named("sidecar-a")],
@@ -913,9 +1112,9 @@ mod tests {
 
     #[test]
     fn build_workload_service_file_sidecar_gets_workload_values() {
-        // dev.service = false + dev.service_file = Some(...) loads a sidecar
-        // service alongside the dev component. Workload values are
-        // workload-wide, so the sidecar service receives them too.
+        // dev.service = false plus a configured service source (file or image)
+        // loads a sidecar service alongside the dev component. Workload values
+        // are workload-wide, so the sidecar service receives them too.
         let resolved = ResolvedWorkload {
             environment: HashMap::from([("LOG".into(), "info".into())]),
             ..Default::default()
@@ -996,11 +1195,14 @@ mod tests {
             components: vec![dev_component_named("sidecar")],
             ..Default::default()
         };
-        let sidecars = vec![LoadedComponent {
+        let sidecars = vec![SidecarComponent {
             name: "sidecar".into(),
             bytes: fake_bytes("sidecar"),
             interfaces: HashSet::from([iface("wasi", "config")]),
             workload: ResolvedWorkload::default(),
+            pool_size: None,
+            max_invocations: None,
+            max_concurrency: None,
         }];
 
         let workload = build_workload(
@@ -1020,11 +1222,11 @@ mod tests {
 
     #[test]
     fn build_workload_service_file_interfaces_reach_host_interfaces() {
-        // Regression for #5351: a service_file that imports a plugin
+        // Regression for #5351: a configured service that imports a plugin
         // interface (e.g. wasi:keyvalue) must have that interface folded into
         // the workload's host_interfaces so the plugin binds to the service.
         // Here neither the dev component nor any sidecar imports it, so the
-        // interface can only reach host_interfaces via the service file.
+        // interface can only reach host_interfaces via the service.
         let dev_cfg = DevConfig::default();
 
         let workload = build_workload(
@@ -1277,5 +1479,39 @@ mod tests {
         assert_eq!(named.config.get("backend").unwrap(), "cloudflare");
         let unnamed = kv_entries.iter().find(|i| i.name.is_none()).unwrap();
         assert!(unnamed.config.get("backend").is_none());
+    }
+
+    #[test]
+    fn distinct_interfaces_of_the_same_package_are_unioned_not_dropped() {
+        // A single component importing `wasmcloud:secrets/store` and
+        // `.../reveal` introspects as two separate WitInterface values
+        // (same namespace:package, each naming only its own interface) —
+        // both must survive into one merged entry. Regression test: the
+        // namespace:package dedup used to treat "an entry already exists"
+        // as "nothing more to do", silently dropping whichever of the two
+        // didn't win the (HashSet-ordered) race to arrive first — a
+        // component plugin then failed to instantiate because the host only
+        // wired a shim for the interface that survived.
+        let comp = HashSet::from([
+            iface_named("wasmcloud", "secrets", "store"),
+            iface_named("wasmcloud", "secrets", "reveal"),
+        ]);
+        let result = build_workload_host_interfaces(Vec::new(), &[comp], &HashMap::new());
+
+        let secrets: Vec<_> = result
+            .iter()
+            .filter(|i| i.namespace == "wasmcloud" && i.package == "secrets")
+            .collect();
+        assert_eq!(
+            secrets.len(),
+            1,
+            "store and reveal must merge into one wasmcloud:secrets entry, got {}",
+            secrets.len()
+        );
+        assert!(
+            secrets[0].interfaces.contains("store") && secrets[0].interfaces.contains("reveal"),
+            "merged entry must carry both interface names, got {:?}",
+            secrets[0].interfaces
+        );
     }
 }

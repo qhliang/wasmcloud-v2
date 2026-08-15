@@ -6,7 +6,7 @@ name: examples
 #           this event (PR = intersection with changed paths, push or
 #           examples-canary label = everything).
 #   build   matrix-fans over plan.outputs.matrix; each cell runs
-#           build-rust-example (fmt + clippy + wash build, plus
+#           build-rust-component (fmt + clippy + wash build, plus
 #           OCI publish on pushes to main when `image` is set).
 #
 # This fork trims upstream's pipeline:
@@ -46,7 +46,7 @@ env:
   # When these change, every example rebuilds.
   SHARED_PATHS: |
     [
-      ".github/actions/build-rust-example/**",
+      ".github/actions/build-rust-component/**",
       ".github/actions/setup-rust/**",
       ".github/scripts/plan-matrix.mjs",
       ".github/scripts/coverage-matrix.mjs",
@@ -99,7 +99,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
-      # Required so build-rust-example's OCI publish step can push to ghcr
+      # Required so build-rust-component's OCI publish step can push to ghcr
       # on push events. PRs (including forks) get the token in read-only
       # mode, so the publish step is a no-op there even with this set.
       packages: write
@@ -140,7 +140,7 @@ jobs:
           EOF
           echo "Generated minimal .wash/config.yaml for package ${PACKAGE} (CI override; the real one is gitignored because it contains per-developer secrets)"
 
-      - uses: ./.github/actions/build-rust-example
+      - uses: ./.github/actions/build-rust-component
         with:
           working-directory: ${{ matrix.workdir }}
           image: ${{ matrix.image }}

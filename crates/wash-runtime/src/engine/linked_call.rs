@@ -17,12 +17,12 @@
 //! assemble the store (pre-instantiating the linked components). See
 //! [`EphemeralLinkedCall`] for how the ephemeral path is captured at link time.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
 use tokio::time::timeout;
-use tracing::trace;
+use tracing::{debug, trace};
 use wasmtime::component::{
     Accessor, ComponentExportIndex, InstancePre, Val,
     types::{ComponentFunc, Type},
@@ -34,13 +34,15 @@ use wasmtime_wasi::WasiCtxBuilder;
 #[cfg(feature = "wasi-tls")]
 use crate::engine::ctx::SharedTlsProvider;
 use crate::engine::ctx::{AccessorActiveCtxGuard, Ctx, SharedCtx, StoreActiveCtxGuard};
+use crate::engine::instance_driver::{InstanceJob, LinkedJob};
+use crate::engine::instance_pool::{self, ComponentInstance, Dispatch, InstancePool};
 use crate::engine::store::relocate::{self, Relocated, bridgeable_element_type};
 use crate::engine::store::stream_pump::Done;
 use crate::engine::value::{carries_cross_store_handle, lift_results, lower_params};
 use crate::engine::volumes::{ResolvedVolumeMount, resolve_component_volume_mounts_in_map};
 use crate::engine::workload::{WorkloadComponent, WorkloadMetadata};
 use crate::plugin::HostPlugin;
-use crate::sockets::{self, SocketAddrUse, loopback};
+use crate::sockets::{self, loopback};
 
 /// A cheap, cloneable recipe for building a component's [`Ctx`].
 ///
@@ -68,6 +70,12 @@ pub(crate) struct ComponentCtxTemplate {
     volume_mounts: Vec<ResolvedVolumeMount>,
     plugins: Option<HashMap<&'static str, Arc<dyn HostPlugin + Send + Sync>>>,
     loopback: Arc<std::sync::Mutex<loopback::Network>>,
+    /// The host-level half of this component's socket policy: enforcement mode,
+    /// address ranges, whether host-loopback access is enabled at all, and the
+    /// budget. The workload-level half (`allowedHosts`,
+    /// `allowedHostLoopbackPorts`) comes from `local_resources` and is layered over
+    /// this when the check is built.
+    socket_policy: Arc<crate::sockets::policy::SocketPolicy>,
     #[cfg(feature = "wasi-tls")]
     tls_provider: Option<SharedTlsProvider>,
 }
@@ -81,6 +89,7 @@ impl ComponentCtxTemplate {
             volume_mounts: metadata.resolved_volume_mounts.clone(),
             plugins: metadata.plugins.clone(),
             loopback: metadata.loopback.clone(),
+            socket_policy: metadata.socket_policy.clone(),
             #[cfg(feature = "wasi-tls")]
             tls_provider: None,
         }
@@ -137,7 +146,7 @@ pub(crate) fn component_ctx_template_from_metadata_with_tls(
 pub(crate) struct EphemeralLinkedCall {
     pub(crate) engine: wasmtime::Engine,
     pub(crate) http_handler: Arc<dyn crate::host::http::HostHandler>,
-    pub(crate) components: Arc<RwLock<HashMap<Arc<str>, WorkloadComponent>>>,
+    pub(crate) components: Arc<RwLock<BTreeMap<Arc<str>, WorkloadComponent>>>,
     pub(crate) active_component_id: Arc<str>,
     pub(crate) linked_component_ids: Vec<Arc<str>>,
     #[cfg(feature = "wasi-tls")]
@@ -163,6 +172,15 @@ pub(crate) enum EphemeralCallMode {
 
 fn type_is_ephemeral_safe(ty: &Type) -> bool {
     !carries_cross_store_handle(ty)
+}
+
+/// Whether every one of `tys` is a plain value, so a call carrying them copies
+/// cleanly into an ephemeral store. The type-list form of
+/// [`func_is_ephemeral_safe`], for a caller holding params and results
+/// separately rather than as one [`ComponentFunc`].
+#[cfg(feature = "host-component-plugins")]
+pub(crate) fn types_are_ephemeral_safe(tys: &[Type]) -> bool {
+    tys.iter().all(type_is_ephemeral_safe)
 }
 
 pub(crate) fn func_is_ephemeral_safe(func_ty: &ComponentFunc) -> bool {
@@ -206,6 +224,14 @@ fn type_is_bridge_safe(ty: &Type) -> bool {
     }
 }
 
+/// Whether every one of `tys` is [`type_is_bridge_safe`]. The type-list form of
+/// [`func_is_bridge_safe`], for a caller holding params and results separately
+/// rather than as one [`ComponentFunc`].
+#[cfg(feature = "host-component-plugins")]
+pub(crate) fn types_are_bridge_safe(tys: &[Type]) -> bool {
+    tys.iter().all(type_is_bridge_safe)
+}
+
 /// Whether every param/result of `func_ty` is [`type_is_bridge_safe`], so a call
 /// carrying a `stream<T>`/`future<T>` can still run in an ephemeral store (with
 /// relocation) instead of being pinned to the shared store.
@@ -235,20 +261,27 @@ async fn build_ctx_from_template(
         .inherit_stdout()
         .inherit_stderr();
 
+    let kind = if is_service {
+        sockets::policy::GuestKind::Service
+    } else {
+        sockets::policy::GuestKind::Component
+    };
+    // Keyed on the workload, not the component: a workload's components share
+    // one allowance, the same way they share one virtual network.
+    let policy = Arc::new(sockets::policy::SocketPolicy {
+        allowed_hosts: Arc::clone(&template.local_resources.allowed_hosts),
+        host_loopback: Arc::clone(&template.local_resources.allowed_host_loopback_ports),
+        ..template
+            .socket_policy
+            .for_guest(kind, &template.workload_id)
+    });
     let sockets_ctx = sockets::WasiSocketsCtx {
         socket_addr_check: sockets::SocketAddrCheck::new(move |addr, reason| {
-            Box::pin(async move {
-                match reason {
-                    SocketAddrUse::TcpBind if is_service => addr.ip().is_loopback(),
-                    SocketAddrUse::TcpBind => false,
-                    SocketAddrUse::UdpBind => addr.ip().is_loopback() || addr.ip().is_unspecified(),
-                    SocketAddrUse::TcpConnect
-                    | SocketAddrUse::UdpConnect
-                    | SocketAddrUse::UdpOutgoingDatagram => true,
-                }
-            })
+            let policy = Arc::clone(&policy);
+            Box::pin(async move { policy.decide(reason, addr) })
         }),
         loopback: Arc::clone(&template.loopback),
+        allowed_ip_name_lookups: Arc::clone(&template.local_resources.allowed_ip_name_lookups),
         ..Default::default()
     };
 
@@ -337,6 +370,19 @@ pub(crate) async fn new_store_from_templates(
     }
 
     Ok(store)
+}
+
+/// The warm-instance pool of the component this call targets, or `None` when
+/// this store must not be parked — see [`instance_pool::poolable`], which also
+/// accounts for the linked components instantiated into the same store.
+///
+/// Read from the component map per call rather than captured at link time, so
+/// a component whose entry is replaced does not keep serving from a pool that
+/// belongs to the old entry.
+async fn callee_instance_pool(call: &EphemeralLinkedCall) -> Option<Arc<InstancePool>> {
+    let components = call.components.read().await;
+    let linked: HashSet<Arc<str>> = call.linked_component_ids.iter().cloned().collect();
+    instance_pool::poolable(&components, &call.active_component_id, &linked)
 }
 
 async fn new_ephemeral_store(
@@ -643,25 +689,20 @@ async fn invoke_ephemeral_relocated(
     Ok(())
 }
 
-/// Run a plain-value async linked call in a short-lived store that is dropped
-/// (reclaiming its core-instance slots) as soon as the call returns.
+/// Run a plain-value async linked call.
+///
+/// A component that keeps instances warm serves this on one of them, alongside
+/// whatever else that instance already has in flight (see
+/// [`crate::engine::instance_driver`]). Otherwise — and when every warm
+/// instance is busy and the pool is full — the call runs in a store built,
+/// invoked and dropped for it alone, so its core-instance slots are reclaimed
+/// immediately.
 async fn invoke_ephemeral_plain(
     params: &[Val],
     results: &mut [Val],
     inv: &LinkedExportInvocation,
     ephemeral_call: &EphemeralLinkedCall,
 ) -> wasmtime::Result<()> {
-    let mut store = new_ephemeral_store(ephemeral_call)
-        .await
-        .map_err(|e| wasmtime::format_err!("{e:#}"))?;
-
-    let params_buf = params.to_vec();
-    let mut results_buf = vec![Val::Bool(false); results.len()];
-    let call_import_name = inv.import_name.clone();
-    let call_export_name = inv.export_name.clone();
-    let callee_pre = inv.pre.clone();
-    let func_idx = inv.func_idx;
-
     trace!(
         name = %inv.import_name,
         fn_name = %inv.export_name,
@@ -669,8 +710,80 @@ async fn invoke_ephemeral_plain(
         "invoking ephemeral dynamic export"
     );
 
+    let pool = callee_instance_pool(ephemeral_call).await;
+
+    // The params travel into the pooled job. A job the pool declines hands
+    // them back, so the cold path below reuses that allocation rather than
+    // cloning them a second time.
+    let mut declined_params = None;
+
+    if let Some(pool) = pool.as_ref() {
+        let (reply, reply_rx) = tokio::sync::oneshot::channel();
+        let job = InstanceJob::Linked(Box::new(LinkedJob {
+            func_idx: inv.func_idx,
+            params: params.to_vec(),
+            results_len: results.len(),
+            import_name: inv.import_name.clone(),
+            export_name: inv.export_name.clone(),
+            reply,
+        }));
+        let outcome = match pool.offer(job) {
+            Dispatch::Sent => Ok(()),
+            // The pool has room. Build and instantiate the store out here,
+            // where awaiting is allowed and where a component that fails to
+            // instantiate reports that failure to this call rather than only
+            // to the log.
+            Dispatch::NeedsInstance(job) => {
+                let mut store = new_ephemeral_store(ephemeral_call).await.map_err(|e| {
+                    wasmtime::format_err!("new pooled store creation failed: {e:#}")
+                })?;
+                let instance = inv.pre.instantiate_async(&mut store).await?;
+                pool.install(ComponentInstance { store, instance }, job)
+            }
+            Dispatch::Saturated(job) => Err(job),
+        };
+        match outcome {
+            Ok(()) => {
+                let vals = reply_rx
+                    .await
+                    .map_err(|_| wasmtime::format_err!("pooled instance dropped the call"))??;
+                write_results(vals, results)?;
+                trace!(
+                    name = %inv.import_name,
+                    fn_name = %inv.export_name,
+                    ?results,
+                    "invoked ephemeral dynamic export"
+                );
+                return Ok(());
+            }
+            // Every warm instance was busy; run it in a store of its own.
+            Err(declined) => {
+                debug!(
+                    name = %inv.import_name,
+                    fn_name = %inv.export_name,
+                    "warm instances saturated; serving this call from a store of its own"
+                );
+                if let InstanceJob::Linked(job) = declined {
+                    declined_params = Some(job.params);
+                }
+            }
+        }
+    }
+
+    let mut store = new_ephemeral_store(ephemeral_call)
+        .await
+        .map_err(|e| wasmtime::format_err!("new ephemeral store creation failed: {e:#}"))?;
+    let instance = inv.pre.instantiate_async(&mut store).await?;
+
+    let params_buf = declined_params.unwrap_or_else(|| params.to_vec());
+    let mut results_buf = vec![Val::Bool(false); results.len()];
+    let call_import_name = inv.import_name.clone();
+    let call_export_name = inv.export_name.clone();
+    let func_idx = inv.func_idx;
+
+    // The store travels into the task, so a caller cancelled mid-call drops it
+    // with the task rather than leaving it running.
     let mut task = AbortOnDrop(tokio::task::spawn(async move {
-        let instance = callee_pre.instantiate_async(&mut store).await?;
         store
             .run_concurrent(async move |accessor| {
                 let func = accessor.with(|mut access| -> wasmtime::Result<_> {
@@ -692,16 +805,13 @@ async fn invoke_ephemeral_plain(
                 Ok::<Vec<Val>, wasmtime::Error>(results_buf)
             })
             .await
-            .map_err(|e| wasmtime::format_err!("{e:#}"))?
+            .map_err(|e| wasmtime::format_err!("{e:#}"))
+            .and_then(|inner| inner)
     }));
-    let call_result = (&mut task.0)
+    let vals = (&mut task.0)
         .await
-        .map_err(|e| wasmtime::format_err!("ephemeral linked call task failed: {e}"));
-    let call_result = call_result??;
-
-    for (i, v) in call_result.into_iter().enumerate() {
-        *results.get_mut(i).context("result index out of bounds")? = v;
-    }
+        .map_err(|e| wasmtime::format_err!("ephemeral linked call task failed: {e}"))??;
+    write_results(vals, results)?;
 
     trace!(
         name = %inv.import_name,
@@ -710,6 +820,14 @@ async fn invoke_ephemeral_plain(
         "invoked ephemeral dynamic export"
     );
 
+    Ok(())
+}
+
+/// Copy a call's returned values into the caller's result slots.
+fn write_results(vals: Vec<Val>, results: &mut [Val]) -> wasmtime::Result<()> {
+    for (i, v) in vals.into_iter().enumerate() {
+        *results.get_mut(i).context("result index out of bounds")? = v;
+    }
     Ok(())
 }
 

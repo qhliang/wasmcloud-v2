@@ -17,7 +17,7 @@ use wash_runtime::{
     engine::Engine,
     host::{
         HostApi, HostBuilder,
-        http::{DevRouter, HttpServer},
+        http::{DevRouter, Ingress},
     },
     types::{Component, LocalResources, Workload, WorkloadStartRequest},
     wit::WitInterface,
@@ -37,8 +37,8 @@ async fn test_http_blobstore_integration() -> Result<()> {
     let engine = Engine::builder().build()?;
 
     // Create HTTP server plugin on a dynamically allocated port
-    let http_plugin = HttpServer::new(DevRouter::default(), "127.0.0.1:0".parse()?).await?;
-    let addr = http_plugin.addr();
+    let ingress = Ingress::new(DevRouter::default(), "127.0.0.1:0".parse()?).await?;
+    let addr = ingress.addr();
 
     // Create blobstore plugin
     let blobstore_plugin = custom_plugin_blobstore::CustomBlobstore::new();
@@ -46,7 +46,7 @@ async fn test_http_blobstore_integration() -> Result<()> {
     // Build host with plugins following the existing pattern from lib.rs test
     let host = HostBuilder::new()
         .with_engine(engine.clone())
-        .with_http_handler(Arc::new(http_plugin))
+        .with_http_handler(Arc::new(ingress))
         .with_plugin(Arc::new(blobstore_plugin))?
         .build()?;
 
@@ -76,9 +76,12 @@ async fn test_http_blobstore_integration() -> Result<()> {
                     environment: HashMap::new(),
                     volume_mounts: vec![],
                     allowed_hosts: Default::default(),
+                    allowed_ip_name_lookups: Default::default(),
+                    allowed_host_loopback_ports: Default::default(),
                 },
                 pool_size: 1,
                 max_invocations: 100,
+                max_concurrency: 1,
             }],
             host_interfaces: vec![
                 WitInterface {
@@ -202,11 +205,11 @@ async fn test_plugin_lifecycle() -> Result<()> {
     println!("Testing plugin lifecycle");
 
     let engine = Engine::builder().build()?;
-    let http_plugin = HttpServer::new(DevRouter::default(), "127.0.0.1:0".parse()?).await?;
+    let ingress = Ingress::new(DevRouter::default(), "127.0.0.1:0".parse()?).await?;
 
     let host = HostBuilder::new()
         .with_engine(engine)
-        .with_http_handler(Arc::new(http_plugin))
+        .with_http_handler(Arc::new(ingress))
         .build()?;
 
     // Start host
@@ -228,14 +231,14 @@ async fn test_plugin_lifecycle() -> Result<()> {
 
 //     let engine = Engine::builder().build()?;
 //     let addr: SocketAddr = "127.0.0.1:8082".parse().unwrap();
-//     let http_plugin = HttpServer::new(addr);
+//     let ingress = Ingress::new(addr);
 
 //     // Create blobstore plugin with large capacity (2GB limit for this test)
 //     let blobstore_plugin = WasiBlobstore::new(Some(2_147_483_648)); // 2GB limit
 
 //     let host = HostBuilder::new()
 //         .with_engine(engine)
-//         .with_plugin(Arc::new(http_plugin))
+//         .with_plugin(Arc::new(ingress))
 //         .with_plugin(Arc::new(blobstore_plugin))
 //         .with_plugin(Arc::new(WasiLogging {}))
 //         .build()?;

@@ -22,36 +22,14 @@ use wash_runtime::types::{LocalResources, WorkloadState, WorkloadStopRequest};
 
 mod common;
 use common::{
-    component_workload_request, kv_plugin_caller_host_interfaces, start_host_with_component_plugin,
-    start_host_with_component_plugin_by_host, start_host_with_component_plugin_max_restarts,
-    start_host_with_p3_http_handler,
+    component_workload_request, kv_plugin_caller_host_interfaces, req,
+    start_host_with_component_plugin, start_host_with_component_plugin_by_host,
+    start_host_with_component_plugin_max_restarts, start_host_with_p3_http_handler,
 };
 
 const KV_PLUGIN_WASM: &[u8] = include_bytes!("wasm/kv_plugin.wasm");
 const KV_PLUGIN_CALLER_WASM: &[u8] = include_bytes!("wasm/kv_plugin_caller.wasm");
 const PLUGIN_ID: &str = "acme-kv-plugin";
-
-/// GET `http://{addr}{path}` with the `HOST` header selecting the workload,
-/// returning the status and body text.
-async fn req(
-    client: &reqwest::Client,
-    addr: &std::net::SocketAddr,
-    host: &str,
-    path: &str,
-) -> Result<(reqwest::StatusCode, String)> {
-    let resp = timeout(
-        Duration::from_secs(15),
-        client
-            .get(format!("http://{addr}{path}"))
-            .header("HOST", host)
-            .send(),
-    )
-    .await
-    .context("request timed out")??;
-    let status = resp.status();
-    let body = resp.text().await?;
-    Ok((status, body))
-}
 
 /// A `kv-plugin-caller` workload addressed by `host`.
 fn caller_workload(host: &str) -> wash_runtime::types::WorkloadStartRequest {
@@ -134,8 +112,8 @@ async fn test_component_plugin_missing_provider_errors() -> Result<()> {
 ///
 /// Uses the host-header router so the two callers are genuinely distinct
 /// workloads (the `DevRouter` would send both requests to the last-resolved
-/// workload, making the assertion vacuous). Multi-threaded: the host-header
-/// router uses `block_in_place`.
+/// workload, making the assertion vacuous). Runs multi-threaded so the live
+/// HTTP server serves requests in parallel with the test's request loop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_component_plugin_shared_across_workloads() -> Result<()> {
     let (addr, h) =
@@ -624,8 +602,8 @@ async fn test_component_plugin_resource_isolation() -> Result<()> {
 /// threading + the identity import; concurrent interleaving is covered by
 /// [`test_component_plugin_partitioning_under_concurrency`].
 ///
-/// Multi-threaded: the host-header router uses `block_in_place`, which a
-/// current-thread runtime cannot run.
+/// Runs multi-threaded so the live HTTP server serves requests in parallel with
+/// the test's request loop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_component_plugin_per_caller_partitioning() -> Result<()> {
     let (addr, h) =
@@ -679,7 +657,7 @@ async fn test_component_plugin_per_caller_partitioning() -> Result<()> {
 /// (the cooperative store can lag a same-caller readback by a call — orthogonal to
 /// identity and not what this test guards).
 ///
-/// Multi-threaded: the host-header router uses `block_in_place`.
+/// Runs multi-threaded so requests are served in parallel under concurrency.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_component_plugin_partitioning_under_concurrency() -> Result<()> {
     let (addr, h) =

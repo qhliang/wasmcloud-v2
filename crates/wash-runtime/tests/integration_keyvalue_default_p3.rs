@@ -1,5 +1,5 @@
 #![cfg(feature = "wasm_component_model_implements")]
-//! A **plain** (unlabeled) async `wasmcloud:keyvalue@0.1.0` `store` import, served
+//! A **plain** (unlabeled) async `wasmcloud:keyvalue@0.2.0` `store` import, served
 //! by a default backend through a **real P3 guest** — no `(implements ..)` label.
 //!
 //! The `keyvalue-default-p3` fixture opens a bucket via `wasmcloud:keyvalue/store`
@@ -27,7 +27,7 @@ use wash_runtime::{
     engine::Engine,
     host::{
         HostApi, HostBuilder,
-        http::{DevRouter, HttpServer},
+        http::{DevRouter, Ingress},
     },
     plugin::wasi_keyvalue::{InMemoryProvider, MultiplexedAsyncKeyValue},
     types::{Component, LocalResources, Workload, WorkloadStartRequest, WorkloadState},
@@ -47,7 +47,7 @@ fn default_kv_iface() -> WitInterface {
         namespace: "wasmcloud".to_string(),
         package: "keyvalue".to_string(),
         interfaces: ["store".to_string()].into_iter().collect(),
-        version: Some(semver::Version::parse("0.1.0").unwrap()),
+        version: Some(semver::Version::parse("0.2.0").unwrap()),
         config: HashMap::new(),
         name: None,
     }
@@ -57,11 +57,11 @@ fn default_kv_iface() -> WitInterface {
 async fn p3_guest_plain_keyvalue_uses_default_backend() -> Result<()> {
     // --- host with the async multiplexed keyvalue plugin + in-memory provider ---
     let engine = Engine::builder().build()?;
-    let http_server = HttpServer::new(DevRouter::default(), "127.0.0.1:0".parse()?).await?;
-    let addr = http_server.addr();
+    let ingress = Ingress::new(DevRouter::default(), "127.0.0.1:0".parse()?).await?;
+    let addr = ingress.addr();
     let host = HostBuilder::new()
         .with_engine(engine)
-        .with_http_handler(Arc::new(http_server))
+        .with_http_handler(Arc::new(ingress))
         .with_plugin(Arc::new(
             MultiplexedAsyncKeyValue::new().with_provider(Arc::new(InMemoryProvider)),
         ))?
@@ -89,6 +89,7 @@ async fn p3_guest_plain_keyvalue_uses_default_backend() -> Result<()> {
                 local_resources: LocalResources::default(),
                 pool_size: 1,
                 max_invocations: 100,
+                max_concurrency: 1,
             }],
             host_interfaces,
             volumes: vec![],

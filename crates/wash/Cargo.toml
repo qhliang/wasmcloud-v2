@@ -15,9 +15,10 @@ version.workspace = true
 default = ["wasi-webgpu", "wasm_component_model_implements"]
 wasi-tls = ["wash-runtime/wasi-tls"]
 # Route component-model `(implements ..)` named imports to per-import backends.
-# When enabled, `wash host`/`wash dev` additionally register the multiplexed
-# keyvalue plugin (the unnamed/default import keeps its standalone backend, so
-# normal workloads are unaffected). Needs a wasmtime build with resource-implements.
+# On by default: `wash host`/`wash dev` register the multiplexed keyvalue plugin
+# (the unnamed/default import keeps its standalone backend, so normal workloads
+# are unaffected). Disable with `--no-default-features` for a build that rejects
+# components importing an interface more than once.
 wasm_component_model_implements = ["wash-runtime/wasm_component_model_implements"]
 # Host component plugins: host capabilities provided by wasm components running
 # in their own supervised stores (wash-runtime's `plugin::component_host`).
@@ -85,12 +86,6 @@ custom_plugin_wechat = { path = "../custom_plugin_wechat" }
 custom_plugin_telegram = { path = "../custom_plugin_telegram" }
 custom_plugin_event_monitor = { path = "../custom_plugin_event_monitor" }
 custom_plugin_workflow = { path = "../custom_plugin_workflow" }
-
-# `O_NOFOLLOW` for the secret-file-open hardening in `crate::workload`.
-# Unix-only. Windows has no portable equivalent.
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
 
 [build-dependencies]
 anyhow = { workspace = true, default-features = true }

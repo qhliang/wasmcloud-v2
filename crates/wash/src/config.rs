@@ -14,7 +14,11 @@ use figment::{
 };
 use serde::{Deserialize, Serialize};
 use tracing::info;
+use wash_runtime::component_source::ComponentSource;
 use wash_runtime::host::allowed_hosts::AllowedHost;
+use wash_runtime::host::allowed_ip_name::AllowedIpName;
+use wash_runtime::host::allowed_loopback::AllowedLoopbackPort;
+use wash_runtime::oci::OciPullPolicy;
 use wash_runtime::wit::WitInterface;
 
 use crate::{
@@ -40,6 +44,10 @@ pub struct Config {
     /// Wash dev configuration (default: empty/optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dev: Option<DevConfig>,
+
+    /// `wash host` configuration (default: empty/optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<HostConfig>,
 
     /// Wash new configuration (default: empty/optional)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -85,6 +93,7 @@ impl Default for Config {
             build: None,
             new: None,
             dev: None,
+            host: None,
             workload: None,
             config_sources: BTreeMap::new(),
             secret_sources: BTreeMap::new(),
@@ -107,6 +116,11 @@ impl Config {
     /// Get the development configuration, defaulting to [DevConfig::default()] if not set
     pub fn dev(&self) -> DevConfig {
         self.dev.clone().unwrap_or_default()
+    }
+
+    /// Get the `wash host` configuration, defaulting to [HostConfig::default()] if not set
+    pub fn host(&self) -> HostConfig {
+        self.host.clone().unwrap_or_default()
     }
 
     pub fn build(&self) -> BuildConfig {
@@ -244,88 +258,36 @@ pub struct WorkloadConfig {
     /// `localResources.config` contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_outbound_http_insecure: Option<bool>,
+    /// Names components may resolve through
+    /// `wasi:sockets/ip-name-lookup` (`resolve-addresses`). Each entry
+    /// parses into a typed [`AllowedIpName`]; YAML/JSON callers write plain
+    /// strings such as `"*"`, `"*.example.com"`, `"example.com"`, or a
+    /// literal IP address.
+    ///
+    /// An omitted or empty list denies every lookup. Resolution is opt-in:
+    /// nothing substitutes an allow-all policy for a workload that
+    /// declared none.
+    #[serde(default)]
+    #[builder(default)]
+    pub allowed_ip_name_lookups: Vec<AllowedIpName>,
+    /// Ports on the machine's own loopback components may reach through
+    /// `host.wasmcloud.internal`. Each entry is a port with an optional
+    /// protocol: `5432`, `5432/tcp`, `53/udp`.
+    ///
+    /// An omitted or empty list denies every host-loopback connection, and a
+    /// non-empty one is inert unless the host runs with
+    /// `--allow-host-loopback`. `127.0.0.1` keeps meaning the workload's own
+    /// virtual network either way.
+    #[serde(default)]
+    #[builder(default)]
+    pub allowed_host_loopback_ports: Vec<AllowedLoopbackPort>,
 }
 
-/// One layer of environment variables.
-///
-/// Inline values are written directly; `configFrom` / `secretFrom` reference
-/// named entries in the top-level `configs:` / `secrets:` blocks by name. On
-/// key conflicts later entries win, in order: inline → configFrom → secretFrom
-/// (matches K8s `envFrom` semantics).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, bon::Builder)]
-#[serde(rename_all = "camelCase")]
-#[non_exhaustive]
-pub struct EnvironmentLayer {
-    /// Inline plain values. Suitable for non-sensitive defaults.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub config: HashMap<String, String>,
-    /// Names of entries in the top-level `configs:` block.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub config_from: Vec<String>,
-    /// Names of entries in the top-level `secrets:` block.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub secret_from: Vec<String>,
-}
-
-/// A source of non-sensitive key-value pairs for a `configs:` entry.
-///
-/// Multiple fields can be set on a single entry. They merge last-wins in the
-/// order `inline` → `file` → `fromEnv` (matches K8s ConfigMap merge
-/// semantics). Resolution lives in [`crate::workload`] as
-/// [`ConfigSource::resolve`].
-///
-/// See [`SecretSource`] for the sibling type that carries the stricter
-/// posture (file-mode check, in-repo-tree warning, etc.). The two share
-/// today's wire schema but are deliberately distinct types so secret
-/// handling can never be applied to a config and vice versa.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, bon::Builder)]
-#[serde(rename_all = "camelCase")]
-#[non_exhaustive]
-pub struct ConfigSource {
-    /// Literal key-value entries supplied inline.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub inline: HashMap<String, String>,
-    /// Path to a `.env`-format file. Relative paths resolve against the
-    /// project directory.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file: Option<PathBuf>,
-    /// Names of environment variables to pull from the developer's shell.
-    /// Each name is read at resolve time via [`std::env::var`]; a missing
-    /// variable is a hard error.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub from_env: Vec<String>,
-}
-
-/// A source of sensitive key-value pairs for a `secrets:` entry.
-///
-/// Same wire shape as [`ConfigSource`] today, but a distinct Rust type so
-/// the stricter resolve-time posture (Unix file mode `0600`/`0400`,
-/// `O_NOFOLLOW` open + `fstat` perm check, in-repo-tree warning, no value
-/// snippets in error / log output) can only be applied here. Resolution
-/// lives in [`crate::workload`] as [`SecretSource::resolve`].
-///
-/// The two types may diverge in the future (e.g. a future `rotation`
-/// field that only makes sense for secrets) — keeping them separate now
-/// avoids retrofitting the type split later.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, bon::Builder)]
-#[serde(rename_all = "camelCase")]
-#[non_exhaustive]
-pub struct SecretSource {
-    /// Literal key-value entries supplied inline. Convenient for dev /
-    /// test; do not commit production secrets this way.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub inline: HashMap<String, String>,
-    /// Path to a `.env`-format file. Relative paths resolve against the
-    /// project directory. The file must be Unix mode `0600` or `0400`
-    /// and must not escape the project directory via `..` or symlink.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file: Option<PathBuf>,
-    /// Names of environment variables to pull from the developer's shell.
-    /// Each name is read at resolve time via [`std::env::var`]; a missing
-    /// variable is a hard error.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub from_env: Vec<String>,
-}
+// The `configs:`/`secrets:` source model moved to wash-runtime so every
+// embedder resolves these the same way (see
+// `wash_runtime::config_source`). Re-exported here because this module is
+// the documented home of the config schema.
+pub use wash_runtime::config_source::{ConfigSource, EnvironmentLayer, SecretSource};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DevVolume {
@@ -335,18 +297,74 @@ pub struct DevVolume {
     pub guest_path: PathBuf,
 }
 
+/// Where a config block's wasm component comes from: exactly one of `file` or
+/// `image`, plus a pull policy that only an image can honor.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentSourceConfig {
+    /// Local wasm file path. Mutually exclusive with `image`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<PathBuf>,
+    /// OCI image reference. Mutually exclusive with `file`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// Pull policy for `image` sources: `always`, `ifNotPresent`, or `never`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_policy: Option<String>,
+}
+
+impl ComponentSourceConfig {
+    /// A local file source.
+    pub fn file(path: impl Into<PathBuf>) -> Self {
+        Self {
+            file: Some(path.into()),
+            ..Default::default()
+        }
+    }
+
+    /// An OCI image source, pulled under the default policy.
+    pub fn image(image: impl Into<String>) -> Self {
+        Self {
+            image: Some(image.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Resolve to a runtime [`ComponentSource`].
+    ///
+    /// `name` names the config block and leads every error. Pass something the
+    /// user can find in their `config.yaml`, e.g. `"dev.components['sidecar']"`.
+    pub fn to_source(&self, name: &str) -> Result<ComponentSource> {
+        let pull_policy = match &self.pull_policy {
+            Some(policy) => Some(
+                policy
+                    .parse::<OciPullPolicy>()
+                    .with_context(|| name.to_string())?,
+            ),
+            None => None,
+        };
+        ComponentSource::from_image_or_file(
+            self.image.clone(),
+            self.file.clone(),
+            pull_policy,
+            name,
+        )
+    }
+}
+
 /// A component loaded alongside the main dev component.
 ///
-/// `environment` / `config` / `allowedHosts` override the workload-level
-/// `workload:` block for this component — see
+/// `environment` / `config` / `allowedHosts` / `allowedIpNameLookups` override
+/// the workload-level `workload:` block for this component. See
 /// [`crate::workload::resolve_component_workload`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DevComponent {
     /// Name of the component
     pub name: String,
-    /// Path to the component file
-    pub file: PathBuf,
+    /// Where the component's wasm comes from: a local `file` or an `image`.
+    #[serde(flatten)]
+    pub source: ComponentSourceConfig,
     /// Environment variables (wasi:cli/env), merged over
     /// `workload.environment`. This component wins on key conflicts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -360,19 +378,393 @@ pub struct DevComponent {
     /// workload list applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_hosts: Option<Vec<AllowedHost>>,
+    /// Names this component may resolve through
+    /// `wasi:sockets/ip-name-lookup`. When set it replaces
+    /// `workload.allowedIpNameLookups` for this component (an explicit `[]`
+    /// denies every lookup); when omitted the workload list applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_ip_name_lookups: Option<Vec<AllowedIpName>>,
+    /// Host-loopback ports this component may reach. When set it replaces
+    /// `workload.allowedHostLoopbackPorts` for this component; when omitted the
+    /// workload list applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_host_loopback_ports: Option<Vec<AllowedLoopbackPort>>,
+    /// How many instances of this component to keep warm between calls.
+    ///
+    /// Unset (or `0`) keeps the default: every call runs in a fresh instance
+    /// and component state is ephemeral. Setting it lets an instance be reused
+    /// by the next call, so whatever the guest caches in memory — a connection
+    /// pool, a lazily built runtime — survives instead of being rebuilt per
+    /// call. Work past what the warm instances can take is still served, from
+    /// fresh ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_size: Option<i32>,
+    /// How many calls a warm instance serves before it is retired and the next
+    /// call starts cold. Unset (or `0`) means no limit. Only meaningful
+    /// alongside `poolSize`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_invocations: Option<i32>,
+    /// How many calls one warm instance may serve at the same time.
+    ///
+    /// Unset means one, which is what a component gets without asking: an
+    /// instance serves a single call at a time. Raising it lets an instance
+    /// overlap calls while it is awaiting I/O, which is where a pool of
+    /// instances would otherwise sit idle.
+    ///
+    /// Only safe for a guest that yields rather than blocks. A guest driving
+    /// its own executor — anything calling `block_on` — must stay at one, or a
+    /// second concurrent call will try to enter that executor from inside
+    /// itself. Only meaningful alongside `poolSize`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<i32>,
 }
 
 impl DevComponent {
-    /// Creates a component entry with no per-component overrides.
+    /// Creates a file-backed component entry with no per-component overrides.
     pub fn new(name: impl Into<String>, file: impl Into<PathBuf>) -> Self {
+        Self::from_source(name, ComponentSourceConfig::file(file))
+    }
+
+    /// Creates a component entry from any source with no per-component
+    /// overrides.
+    pub fn from_source(name: impl Into<String>, source: ComponentSourceConfig) -> Self {
         Self {
             name: name.into(),
-            file: file.into(),
+            source,
             environment: None,
             config: HashMap::new(),
             allowed_hosts: None,
+            allowed_ip_name_lookups: None,
+            allowed_host_loopback_ports: None,
+            pool_size: None,
+            max_invocations: None,
+            max_concurrency: None,
         }
     }
+}
+
+/// A host component plugin to load into the `wash dev` host: a WebAssembly
+/// component that provides a host capability, served to every workload that
+/// imports its interface. Provide exactly one of `file` (local path) or `image`
+/// (OCI reference). Requires a wash build with the `host-component-plugins`
+/// feature.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostPluginConfig {
+    /// Host-unique plugin id.
+    pub id: String,
+    /// Where the plugin's wasm comes from: a local `file` or an `image`.
+    #[serde(flatten)]
+    pub source: ComponentSourceConfig,
+    /// Supervised driver restarts before the plugin is declared dead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_restarts: Option<u32>,
+    /// OCI digest to pin (`image` sources only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_digest: Option<String>,
+    /// This plugin's own bind-time config, delivered to every native
+    /// capability it imports (e.g. `wasmcloud:secrets`) via `on-workload-bind`
+    /// — never written to a file the plugin itself reads. `config`/
+    /// `configFrom`/`secretFrom` merge exactly like `workload.environment`
+    /// (inline → configFrom → secretFrom, last source wins), resolved
+    /// against the same top-level `configs:`/`secrets:` catalogs.
+    #[serde(flatten)]
+    pub environment: EnvironmentLayer,
+    /// Hosts this plugin's own `wasi:http/outgoing-handler` calls may reach.
+    /// Unlike a workload's `allowedHosts`, an omitted list denies every
+    /// outbound host by default — a host component plugin is
+    /// operator-controlled, more privileged than a workload, and gets no
+    /// ergonomic allow-all default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_hosts: Vec<AllowedHost>,
+    /// Names this plugin's own `wasi:sockets/ip-name-lookup` calls may
+    /// resolve. An omitted or empty list denies every lookup.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_ip_name_lookups: Vec<AllowedIpName>,
+    /// Ports this plugin listens on. An omitted or empty list means it binds
+    /// nothing reachable, which is what every plugin got before ports existed.
+    ///
+    /// Each entry needs a `name` and the `port` the plugin's own code binds.
+    /// Optional: `protocol` (TCP or UDP, default TCP) and exactly one of
+    ///
+    ///   publish   real port the host binds, splicing accepted connections
+    ///             into the plugin's private virtual loopback. The plugin
+    ///             binds `127.0.0.1:<port>` and needs no change.
+    ///   bind      concrete address the plugin binds itself, skipping the
+    ///             splice. Rejected if unspecified (`0.0.0.0`) or loopback.
+    ///
+    /// Neither declares the port without exposing it. Requires the host to be
+    /// started with `--publish-ports`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<wash_runtime::host::declared_port::DeclaredPort>,
+}
+
+impl HostPluginConfig {
+    /// Convert to a runtime [`wash_runtime::plugin::ComponentPluginSpec`],
+    /// without resolving `configFrom`/`secretFrom` — used where no [`Config`]
+    /// is available. Prefer [`HostPluginConfig::to_spec`] when one is.
+    ///
+    /// `expectedDigest` on a file source is caught by the loader when it finds
+    /// no digest to check against, so this only has to validate what it can see
+    /// without fetching.
+    pub fn to_spec_unresolved(&self) -> Result<wash_runtime::plugin::ComponentPluginSpec> {
+        if self.id.is_empty() {
+            bail!("host_plugins entry is missing a non-empty `id`");
+        }
+        let what = format!("host_plugins '{}'", self.id);
+        // Catch a bad port declaration here, where the error can name the
+        // config entry, rather than at plugin start.
+        wash_runtime::host::declared_port::validate_ports(&self.ports, &what)?;
+        Ok(wash_runtime::plugin::ComponentPluginSpec {
+            id: self.id.clone(),
+            source: self.source.to_source(&what)?,
+            max_restarts: self.max_restarts,
+            expected_digest: self.expected_digest.clone(),
+            config: self.environment.config.clone(),
+            allowed_hosts: self.allowed_hosts.clone().into(),
+            allowed_ip_name_lookups: self.allowed_ip_name_lookups.clone().into(),
+            ports: self.ports.clone().into(),
+        })
+    }
+
+    /// Convert to a runtime [`wash_runtime::plugin::ComponentPluginSpec`],
+    /// resolving `configFrom`/`secretFrom` against `config`'s top-level
+    /// `configs:`/`secrets:` catalogs the same way a workload's
+    /// `environment.configFrom`/`secretFrom` resolve.
+    ///
+    /// # Errors
+    ///
+    /// Same failure modes as [`crate::workload::resolve_workload`], for this
+    /// plugin's own `configFrom`/`secretFrom` references.
+    pub fn to_spec(
+        &self,
+        config: &Config,
+        project_dir: &Path,
+        repo_root: Option<&Path>,
+    ) -> Result<wash_runtime::plugin::ComponentPluginSpec> {
+        let mut spec = self.to_spec_unresolved()?;
+        let owner = format!("host_plugins '{}'", self.id);
+        spec.config = wash_runtime::config_source::resolve_environment_layer(
+            Some(&self.environment),
+            &owner,
+            &config.config_sources,
+            &config.secret_sources,
+            project_dir,
+            repo_root,
+        )?;
+        Ok(spec)
+    }
+}
+
+/// `wash host` configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostConfig {
+    /// Host component plugins to load: WebAssembly components that provide
+    /// host capabilities. Requires a wash build with the
+    /// `host-component-plugins` feature. Merges with (does not replace) any
+    /// plugins declared via repeated `--host-plugin` flags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_plugins: Vec<HostPluginConfig>,
+}
+
+/// Built-in trust roots for outbound HTTPS from components, before any extra
+/// CA bundles are layered on top. CLI/config mirror of
+/// [`wash_runtime::host::http_client::TrustRoots`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum HttpClientTrustRoots {
+    /// Compiled-in webpki roots plus the platform's native store.
+    /// The native store honours `SSL_CERT_FILE`/`SSL_CERT_DIR`.
+    WebpkiAndNative,
+    /// Compiled-in webpki roots only — reproducible, ignores the host
+    /// environment. The default, matching the behavior before this option
+    /// existed.
+    #[default]
+    Webpki,
+    /// Platform native store only.
+    Native,
+    /// No built-in roots: trust exactly the configured extra CA bundles.
+    ExtraOnly,
+}
+
+impl HttpClientTrustRoots {
+    // serde's `skip_serializing_if` hands the field by reference.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl From<HttpClientTrustRoots> for wash_runtime::host::http_client::TrustRoots {
+    fn from(roots: HttpClientTrustRoots) -> Self {
+        match roots {
+            HttpClientTrustRoots::WebpkiAndNative => Self::WebpkiAndNative,
+            HttpClientTrustRoots::Webpki => Self::Webpki,
+            HttpClientTrustRoots::Native => Self::Native,
+            HttpClientTrustRoots::ExtraOnly => Self::ExtraOnly,
+        }
+    }
+}
+
+/// Build the host's [`QuotaRegistry`] from optional config/CLI overrides.
+///
+/// One registry governs every surface a guest can hold a connection on, so
+/// these are the numbers an operator tunes. `None` keeps the built-in default
+/// for that setting.
+///
+/// # Errors
+///
+/// Rejects a zero for any ceiling or for the wait, which would silently mean
+/// "no connections" or "never wait" rather than what the operator meant.
+///
+/// [`QuotaRegistry`]: wash_runtime::host::quota::QuotaRegistry
+pub fn connection_quotas(
+    max_connections: Option<usize>,
+    max_http_per_workload: Option<usize>,
+    max_sockets_per_workload: Option<usize>,
+    max_inbound_per_workload: Option<usize>,
+    http_connection_wait: Option<std::time::Duration>,
+) -> anyhow::Result<std::sync::Arc<wash_runtime::host::quota::QuotaRegistry>> {
+    let defaults = wash_runtime::host::quota::QuotaLimits::default();
+    let resolve = |value: Option<usize>, default: usize, name: &str| -> anyhow::Result<usize> {
+        match value {
+            Some(0) => anyhow::bail!("{name} must be at least 1"),
+            Some(v) => Ok(v),
+            None => Ok(default),
+        }
+    };
+    let limits = wash_runtime::host::quota::QuotaLimits {
+        outbound_http: resolve(
+            max_http_per_workload,
+            defaults.outbound_http,
+            "max_outbound_http_connections_per_workload",
+        )?,
+        outbound_sockets: resolve(
+            max_sockets_per_workload,
+            defaults.outbound_sockets,
+            "max_outbound_socket_connections_per_workload",
+        )?,
+        inbound_sockets: resolve(
+            max_inbound_per_workload,
+            defaults.inbound_sockets,
+            "max_inbound_socket_connections_per_workload",
+        )?,
+    };
+    if max_connections == Some(0) {
+        anyhow::bail!("max_connections must be at least 1");
+    }
+    if let Some(total) = max_connections
+        && limits
+            .outbound_http
+            .max(limits.outbound_sockets)
+            .max(limits.inbound_sockets)
+            > total
+    {
+        // Harmless (the host-wide ceiling simply gates first), but almost
+        // certainly an operator mixing the two knobs up.
+        tracing::warn!(
+            ?limits,
+            max_connections = total,
+            "a per-workload ceiling exceeds max_connections; the host-wide cap will gate first"
+        );
+    }
+
+    // An unset flag means the built-in ceiling, not "unbounded": without one, a
+    // crowd of workloads each holding its per-guest allowance exhausts the
+    // host's file descriptors, and the failures land on ingress and OCI pulls
+    // rather than on whoever caused them.
+    let host_wide =
+        max_connections.or_else(|| Some(wash_runtime::host::quota::default_max_connections()));
+    let registry = wash_runtime::host::quota::QuotaRegistry::new(limits, host_wide);
+    match http_connection_wait {
+        Some(wait) if wait.is_zero() => {
+            anyhow::bail!("http_connection_wait must be greater than zero")
+        }
+        Some(wait) => Ok(std::sync::Arc::new(
+            registry.as_ref().clone().with_http_wait(wait),
+        )),
+        None => Ok(registry),
+    }
+}
+
+/// Resolve the messaging admission ceilings into the [`MessagingLimits`] every
+/// messaging backend on this host shares.
+///
+/// Mirrors [`connection_quotas`]: the same two-level host-wide/per-workload
+/// shape, and the same treatment of a zero.
+///
+/// `None` for either ceiling means the operator said nothing, and the number is
+/// derived from `total_core_instances` — the engine's actual pool budget — so a
+/// host told it is larger sizes its messaging ceiling to match instead of
+/// leaving a stock default silently binding. This is why the flags must not
+/// carry a `default_value_t`: a parse-time default is indistinguishable here
+/// from an operator typing the same number.
+///
+/// # Errors
+///
+/// Rejects a ceiling outside `1..=`[`MessagingLimits::MAX_IN_FLIGHT`]. Zero
+/// would silently mean "process no messages", which is never what an operator
+/// meant; a value above the maximum would panic inside the semaphore at
+/// startup. Better a startup error than a host that looks healthy and quietly
+/// consumes nothing, or one that aborts with a backtrace.
+///
+/// [`MessagingLimits`]: wash_runtime::plugin::wasmcloud_messaging::MessagingLimits
+/// [`MessagingLimits::MAX_IN_FLIGHT`]: wash_runtime::plugin::wasmcloud_messaging::MessagingLimits::MAX_IN_FLIGHT
+pub fn wasmcloud_messaging_limits(
+    max_in_flight: Option<usize>,
+    max_in_flight_per_component: Option<usize>,
+    total_core_instances: Option<u32>,
+) -> anyhow::Result<wash_runtime::plugin::wasmcloud_messaging::MessagingLimits> {
+    use wash_runtime::plugin::wasmcloud_messaging::MessagingLimits;
+
+    let checked = |value: Option<usize>, flag: &str| -> anyhow::Result<Option<usize>> {
+        match value {
+            Some(0) => anyhow::bail!("{flag} must be at least 1"),
+            Some(v) if v > MessagingLimits::MAX_IN_FLIGHT => anyhow::bail!(
+                "{flag} must be at most {} (the most a semaphore can hold), got {v}",
+                MessagingLimits::MAX_IN_FLIGHT
+            ),
+            other => Ok(other),
+        }
+    };
+
+    // A per-component ceiling above the host-wide total is harmless — the host
+    // semaphore gates first — but almost certainly an operator mixing the two
+    // knobs up, so `MessagingLimits::new` warns about it, exactly as
+    // `connection_quotas` does for its equivalent.
+    let limits = MessagingLimits::resolve(
+        checked(max_in_flight, "wasmcloud_messaging_max_in_flight")?,
+        checked(
+            max_in_flight_per_component,
+            "wasmcloud_messaging_max_in_flight_per_component",
+        )?,
+        total_core_instances,
+    );
+
+    // Both numbers vary by host — pooling on or off, the size of the pool, and
+    // which flags were given — so an operator cannot read them off the docs.
+    // They are also the numbers a shed warning tells them to go and raise, which
+    // makes this the one derived ceiling worth a line at startup.
+    tracing::info!(
+        host_total = limits.host_total(),
+        per_component_default = limits.per_component_default(),
+        host_total_source = if max_in_flight.is_some() {
+            "flag"
+        } else if total_core_instances.is_some() {
+            "derived from the instance pool"
+        } else {
+            "built-in default (pooling disabled)"
+        },
+        per_component_source = if max_in_flight_per_component.is_some() {
+            "flag"
+        } else {
+            "derived from the host total"
+        },
+        "wasmcloud:messaging admission ceilings resolved"
+    );
+
+    Ok(limits)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -395,13 +787,43 @@ pub struct DevConfig {
     /// Whether the component under development should be treated as a service
     #[serde(default)]
     pub service: bool,
-    /// Optional path to a wasm component to be used as a service
+    /// Optional path to a wasm component to be used as a service. Mutually
+    /// exclusive with `service_image`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_file: Option<PathBuf>,
+    /// Optional OCI image for the component to be used as a service. Mutually
+    /// exclusive with `service_file`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_image: Option<String>,
+    /// Pull policy for `service_image`: `always`, `ifNotPresent`, or `never`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_pull_policy: Option<String>,
+    /// Ports the service listens on inside the workload's virtual loopback,
+    /// and which of them the host exposes on a real address.
+    ///
+    /// Each entry needs a `name` and the `port` the service binds on
+    /// `127.0.0.1`; add `publish: <hostPort>` to expose it. Omitting `publish`
+    /// declares the port without exposing it, which is exactly today's
+    /// behavior. `bind` is not accepted here — handing a guest a real listening
+    /// socket is an operator's call, and a workload's ports are not.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_ports: Vec<wash_runtime::host::declared_port::DeclaredPort>,
+
+    /// Reach registries over HTTP instead of HTTPS. Applies to every image a
+    /// dev session pulls components, the service, and host plugins.
+    /// Mirrors `wash host --allow-insecure-registries`.
+    #[serde(default)]
+    pub allow_insecure_registries: bool,
 
     /// Additional components to load alongside the main component
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub components: Vec<DevComponent>,
+
+    /// Host component plugins to load into the dev host: WebAssembly components
+    /// that provide host capabilities. Requires a wash build with the
+    /// `host-component-plugins` feature.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_plugins: Vec<HostPluginConfig>,
 
     /// Volumes to mount into the dev environment
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -425,6 +847,52 @@ pub struct DevConfig {
     pub tls_key_path: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls_ca_path: Option<PathBuf>,
+
+    /// Extra CA certificate bundle files (PEM) trusted for *outbound* HTTPS
+    /// requests made by the component (`wasi:http` outgoing handler), layered
+    /// on top of `http_client_trust_roots`. Use this to reach hosts behind a
+    /// corporate or otherwise private CA. Unlike `tls_ca_path` (which
+    /// configures the ingress HTTP server), these apply to requests the
+    /// component sends out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub http_client_ca_paths: Vec<PathBuf>,
+
+    /// Built-in trust roots for the component's *outbound* HTTPS requests,
+    /// before `http_client_ca_paths` bundles are layered on top. Defaults to
+    /// `webpki`; set `webpki-and-native` to also trust the platform store
+    /// (which honours `SSL_CERT_FILE`/`SSL_CERT_DIR`).
+    #[serde(default, skip_serializing_if = "HttpClientTrustRoots::is_default")]
+    pub http_client_trust_roots: HttpClientTrustRoots,
+
+    /// Raw `wasi:sockets` connections one workload may hold.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_outbound_socket_connections_per_workload: Option<usize>,
+
+    /// Inbound published-port connections one workload may serve at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_inbound_socket_connections_per_workload: Option<usize>,
+
+    /// Host-wide cap on live *outbound* HTTP connections across all
+    /// workloads combined (in-flight or idle in a keep-alive pool). Defaults
+    /// to the runtime's built-in limit; size it for the number of
+    /// concurrently busy workloads times their burst concurrency.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_connections: Option<usize>,
+
+    /// Cap on live *outbound* HTTP connections a single workload may hold,
+    /// across all authorities it talks to. Defaults to the runtime's
+    /// built-in limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_outbound_http_connections_per_workload: Option<usize>,
+
+    /// How long an outbound request waits for a connection slot once one of
+    /// the caps above is reached, before failing with a connect timeout.
+    /// A humantime duration such as `5s` or `500ms`; defaults to the
+    /// runtime's built-in wait. A component's own `connect-timeout` bounds
+    /// its request independently, so this only decides how long an attempt
+    /// nothing is waiting on may hold a slot reservation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_connection_wait: Option<String>,
 
     /// Enable WASI WebGPU support in the dev environment. Only supported on non-Windows platforms.
     #[serde(default)]
@@ -470,8 +938,9 @@ pub struct DevConfig {
     pub wasi_otel: bool,
 
     /// Additional wasm proposals to enable on the engine, by name. Accepted
-    /// names match `wash_runtime`'s `WasmProposal`: component-model-async, gc,
-    /// exception-handling, wide-arithmetic, threads, tail-call.
+    /// names match `wash_runtime`'s `WasmProposal`: component-model-async,
+    /// component-model-map, gc, exception-handling, wide-arithmetic, threads,
+    /// tail-call.
     #[serde(default)]
     pub wasm_proposals: Vec<String>,
 
@@ -482,6 +951,52 @@ pub struct DevConfig {
 }
 
 impl DevConfig {
+    /// The connection quota registry this dev config asks for.
+    ///
+    /// Lives here rather than at the call site so the five knobs are read in
+    /// one place, next to the fields they come from — adding a surface means
+    /// touching this method, not every caller.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `http_connection_wait` is not a duration, or if any ceiling is
+    /// zero.
+    pub fn connection_quotas(
+        &self,
+    ) -> Result<std::sync::Arc<wash_runtime::host::quota::QuotaRegistry>> {
+        let http_connection_wait = self
+            .http_connection_wait
+            .as_deref()
+            .map(humantime::parse_duration)
+            .transpose()
+            .context("dev.http_connection_wait is not a valid duration (e.g. `5s`)")?;
+        connection_quotas(
+            self.max_connections,
+            self.max_outbound_http_connections_per_workload,
+            self.max_outbound_socket_connections_per_workload,
+            self.max_inbound_socket_connections_per_workload,
+            http_connection_wait,
+        )
+    }
+
+    /// Where the separately-configured service component comes from, or `None`
+    /// when none is configured.
+    ///
+    /// `dev.service = true` makes the component under development the service,
+    /// and then this is ignored. See `wash dev`'s workload assembly.
+    pub fn service_source(&self) -> Result<Option<ComponentSource>> {
+        if self.service_file.is_none() && self.service_image.is_none() {
+            return Ok(None);
+        }
+        ComponentSourceConfig {
+            file: self.service_file.clone(),
+            image: self.service_image.clone(),
+            pull_policy: self.service_pull_policy.clone(),
+        }
+        .to_source("dev.service_file/service_image")
+        .map(Some)
+    }
+
     pub fn validate(&self) -> Result<()> {
         let mut errors: Vec<String> = Vec::new();
 
@@ -548,9 +1063,22 @@ impl DevConfig {
             if comp.name.trim().is_empty() {
                 errors.push("dev.components contains an entry with empty name".to_string());
             }
-            if comp.file.as_os_str().is_empty() {
-                errors.push(format!("dev.components['{}'].file is empty", comp.name));
+            if let Err(err) = comp
+                .source
+                .to_source(&format!("dev.components['{}']", comp.name))
+            {
+                errors.push(format!("{err:#}"));
             }
+        }
+
+        for plugin in &self.host_plugins {
+            if let Err(err) = plugin.to_spec_unresolved() {
+                errors.push(format!("{err:#}"));
+            }
+        }
+
+        if let Err(err) = self.service_source() {
+            errors.push(format!("{err:#}"));
         }
 
         if errors.is_empty() {
@@ -814,6 +1342,7 @@ pub fn example_config() -> Config {
             postgres_url: Some("postgres://user:pass@127.0.0.1:5432".to_string()),
             ..Default::default()
         }),
+        host: None,
         new: None,
         wit: Some(WitConfig {
             registries: vec![],
@@ -854,11 +1383,176 @@ fn check_url_scheme(field: &str, value: &str, expected: &[&str], errors: &mut Ve
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
     fn build_no_command_is_ok() {
         assert!(BuildConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn connection_quotas_default_when_unset() {
+        let quotas = connection_quotas(None, None, None, None, None).unwrap();
+        let defaults = wash_runtime::host::quota::QuotaLimits::default();
+        assert_eq!(quotas.limits(), defaults);
+    }
+
+    #[test]
+    fn connection_quotas_apply_overrides() {
+        let quotas = connection_quotas(
+            Some(64),
+            Some(8),
+            Some(16),
+            Some(32),
+            Some(Duration::from_millis(250)),
+        )
+        .unwrap();
+        assert_eq!(quotas.limits().outbound_http, 8);
+        assert_eq!(quotas.limits().outbound_sockets, 16);
+        assert_eq!(quotas.limits().inbound_sockets, 32);
+        assert_eq!(quotas.http_wait(), Duration::from_millis(250));
+    }
+
+    /// Each surface is its own ceiling, so filling one must leave the others
+    /// alone — the property the unified quota exists to provide.
+    #[test]
+    fn connection_quotas_are_per_surface_and_per_guest() {
+        let quotas = connection_quotas(None, Some(4), Some(1), Some(1), None).unwrap();
+        let guest = quotas.for_guest("w-1");
+        let _held = guest
+            .try_acquire_outbound_socket()
+            .expect("its one socket slot");
+        assert!(
+            guest.try_acquire_outbound_socket().is_none(),
+            "sockets are at ceiling"
+        );
+        assert!(
+            guest.try_acquire_inbound_socket().is_some(),
+            "inbound must not be affected"
+        );
+        assert_eq!(
+            guest.outbound_http_available(),
+            4,
+            "http must not be affected"
+        );
+        assert!(
+            quotas
+                .for_guest("w-2")
+                .try_acquire_outbound_socket()
+                .is_some(),
+            "another guest has its own allowance"
+        );
+    }
+
+    /// Every knob is a hard bound, so a zero would wedge that surface
+    /// entirely — reject it at startup rather than at the first request.
+    #[test]
+    fn connection_quotas_reject_zero() {
+        assert!(connection_quotas(Some(0), None, None, None, None).is_err());
+        assert!(connection_quotas(None, Some(0), None, None, None).is_err());
+        assert!(connection_quotas(None, None, Some(0), None, None).is_err());
+        assert!(connection_quotas(None, None, None, Some(0), None).is_err());
+        assert!(connection_quotas(None, None, None, None, Some(Duration::ZERO)).is_err());
+    }
+
+    #[test]
+    fn wasmcloud_messaging_limits_reject_zero() {
+        // Zero would silently mean "process no messages" — a host that looks
+        // healthy and quietly consumes nothing. Better a startup error.
+        assert!(wasmcloud_messaging_limits(Some(0), Some(32), None).is_err());
+        assert!(wasmcloud_messaging_limits(Some(128), Some(0), None).is_err());
+    }
+
+    #[test]
+    fn wasmcloud_messaging_limits_reject_more_than_a_semaphore_can_hold() {
+        // Above this the semaphore panics at startup, so an unchecked value is
+        // not a large ceiling but an abort with a backtrace. `usize::MAX` is
+        // what a fat-fingered "unlimited" looks like.
+        let too_big = wash_runtime::plugin::wasmcloud_messaging::MessagingLimits::MAX_IN_FLIGHT + 1;
+        assert!(wasmcloud_messaging_limits(Some(too_big), None, None).is_err());
+        assert!(wasmcloud_messaging_limits(None, Some(too_big), None).is_err());
+        assert!(wasmcloud_messaging_limits(Some(usize::MAX), None, None).is_err());
+    }
+
+    #[test]
+    fn wasmcloud_messaging_limits_apply_overrides() {
+        let limits = wasmcloud_messaging_limits(Some(64), Some(8), None).expect("valid ceilings");
+        assert_eq!(limits.host_total(), 64);
+        assert_eq!(limits.per_component_default(), 8);
+
+        // An explicit ceiling wins over what the pool would have derived —
+        // otherwise the flag would be advisory on a pooled host.
+        let limits =
+            wasmcloud_messaging_limits(Some(64), Some(8), Some(3000)).expect("valid ceilings");
+        assert_eq!(limits.host_total(), 64);
+        assert_eq!(limits.per_component_default(), 8);
+    }
+
+    #[test]
+    fn wasmcloud_messaging_limits_default_to_the_documented_pair() {
+        // No flags and no pool to derive from: the pinned defaults stand.
+        let limits =
+            wasmcloud_messaging_limits(None, None, None).expect("the built-in defaults are valid");
+        assert_eq!(limits.host_total(), 128);
+        assert_eq!(limits.per_component_default(), 32);
+    }
+
+    #[test]
+    fn setting_only_the_host_ceiling_still_moves_the_per_component_default() {
+        // The operator-visible symptom of deriving the two independently:
+        // `--wasmcloud-messaging-max-in-flight 1024` was accepted, the host
+        // ceiling rose, and every component stayed pinned at the pool-derived
+        // default — so on any host with fewer than ~31 messaging components the
+        // flag changed nothing at all.
+        let derived = wasmcloud_messaging_limits(None, None, Some(1000)).expect("valid");
+        let raised = wasmcloud_messaging_limits(Some(1024), None, Some(1000)).expect("valid");
+        assert_eq!(raised.host_total(), 1024);
+        assert!(
+            raised.per_component_default() > derived.per_component_default(),
+            "raising only the host ceiling left the per-component default at {}",
+            raised.per_component_default()
+        );
+
+        // Lowering it must not leave the per-component default stranded above
+        // the total the operator just set.
+        let lowered = wasmcloud_messaging_limits(Some(4), None, Some(1000)).expect("valid");
+        assert!(lowered.per_component_default() <= lowered.host_total());
+    }
+
+    #[test]
+    fn wasmcloud_messaging_limits_do_not_over_commit_a_small_pool() {
+        // A pool of 16 core instances holds 3 worst-case components. The
+        // derived ceiling must not exceed that: admitting 8 would need 40 core
+        // instances and fail at instantiation, which is the exhaustion these
+        // ceilings exist to prevent.
+        let limits = wasmcloud_messaging_limits(None, None, Some(16)).expect("valid");
+        assert!(
+            limits.host_total() <= 3,
+            "a 16-instance pool derived a ceiling of {} messages",
+            limits.host_total()
+        );
+    }
+
+    #[test]
+    fn wasmcloud_messaging_limits_scale_with_the_pool() {
+        // The point of deriving: a host told it is larger gets a larger
+        // messaging ceiling, instead of the stock default silently binding.
+        let stock = wasmcloud_messaging_limits(None, None, Some(1000)).expect("valid");
+        let big = wasmcloud_messaging_limits(None, None, Some(8000)).expect("valid");
+        assert!(
+            big.host_total() > stock.host_total(),
+            "raising WASMTIME_POOLING_TOTAL_CORE_INSTANCES must raise the messaging ceiling: \
+             {} vs {}",
+            big.host_total(),
+            stock.host_total()
+        );
+        // And the per-component ceiling never exceeds the host one, however the
+        // pool is sized.
+        for limits in [&stock, &big] {
+            assert!(limits.per_component_default() <= limits.host_total());
+        }
     }
 
     #[test]
@@ -945,6 +1639,8 @@ workload:
   allowedHosts:
     - https://api.example.com
   allowOutboundHttpInsecure: true
+  allowedIpNameLookups:
+    - "*.example.com"
 "#;
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
         let workload = config.workload.expect("workload should parse");
@@ -965,6 +1661,10 @@ workload:
             workload.allow_outbound_http_insecure,
             Some(true),
             "allowOutboundHttpInsecure should parse via camelCase"
+        );
+        assert_eq!(
+            workload.allowed_ip_name_lookups,
+            vec!["*.example.com".parse().unwrap()]
         );
     }
 
@@ -1133,16 +1833,111 @@ workload:
             ..Default::default()
         };
         let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("file is empty"));
+        assert!(err.contains("`file` source is empty"), "{err}");
     }
 
     #[test]
     fn dev_component_valid_is_ok() {
         let cfg = DevConfig {
-            components: vec![DevComponent::new("sidecar", "sidecar.wasm")],
+            components: vec![
+                DevComponent::new("sidecar", "sidecar.wasm"),
+                DevComponent::from_source(
+                    "pulled",
+                    ComponentSourceConfig::image("ghcr.io/acme/sidecar:1"),
+                ),
+            ],
             ..Default::default()
         };
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn dev_component_ambiguous_source_is_err() {
+        // Both sources, then neither, then a pull policy on a file.
+        for source in [
+            ComponentSourceConfig {
+                file: Some("sidecar.wasm".into()),
+                image: Some("ghcr.io/acme/sidecar:1".into()),
+                pull_policy: None,
+            },
+            ComponentSourceConfig::default(),
+            ComponentSourceConfig {
+                file: Some("sidecar.wasm".into()),
+                image: None,
+                pull_policy: Some("always".into()),
+            },
+            ComponentSourceConfig {
+                file: None,
+                image: Some("ghcr.io/acme/sidecar:1".into()),
+                pull_policy: Some("sometimes".into()),
+            },
+        ] {
+            let cfg = DevConfig {
+                components: vec![DevComponent::from_source("sidecar", source)],
+                ..Default::default()
+            };
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("dev.components['sidecar']"), "{err}");
+        }
+    }
+
+    #[test]
+    fn dev_component_image_source_parses_from_yaml() {
+        // `image` / `pullPolicy` are flattened alongside `file`, so a sidecar
+        // names its wasm exactly the way a host plugin does.
+        let yaml = r#"
+dev:
+  components:
+    - name: sidecar
+      image: ghcr.io/acme/sidecar:1.0.0
+      pullPolicy: always
+"#;
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        let dev = config.dev();
+        let source = dev.components[0].source.to_source("sidecar").unwrap();
+        assert_eq!(
+            source,
+            ComponentSource::Oci {
+                image: "ghcr.io/acme/sidecar:1.0.0".into(),
+                pull_policy: OciPullPolicy::Always,
+            }
+        );
+    }
+
+    #[test]
+    fn dev_service_takes_a_file_or_an_image_but_not_both() {
+        let none = DevConfig::default();
+        assert!(none.service_source().unwrap().is_none());
+
+        let file = DevConfig {
+            service_file: Some("service.wasm".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            file.service_source().unwrap(),
+            Some(ComponentSource::File("service.wasm".into()))
+        );
+
+        let image = DevConfig {
+            service_image: Some("ghcr.io/acme/svc:1".into()),
+            service_pull_policy: Some("always".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            image.service_source().unwrap(),
+            Some(ComponentSource::Oci {
+                image: "ghcr.io/acme/svc:1".into(),
+                pull_policy: OciPullPolicy::Always,
+            })
+        );
+
+        let both = DevConfig {
+            service_file: Some("service.wasm".into()),
+            service_image: Some("ghcr.io/acme/svc:1".into()),
+            ..Default::default()
+        };
+        assert!(both.service_source().is_err());
+        assert!(both.validate().is_err());
     }
 
     #[test]
@@ -1184,6 +1979,152 @@ dev:
         assert!(component.environment.is_none());
         assert!(component.config.is_empty());
         assert!(component.allowed_hosts.is_none());
+    }
+
+    #[test]
+    fn dev_host_plugins_parse_from_yaml_and_convert_to_spec() {
+        // The `dev.host_plugins` key follows DevConfig's snake_case; each entry's
+        // fields follow the camelCase used by other nested dev structs.
+        let yaml = r#"
+dev:
+  host_plugins:
+    - id: acme-kv
+      file: ./build/kv_plugin.wasm
+      maxRestarts: 3
+    - id: acme-widgets
+      image: ghcr.io/acme/widgets:1.2.0
+      pullPolicy: ifNotPresent
+"#;
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        let dev = config.dev();
+        assert_eq!(dev.host_plugins.len(), 2);
+
+        let kv = dev.host_plugins[0].to_spec_unresolved().unwrap();
+        assert_eq!(kv.id, "acme-kv");
+        assert_eq!(
+            kv.source,
+            ComponentSource::File("./build/kv_plugin.wasm".into())
+        );
+        assert_eq!(kv.max_restarts, Some(3));
+
+        let widgets = dev.host_plugins[1].to_spec_unresolved().unwrap();
+        assert_eq!(
+            widgets.source,
+            ComponentSource::image("ghcr.io/acme/widgets:1.2.0")
+        );
+    }
+
+    #[test]
+    fn host_plugins_parse_from_yaml_and_resolve_config_from_secret_from() {
+        // `host.hostPlugins` mirrors `dev.host_plugins`'s shape but adds
+        // `config`/`configFrom`/`secretFrom` (this plugin's own bind-time
+        // config, resolved the same way `workload.environment` is) and
+        // `allowedHosts`/`allowedIpNameLookups`.
+        let yaml = r#"
+configs:
+  etcd-connection-settings:
+    inline:
+      etcd-prefix: /wasmcloud/secrets
+secrets:
+  etcd-client-cert:
+    inline:
+      api-key: s3cr3t-value
+host:
+  hostPlugins:
+    - id: etcd-secrets
+      image: ghcr.io/example/etcd-secrets:1.0.0
+      allowedHosts:
+        - https://etcd.internal:2379
+      allowedIpNameLookups:
+        - etcd.internal
+      config:
+        literal-key: literal-value
+      configFrom:
+        - etcd-connection-settings
+      secretFrom:
+        - etcd-client-cert
+"#;
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        let host = config.host();
+        assert_eq!(host.host_plugins.len(), 1);
+        let hp = &host.host_plugins[0];
+        assert_eq!(hp.id, "etcd-secrets");
+        assert_eq!(hp.allowed_hosts.len(), 1);
+        assert_eq!(hp.allowed_ip_name_lookups.len(), 1);
+
+        let spec = hp
+            .to_spec(&config, Path::new("."), None)
+            .expect("host_plugins entry should resolve");
+        assert_eq!(spec.id, "etcd-secrets");
+        assert_eq!(
+            spec.source,
+            ComponentSource::image("ghcr.io/example/etcd-secrets:1.0.0")
+        );
+        assert_eq!(spec.allowed_hosts.len(), 1);
+        assert_eq!(spec.allowed_ip_name_lookups.len(), 1);
+        // inline < configFrom < secretFrom precedence, all three present.
+        assert_eq!(spec.config.get("literal-key").unwrap(), "literal-value");
+        assert_eq!(
+            spec.config.get("etcd-prefix").unwrap(),
+            "/wasmcloud/secrets"
+        );
+        assert_eq!(spec.config.get("api-key").unwrap(), "s3cr3t-value");
+    }
+
+    #[test]
+    fn host_plugins_unresolved_config_from_reference_is_an_error() {
+        let yaml = r#"
+host:
+  hostPlugins:
+    - id: etcd-secrets
+      image: ghcr.io/example/etcd-secrets:1.0.0
+      configFrom:
+        - missing
+"#;
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        let hp = &config.host().host_plugins[0];
+        assert!(hp.to_spec(&config, Path::new("."), None).is_err());
+    }
+
+    #[test]
+    fn host_plugin_config_validation_rejects_ambiguous_specs() {
+        // Both sources set.
+        let both = HostPluginConfig {
+            id: "x".into(),
+            source: ComponentSourceConfig {
+                file: Some("a.wasm".into()),
+                image: Some("ghcr.io/x:1".into()),
+                pull_policy: None,
+            },
+            ..Default::default()
+        };
+        assert!(both.to_spec_unresolved().is_err());
+
+        // No source.
+        let neither = HostPluginConfig {
+            id: "x".into(),
+            ..Default::default()
+        };
+        assert!(neither.to_spec_unresolved().is_err());
+
+        // pullPolicy with a file source.
+        let pull_on_file = HostPluginConfig {
+            id: "x".into(),
+            source: ComponentSourceConfig {
+                file: Some("a.wasm".into()),
+                image: None,
+                pull_policy: Some("always".into()),
+            },
+            ..Default::default()
+        };
+        assert!(pull_on_file.to_spec_unresolved().is_err());
+
+        // Empty id.
+        let empty_id = HostPluginConfig {
+            source: ComponentSourceConfig::file("a.wasm"),
+            ..Default::default()
+        };
+        assert!(empty_id.to_spec_unresolved().is_err());
     }
 
     #[test]

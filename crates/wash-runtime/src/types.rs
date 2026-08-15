@@ -18,6 +18,8 @@ use bytes::Bytes;
 use std::{collections::HashMap, sync::Arc};
 
 use crate::host::allowed_hosts::AllowedHost;
+use crate::host::allowed_ip_name::AllowedIpName;
+use crate::host::allowed_loopback::AllowedLoopbackPort;
 use crate::wit::WitInterface;
 
 /// Represents a deployable workload containing one or more WebAssembly components.
@@ -65,8 +67,22 @@ pub struct Component {
     pub bytes: Bytes,
     pub digest: Option<String>,
     pub local_resources: LocalResources,
+    /// The instance limits, exactly as the wire carried them. Signed because
+    /// they mirror the Kubernetes CRD fields a workload sets them through, and
+    /// unset is spelled as a non-positive value there. Nothing reads them
+    /// directly: [`crate::engine::InstancePolicy::from_component`] decodes all
+    /// three into named, non-zero limits once.
     pub pool_size: i32,
     pub max_invocations: i32,
+    /// How many calls one warm instance may serve at the same time.
+    ///
+    /// Unset or below `1` means one, which is what a component gets without
+    /// asking: a warm instance serves a single call at a time, exactly as an
+    /// unpooled one does. Raising it lets an instance overlap calls while it is
+    /// awaiting I/O, and is only safe for a guest that yields rather than
+    /// blocks — a guest driving its own executor with `block_on` must stay at
+    /// one.
+    pub max_concurrency: i32,
 }
 
 /// Resource limits and configuration for a component or service.
@@ -97,6 +113,25 @@ pub struct LocalResources {
     /// wire (proto / wash YAML) are parsed at conversion time, so the
     /// request hot path matches against the typed enum directly.
     pub allowed_hosts: Arc<[AllowedHost]>,
+    /// Which names the component may resolve through
+    /// `wasi:sockets/ip-name-lookup` (`resolve-addresses`).
+    /// **Empty = deny every lookup**, reported to the guest as
+    /// `permanent-resolver-failure`. See
+    /// [`crate::host::allowed_ip_name`] for the accepted entry forms; pass
+    /// an explicit `[AllowedIpName::Any]` to resolve any name. Strings from
+    /// the wire (proto / wash YAML) are parsed at conversion time, so the
+    /// resolve path matches against the typed enum directly.
+    pub allowed_ip_name_lookups: Arc<[AllowedIpName]>,
+    /// Ports on the machine's own loopback this component may reach through
+    /// `host.wasmcloud.internal`.
+    ///
+    /// **Empty = deny every host-loopback connection**, and a non-empty list is
+    /// still inert unless the host itself was started with
+    /// `--allow-host-loopback`: neither a workload author nor an operator can
+    /// open this door alone. See [`crate::host::allowed_loopback`] for the
+    /// accepted entry forms. Strings from the wire (proto / wash YAML) are
+    /// parsed at conversion time.
+    pub allowed_host_loopback_ports: Arc<[AllowedLoopbackPort]>,
 }
 
 impl Default for LocalResources {
@@ -108,6 +143,8 @@ impl Default for LocalResources {
             environment: HashMap::new(),
             volume_mounts: Vec::new(),
             allowed_hosts: Default::default(),
+            allowed_ip_name_lookups: Default::default(),
+            allowed_host_loopback_ports: Default::default(),
         }
     }
 }

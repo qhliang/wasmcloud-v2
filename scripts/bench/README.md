@@ -569,8 +569,16 @@ GitHub → **Actions** → **bench** → **Run workflow**:
 
 | Input   | Description                                                                                | Default          |
 | ------- | ------------------------------------------------------------------------------------------ | ---------------- |
-| `bench` | which bench to run (`http_invoke`, `gungraun`, `wasmtime_baseline`, `wasmtime_serve`) | `http_invoke`    |
-| `ref`   | git ref to bench (branch, tag, or sha)                                                     | the workflow ref |
+| `bench` | which bench to run (`http_invoke`, `service_http`, `gungraun`, `wasmtime_baseline`, `wasmtime_serve`, `gungraun_plugin`) | `http_invoke`    |
+| `ref`   | git ref to bench (branch, tag, sha, or a pull request as `#123` / `pull/123` / `pr/123` — the same spellings bench-compare accepts) | the workflow ref |
+
+A pull-request ref produces a step summary and an uploaded artifact but is
+deliberately **not** pushed to S3, so it never lands on the trends timeline —
+that timeline tracks merged history, and the run's data row would otherwise
+describe code that may never land. Rows from a PR run are labelled `pull/123`;
+the exact commit is on the row's `sha` field either way. To compare a PR
+against its baseline rather than read its absolute numbers, use **bench-compare**
+(§9.4) — that is the workflow built for it.
 
 **Bench types:**
 
@@ -580,6 +588,7 @@ GitHub → **Actions** → **bench** → **Run workflow**:
 | `gungraun`          | gungraun      | CPU instruction count (cachegrind) | deterministic regression detection; not subject to shared-runner timing noise. `gungraun` is the renamed/refreshed `iai-callgrind` (rename landed upstream at 0.17.0) |
 | `wasmtime_baseline` | criterion     | wall-clock                         | wasmtime-only baseline for context                                                                                                                             |
 | `wasmtime_serve`    | criterion     | wall-clock                         | wasmtime serve subcommand baseline                                                                                                                             |
+| `gungraun_plugin`   | gungraun      | CPU instruction count (cachegrind) | host component plugin: the cross-store capability hop, and the plugin's `on-workload-bind` contribution separated from component instantiation. Both are far below what a wall-clock harness can resolve, which is why this is an instruction-count bench rather than a criterion one. Needs `--features host-component-plugins` (added by `run-bench.sh`) plus valgrind — no Apple Silicon support, so it runs on the bench host only |
 
 Anyone with repo-write can dispatch. The job queues on the
 `bench-host` concurrency group, so two dispatched runs serialize.

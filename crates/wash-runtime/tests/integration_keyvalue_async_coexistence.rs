@@ -34,7 +34,7 @@ use wash_runtime::{
     engine::Engine,
     host::{
         HostApi, HostBuilder,
-        http::{DevRouter, HttpServer},
+        http::{DevRouter, Ingress},
     },
     plugin::wasi_keyvalue::{
         InMemoryKeyValue, InMemoryProvider, MultiplexedAsyncKeyValue, MultiplexedKeyValue,
@@ -74,7 +74,7 @@ fn wasmcloud_kv_store(name: &str) -> WitInterface {
         namespace: "wasmcloud".to_string(),
         package: "keyvalue".to_string(),
         interfaces: ["store".to_string()].into_iter().collect(),
-        version: Some(semver::Version::parse("0.1.0").unwrap()),
+        version: Some(semver::Version::parse("0.2.0").unwrap()),
         config: HashMap::from([("backend".to_string(), "in-memory".to_string())]),
         name: Some(name.to_string()),
     }
@@ -100,6 +100,7 @@ fn workload(
                 local_resources: LocalResources::default(),
                 pool_size: 1,
                 max_invocations: 100,
+                max_concurrency: 1,
             }],
             host_interfaces,
             volumes: vec![],
@@ -110,11 +111,11 @@ fn workload(
 #[tokio::test]
 async fn standalone_sync_and_async_keyvalue_coexist() -> Result<()> {
     let engine = Engine::builder().build()?;
-    let http_server = HttpServer::new(DevRouter::default(), "127.0.0.1:0".parse()?).await?;
-    let addr = http_server.addr();
+    let ingress = Ingress::new(DevRouter::default(), "127.0.0.1:0".parse()?).await?;
+    let addr = ingress.addr();
     let host = HostBuilder::new()
         .with_engine(engine)
-        .with_http_handler(Arc::new(http_server))
+        .with_http_handler(Arc::new(ingress))
         .with_plugin(Arc::new(InMemoryKeyValue::new()))?
         .with_plugin(Arc::new(
             MultiplexedKeyValue::new().with_provider(Arc::new(InMemoryProvider)),
