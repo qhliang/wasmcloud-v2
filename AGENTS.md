@@ -17,6 +17,7 @@ cargo test -p wash-runtime --features wasi-tls,host-component-plugins  # CI 必�
 cargo clippy --workspace --features wasi-tls,host-component-plugins    # CI lint 命令
 cargo +nightly fmt -- --check              # 代码格式检查
 cargo machete                              # 未使用依赖检查
+cargo xtask build-fixtures                 # 生成 wash-runtime 集成测试所需 wasm fixtures（tests/wasm/ 下，被 gitignore）
 ```
 
 ## 仓库结构
@@ -71,6 +72,7 @@ cargo machete                              # 未使用依赖检查
   2. `cargo +nightly fmt -- --check`
   3. `cargo clippy --workspace --features wasi-tls,host-component-plugins`
   4. `cargo machete`
+- **fixtures 导致的失败可忽略，不用处理** — `cargo test --workspace` 编译集成测试需要 `crates/wash-runtime/tests/wasm/*.wasm`（构建产物，被 gitignore，需 `cargo xtask build-fixtures` 生成；部分 fixture 如 `http-egress-plugin` 需从 ghcr.io 拉取 WASI 依赖，网络受限时会失败）。此类失败属于环境问题，与代码改动无关，可直接提交
 
 ## http-api-distributed example 编译
 
