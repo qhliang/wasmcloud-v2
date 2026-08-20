@@ -156,6 +156,7 @@ impl CliCommand for DevCommand {
         // use a filesystem backend if there is a path override,
         // otherwise it uses NATS if `data_nats_url` is set, otherwise it falls back to
         // the in-memory plugin.
+        #[cfg(not(feature = "wasm_component_model_implements"))]
         if let Some(blobstore_path) = &dev_config.wasi_blobstore_path {
             host_builder = host_builder.with_plugin(Arc::new(
                 plugin::wasi_blobstore::FilesystemBlobstore::new(blobstore_path.clone()),
@@ -249,21 +250,6 @@ impl CliCommand for DevCommand {
         host_builder =
             host_builder.with_plugin(Arc::new(plugin::wasi_logging::TracingLogger::default()))?;
         debug!("Logging plugin registered");
-
-        #[cfg(not(feature = "wasm_component_model_implements"))]
-        // Standalone blobstore plugin — NATS when `dev.data_nats_url` is set,
-        // otherwise the in-memory backend. Handles the default (unnamed)
-        // `wasi:blobstore/blobstore` import.
-        if let Some(client) = &data_nats_client {
-            host_builder = host_builder
-                .with_plugin(Arc::new(plugin::wasi_blobstore::NatsBlobstore::new(client)))?;
-            debug!("WASI Blobstore plugin registered with NATS backend (data_nats_url)");
-        } else {
-            host_builder = host_builder.with_plugin(Arc::new(
-                plugin::wasi_blobstore::InMemoryBlobstore::default(),
-            ))?;
-            debug!("WASI Blobstore plugin registered with in-memory backend");
-        }
 
         #[cfg(not(feature = "wasm_component_model_implements"))]
         // Standalone keyvalue plugin — NATS when `dev.data_nats_url` is set,

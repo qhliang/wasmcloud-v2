@@ -497,10 +497,16 @@ impl CliCommand for HostCommand {
                     .build(),
             ))?
             .with_plugin(Arc::new(plugin::wasmcloud_secrets::WasmcloudSecrets::new()))?
-            .with_plugin(Arc::new(plugin::wasi_logging::TracingLogger::default()))?
-            .with_plugin(Arc::new(plugin::wasi_blobstore::NatsBlobstore::new(
-                &data_nats_client,
-            )))?
+            .with_plugin(Arc::new(plugin::wasi_logging::TracingLogger::default()))?;
+
+        #[cfg(not(feature = "wasm_component_model_implements"))]
+        {
+            cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(
+                plugin::wasi_blobstore::NatsBlobstore::new(&data_nats_client),
+            ))?;
+        }
+
+        cluster_host_builder = cluster_host_builder
             .with_plugin(Arc::new(
                 plugin::wasmcloud_messaging::NatsMessaging::with_limits(
                     data_nats_client.clone(),
