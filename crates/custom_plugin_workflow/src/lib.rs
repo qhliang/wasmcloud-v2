@@ -7,12 +7,13 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;
+use std::time::Duration;
 
 use acts::Channel;
 use acts::{Engine, Vars, Workflow};
 use acts::{Event, Message, MessageState};
 use async_trait::async_trait;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{Notify, RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -34,6 +35,11 @@ use bindings::custom::workflow::types::VarPair;
 
 const PLUGIN_ID: &str = "workflow";
 
+/// Upper bound for waiting on a pid -> exec-id mapping. `start` records the
+/// mapping before returning, so this timeout only fires on an unexpected
+/// invariant violation; it exists so the consumer never hangs.
+const EXEC_ID_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
 // ---------------------------------------------------------------------------
 // Queued callback types
 // ---------------------------------------------------------------------------
@@ -47,7 +53,6 @@ enum CallbackKind {
 
 struct QueuedEvent {
     kind: CallbackKind,
-    exec_id: String,
     pid: String,
     inputs: Vec<VarPair>,
     outputs: Vec<VarPair>,
@@ -71,6 +76,10 @@ struct ComponentData {
     /// `start` so lifecycle callbacks can report the exec-id without relying on
     /// the guest embedding it in workflow vars.
     exec_id_by_pid: Arc<StdRwLock<HashMap<String, String>>>,
+    /// Wakes the event consumer after `start` records a pid -> exec-id mapping.
+    /// `start` always records the mapping before returning, so the consumer can
+    /// wait on this instead of racing the write from the channel callbacks.
+    exec_id_notify: Arc<Notify>,
 }
 
 #[derive(Clone)]
@@ -96,6 +105,8 @@ impl WorkflowPlugin {
         component_id: String,
         cancel_token: CancellationToken,
         event_rx: EventRx,
+        exec_id_map: Arc<StdRwLock<HashMap<String, String>>>,
+        exec_id_notify: Arc<Notify>,
     ) {
         tokio::spawn(async move {
             info!(component_id = %component_id, "Workflow event consumer started");
@@ -107,7 +118,14 @@ impl WorkflowPlugin {
                         break;
                     }
                     msg = rx.recv() => match msg {
-                        Some(q) => dispatch_event(&workload, &component_id, q).await,
+                        Some(q) => dispatch_event(
+                            &workload,
+                            &component_id,
+                            q,
+                            exec_id_map.clone(),
+                            exec_id_notify.clone(),
+                        )
+                        .await,
                         None => { info!(component_id = %component_id, "Event channel closed"); break; }
                     }
                 }
@@ -160,7 +178,36 @@ fn msg_to_pairs(inputs: &Vars) -> Vec<VarPair> {
 // Dispatch
 // ---------------------------------------------------------------------------
 
-async fn dispatch_event(workload: &ResolvedWorkload, component_id: &str, q: QueuedEvent) {
+/// Resolves the caller-assigned exec-id for `pid`, waiting (bounded) until
+/// `start` records it. `start` always records the mapping before returning, so
+/// the wait completes promptly; the timeout guards against an invariant
+/// violation that would otherwise hang the consumer.
+async fn resolve_exec_id(
+    exec_id_map: &Arc<StdRwLock<HashMap<String, String>>>,
+    exec_id_notify: &Arc<Notify>,
+    pid: &str,
+) -> String {
+    loop {
+        if let Some(exec_id) = exec_id_map.read().ok().and_then(|m| m.get(pid).cloned()) {
+            return exec_id;
+        }
+        if tokio::time::timeout(EXEC_ID_WAIT_TIMEOUT, exec_id_notify.notified())
+            .await
+            .is_err()
+        {
+            warn!(pid = %pid, "timed out waiting for exec-id mapping, using empty exec-id");
+            return String::new();
+        }
+    }
+}
+
+async fn dispatch_event(
+    workload: &ResolvedWorkload,
+    component_id: &str,
+    q: QueuedEvent,
+    exec_id_map: Arc<StdRwLock<HashMap<String, String>>>,
+    exec_id_notify: Arc<Notify>,
+) {
     let Ok(mut store) = workload.new_store(component_id).await else {
         warn!(component_id = %component_id, "new_store failed");
         return;
@@ -181,21 +228,22 @@ async fn dispatch_event(workload: &ResolvedWorkload, component_id: &str, q: Queu
     let handler = proxy.custom_workflow_handler();
 
     let pid_for_log = q.pid.clone();
+    let exec_id = resolve_exec_id(&exec_id_map, &exec_id_notify, &q.pid).await;
     let result = match q.kind {
-        CallbackKind::Start => handler.call_on_start(&mut store, &q.exec_id, &q.pid).await,
+        CallbackKind::Start => handler.call_on_start(&mut store, &exec_id, &q.pid).await,
         CallbackKind::Message => {
             handler
-                .call_on_message(&mut store, &q.exec_id, &q.pid, &q.inputs)
+                .call_on_message(&mut store, &exec_id, &q.pid, &q.inputs)
                 .await
         }
         CallbackKind::Complete => {
             handler
-                .call_on_complete(&mut store, &q.exec_id, &q.pid, &q.outputs)
+                .call_on_complete(&mut store, &exec_id, &q.pid, &q.outputs)
                 .await
         }
         CallbackKind::Error(err) => {
             handler
-                .call_on_error(&mut store, &q.exec_id, &q.pid, &err)
+                .call_on_error(&mut store, &exec_id, &q.pid, &err)
                 .await
         }
     };
@@ -265,13 +313,15 @@ impl bindings::custom::workflow::manager::Host for ActiveCtx<'_> {
         };
 
         // Record exec-id -> pid so lifecycle callbacks can echo it back without
-        // relying on the guest embedding it in the workflow vars.
+        // relying on the guest embedding it in the workflow vars. The notify
+        // wakes the consumer, which resolves the mapping at dispatch time.
         {
             let lock = plugin.tracker.read().await;
             if let Some(data) = lock.get_component_data(&cid)
                 && let Ok(mut m) = data.exec_id_by_pid.write()
             {
                 m.insert(pid.clone(), exec_id.clone());
+                data.exec_id_notify.notify_one();
             }
         }
 
@@ -427,9 +477,11 @@ impl HostPlugin for WorkflowPlugin {
         // Create the event channel
         let (tx, rx) = mpsc::unbounded_channel::<QueuedEvent>();
 
-        // Maps pid -> exec-id, populated by `start`. Cloned into each channel
-        // callback so every lifecycle event carries the caller-assigned exec-id.
+        // Maps pid -> exec-id, populated by `start`. Resolved by the event
+        // consumer at dispatch time so the channel callbacks never race the
+        // write. `exec_id_notify` wakes the consumer once the mapping lands.
         let exec_id_map = Arc::new(StdRwLock::new(HashMap::new()));
+        let exec_id_notify = Arc::new(Notify::new());
 
         // Register channel callbacks
         let chan_start = engine.channel();
@@ -439,16 +491,10 @@ impl HostPlugin for WorkflowPlugin {
 
         {
             let tx = tx.clone();
-            let map = exec_id_map.clone();
             chan_start.on_start(move |e: &Event<Message>| {
                 let msg = e.inner();
                 let _ = tx.send(QueuedEvent {
                     kind: CallbackKind::Start,
-                    exec_id: map
-                        .read()
-                        .ok()
-                        .and_then(|m| m.get(&msg.pid).cloned())
-                        .unwrap_or_default(),
                     pid: msg.pid.clone(),
                     inputs: msg_to_pairs(&msg.inputs),
                     outputs: msg_to_pairs(&msg.outputs),
@@ -457,16 +503,10 @@ impl HostPlugin for WorkflowPlugin {
         }
         {
             let tx = tx.clone();
-            let map = exec_id_map.clone();
             chan_message.on_message(move |e: &Event<Message>| {
                 let msg = e.inner();
                 let _ = tx.send(QueuedEvent {
                     kind: CallbackKind::Message,
-                    exec_id: map
-                        .read()
-                        .ok()
-                        .and_then(|m| m.get(&msg.pid).cloned())
-                        .unwrap_or_default(),
                     pid: msg.pid.clone(),
                     inputs: msg_to_pairs(&msg.inputs),
                     outputs: msg_to_pairs(&msg.outputs),
@@ -475,16 +515,10 @@ impl HostPlugin for WorkflowPlugin {
         }
         {
             let tx = tx.clone();
-            let map = exec_id_map.clone();
             chan_complete.on_complete(move |e: &Event<Message>| {
                 let msg = e.inner();
                 let _ = tx.send(QueuedEvent {
                     kind: CallbackKind::Complete,
-                    exec_id: map
-                        .read()
-                        .ok()
-                        .and_then(|m| m.get(&msg.pid).cloned())
-                        .unwrap_or_default(),
                     pid: msg.pid.clone(),
                     inputs: msg_to_pairs(&msg.inputs),
                     outputs: msg_to_pairs(&msg.outputs),
@@ -493,16 +527,10 @@ impl HostPlugin for WorkflowPlugin {
         }
         {
             let tx = tx.clone();
-            let map = exec_id_map.clone();
             chan_error.on_error(move |e: &Event<Message>| {
                 let msg = e.inner();
                 let _ = tx.send(QueuedEvent {
                     kind: CallbackKind::Error(format!("state={}", state_str(msg.state))),
-                    exec_id: map
-                        .read()
-                        .ok()
-                        .and_then(|m| m.get(&msg.pid).cloned())
-                        .unwrap_or_default(),
                     pid: msg.pid.clone(),
                     inputs: msg_to_pairs(&msg.inputs),
                     outputs: msg_to_pairs(&msg.outputs),
@@ -525,6 +553,7 @@ impl HostPlugin for WorkflowPlugin {
                 _chan_complete: Some(chan_complete),
                 _chan_error: Some(chan_error),
                 exec_id_by_pid: exec_id_map,
+                exec_id_notify,
             },
         );
 
@@ -548,6 +577,8 @@ impl HostPlugin for WorkflowPlugin {
                     component_id.into(),
                     child,
                     rx,
+                    data.exec_id_by_pid.clone(),
+                    data.exec_id_notify.clone(),
                 );
             }
         }
@@ -612,5 +643,33 @@ mod tests {
         }];
         let vars = vars_from_pairs(&pairs);
         assert_eq!(vars.get::<String>("a"), Some("1".into()));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_exec_id_immediate() {
+        let map = Arc::new(StdRwLock::new(HashMap::new()));
+        let notify = Arc::new(Notify::new());
+        map.write().unwrap().insert("p1".into(), "exec-1".into());
+        assert_eq!(resolve_exec_id(&map, &notify, "p1").await, "exec-1");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_exec_id_waits_for_mapping() {
+        let map = Arc::new(StdRwLock::new(HashMap::new()));
+        let notify = Arc::new(Notify::new());
+
+        let map_task = map.clone();
+        let notify_task = notify.clone();
+        let resolver =
+            tokio::spawn(async move { resolve_exec_id(&map_task, &notify_task, "p1").await });
+
+        // Let the resolver start waiting, then record the mapping and notify.
+        // The test is deterministic either way: if the resolver has not started
+        // awaiting yet, notify_one stores the notification.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        map.write().unwrap().insert("p1".into(), "exec-1".into());
+        notify.notify_one();
+
+        assert_eq!(resolver.await.unwrap(), "exec-1");
     }
 }
