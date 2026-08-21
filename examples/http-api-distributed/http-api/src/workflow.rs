@@ -5,9 +5,13 @@ use crate::helpers;
 use crate::templates;
 
 use serde::Deserialize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use wstd::http::{Body, Request, Response, StatusCode};
 
 use crate::LOG_CTX;
+
+/// Monotonic counter so each demo workflow start gets a unique exec-id.
+static EXEC_SEQ: AtomicU64 = AtomicU64::new(0);
 
 const WORKFLOW_HTML: &str = include_str!("../resources/workflow.html");
 
@@ -45,7 +49,8 @@ pub async fn start(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
 
     log(Level::Info, LOG_CTX, "WORKFLOW START");
 
-    match manager::start(&body.workflow_def, &pairs) {
+    let exec_id = format!("demo-{}", EXEC_SEQ.fetch_add(1, Ordering::SeqCst));
+    match manager::start(&exec_id, &body.workflow_def, &pairs) {
         Ok(pid) => helpers::json_response(serde_json::json!({ "pid": pid }).to_string()),
         Err(e) => helpers::json_error(
             StatusCode::INTERNAL_SERVER_ERROR,

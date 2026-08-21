@@ -3,8 +3,10 @@
 //! Integrates the `acts` workflow engine into wasmCloud.
 //! Host manages workflow lifecycle, guest receives lifecycle events.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::RwLock as StdRwLock;
 
 use acts::Channel;
 use acts::{Engine, Vars, Workflow};
@@ -29,7 +31,6 @@ mod bindings {
 
 use bindings::custom::workflow::manager::ProcInfo;
 use bindings::custom::workflow::types::VarPair;
-use bindings::custom::workflow::types::WorkflowEvent;
 
 const PLUGIN_ID: &str = "workflow";
 
@@ -46,11 +47,8 @@ enum CallbackKind {
 
 struct QueuedEvent {
     kind: CallbackKind,
+    exec_id: String,
     pid: String,
-    mid: String,
-    event_type: String,
-    state: String,
-    name: String,
     inputs: Vec<VarPair>,
     outputs: Vec<VarPair>,
 }
@@ -69,6 +67,10 @@ struct ComponentData {
     _chan_message: Option<Arc<Channel>>,
     _chan_complete: Option<Arc<Channel>>,
     _chan_error: Option<Arc<Channel>>,
+    /// Maps a process id (pid) to the caller-assigned exec-id, populated in
+    /// `start` so lifecycle callbacks can report the exec-id without relying on
+    /// the guest embedding it in workflow vars.
+    exec_id_by_pid: Arc<StdRwLock<HashMap<String, String>>>,
 }
 
 #[derive(Clone)]
@@ -180,43 +182,22 @@ async fn dispatch_event(workload: &ResolvedWorkload, component_id: &str, q: Queu
 
     let pid_for_log = q.pid.clone();
     let result = match q.kind {
-        CallbackKind::Start => {
-            let ev = WorkflowEvent {
-                pid: q.pid,
-                mid: q.mid,
-                event_type: q.event_type,
-                state: q.state,
-                name: q.name,
-                inputs: q.inputs,
-                outputs: q.outputs,
-            };
-            handler.call_on_start(&mut store, &ev).await
-        }
+        CallbackKind::Start => handler.call_on_start(&mut store, &q.exec_id, &q.pid).await,
         CallbackKind::Message => {
-            let ev = WorkflowEvent {
-                pid: q.pid,
-                mid: q.mid,
-                event_type: q.event_type,
-                state: q.state,
-                name: q.name,
-                inputs: q.inputs,
-                outputs: q.outputs,
-            };
-            handler.call_on_message(&mut store, &ev).await
+            handler
+                .call_on_message(&mut store, &q.exec_id, &q.pid, &q.inputs)
+                .await
         }
         CallbackKind::Complete => {
-            let ev = WorkflowEvent {
-                pid: q.pid,
-                mid: q.mid,
-                event_type: q.event_type,
-                state: q.state,
-                name: q.name,
-                inputs: q.inputs,
-                outputs: q.outputs,
-            };
-            handler.call_on_complete(&mut store, &ev).await
+            handler
+                .call_on_complete(&mut store, &q.exec_id, &q.pid, &q.outputs)
+                .await
         }
-        CallbackKind::Error(err) => handler.call_on_error(&mut store, &q.pid, &err).await,
+        CallbackKind::Error(err) => {
+            handler
+                .call_on_error(&mut store, &q.exec_id, &q.pid, &err)
+                .await
+        }
     };
 
     match result {
@@ -237,6 +218,7 @@ async fn dispatch_event(workload: &ResolvedWorkload, component_id: &str, q: Queu
 impl bindings::custom::workflow::manager::Host for ActiveCtx<'_> {
     async fn start(
         &mut self,
+        exec_id: String,
         workflow_def: String,
         vars: Vec<VarPair>,
     ) -> wasmtime::Result<Result<String, String>> {
@@ -282,7 +264,18 @@ impl bindings::custom::workflow::manager::Host for ActiveCtx<'_> {
             Err(e) => return Ok(Err(format!("start failed: {e}"))),
         };
 
-        info!(component_id = %cid, pid = %pid, mid = %mid, "Workflow started");
+        // Record exec-id -> pid so lifecycle callbacks can echo it back without
+        // relying on the guest embedding it in the workflow vars.
+        {
+            let lock = plugin.tracker.read().await;
+            if let Some(data) = lock.get_component_data(&cid)
+                && let Ok(mut m) = data.exec_id_by_pid.write()
+            {
+                m.insert(pid.clone(), exec_id.clone());
+            }
+        }
+
+        info!(component_id = %cid, pid = %pid, mid = %mid, exec_id = %exec_id, "Workflow started");
 
         Ok(Ok(pid))
     }
@@ -399,8 +392,8 @@ impl HostPlugin for WorkflowPlugin {
 
     fn world(&self) -> wash_runtime::wit::WitWorld {
         wash_runtime::wit::WitWorld {
-            imports: HashSet::from([WitInterface::from("custom:workflow/manager,types@0.1.0")]),
-            exports: HashSet::from([WitInterface::from("custom:workflow/handler@0.1.0")]),
+            imports: HashSet::from([WitInterface::from("custom:workflow/manager,types@0.2.0")]),
+            exports: HashSet::from([WitInterface::from("custom:workflow/handler@0.2.0")]),
         }
     }
 
@@ -434,6 +427,10 @@ impl HostPlugin for WorkflowPlugin {
         // Create the event channel
         let (tx, rx) = mpsc::unbounded_channel::<QueuedEvent>();
 
+        // Maps pid -> exec-id, populated by `start`. Cloned into each channel
+        // callback so every lifecycle event carries the caller-assigned exec-id.
+        let exec_id_map = Arc::new(StdRwLock::new(HashMap::new()));
+
         // Register channel callbacks
         let chan_start = engine.channel();
         let chan_message = engine.channel();
@@ -442,15 +439,17 @@ impl HostPlugin for WorkflowPlugin {
 
         {
             let tx = tx.clone();
+            let map = exec_id_map.clone();
             chan_start.on_start(move |e: &Event<Message>| {
                 let msg = e.inner();
                 let _ = tx.send(QueuedEvent {
                     kind: CallbackKind::Start,
+                    exec_id: map
+                        .read()
+                        .ok()
+                        .and_then(|m| m.get(&msg.pid).cloned())
+                        .unwrap_or_default(),
                     pid: msg.pid.clone(),
-                    mid: msg.mid.clone(),
-                    event_type: msg.r#type.clone(),
-                    state: state_str(msg.state).into(),
-                    name: msg.name.clone(),
                     inputs: msg_to_pairs(&msg.inputs),
                     outputs: msg_to_pairs(&msg.outputs),
                 });
@@ -458,15 +457,17 @@ impl HostPlugin for WorkflowPlugin {
         }
         {
             let tx = tx.clone();
+            let map = exec_id_map.clone();
             chan_message.on_message(move |e: &Event<Message>| {
                 let msg = e.inner();
                 let _ = tx.send(QueuedEvent {
                     kind: CallbackKind::Message,
+                    exec_id: map
+                        .read()
+                        .ok()
+                        .and_then(|m| m.get(&msg.pid).cloned())
+                        .unwrap_or_default(),
                     pid: msg.pid.clone(),
-                    mid: msg.mid.clone(),
-                    event_type: msg.r#type.clone(),
-                    state: state_str(msg.state).into(),
-                    name: msg.name.clone(),
                     inputs: msg_to_pairs(&msg.inputs),
                     outputs: msg_to_pairs(&msg.outputs),
                 });
@@ -474,15 +475,17 @@ impl HostPlugin for WorkflowPlugin {
         }
         {
             let tx = tx.clone();
+            let map = exec_id_map.clone();
             chan_complete.on_complete(move |e: &Event<Message>| {
                 let msg = e.inner();
                 let _ = tx.send(QueuedEvent {
                     kind: CallbackKind::Complete,
+                    exec_id: map
+                        .read()
+                        .ok()
+                        .and_then(|m| m.get(&msg.pid).cloned())
+                        .unwrap_or_default(),
                     pid: msg.pid.clone(),
-                    mid: msg.mid.clone(),
-                    event_type: msg.r#type.clone(),
-                    state: state_str(msg.state).into(),
-                    name: msg.name.clone(),
                     inputs: msg_to_pairs(&msg.inputs),
                     outputs: msg_to_pairs(&msg.outputs),
                 });
@@ -490,15 +493,17 @@ impl HostPlugin for WorkflowPlugin {
         }
         {
             let tx = tx.clone();
+            let map = exec_id_map.clone();
             chan_error.on_error(move |e: &Event<Message>| {
                 let msg = e.inner();
                 let _ = tx.send(QueuedEvent {
                     kind: CallbackKind::Error(format!("state={}", state_str(msg.state))),
+                    exec_id: map
+                        .read()
+                        .ok()
+                        .and_then(|m| m.get(&msg.pid).cloned())
+                        .unwrap_or_default(),
                     pid: msg.pid.clone(),
-                    mid: msg.mid.clone(),
-                    event_type: msg.r#type.clone(),
-                    state: state_str(msg.state).into(),
-                    name: msg.name.clone(),
                     inputs: msg_to_pairs(&msg.inputs),
                     outputs: msg_to_pairs(&msg.outputs),
                 });
@@ -519,6 +524,7 @@ impl HostPlugin for WorkflowPlugin {
                 _chan_message: Some(chan_message),
                 _chan_complete: Some(chan_complete),
                 _chan_error: Some(chan_error),
+                exec_id_by_pid: exec_id_map,
             },
         );
 

@@ -170,47 +170,56 @@ impl bindings::exports::custom::event_monitor::handler::Guest for CustomHandler 
 }
 
 impl bindings::exports::custom::workflow::handler::Guest for CustomHandler {
-    fn on_start(event: bindings::custom::workflow::types::WorkflowEvent) -> Result<(), String> {
+    fn on_start(exec_id: String, pid: String) -> Result<(), String> {
+        log(
+            Level::Info,
+            LOG_CTX,
+            &format!("WF ON_START: exec_id={}, pid={}", exec_id, pid),
+        );
+        Ok(())
+    }
+
+    fn on_message(
+        exec_id: String,
+        pid: String,
+        message: Vec<bindings::custom::workflow::types::VarPair>,
+    ) -> Result<(), String> {
         log(
             Level::Info,
             LOG_CTX,
             &format!(
-                "WF ON_START: pid={}, type={}, state={}, name={}",
-                event.pid, event.event_type, event.state, event.name
+                "WF ON_MSG: exec_id={}, pid={}, vars={}",
+                exec_id,
+                pid,
+                message.len()
             ),
         );
         Ok(())
     }
 
-    fn on_message(event: bindings::custom::workflow::types::WorkflowEvent) -> Result<(), String> {
+    fn on_complete(
+        exec_id: String,
+        pid: String,
+        outputs: Vec<bindings::custom::workflow::types::VarPair>,
+    ) -> Result<(), String> {
         log(
             Level::Info,
             LOG_CTX,
             &format!(
-                "WF ON_MSG: pid={}, type={}, state={}, name={}",
-                event.pid, event.event_type, event.state, event.name
+                "WF ON_COMPLETE: exec_id={}, pid={}, outputs={}",
+                exec_id,
+                pid,
+                outputs.len()
             ),
         );
         Ok(())
     }
 
-    fn on_complete(event: bindings::custom::workflow::types::WorkflowEvent) -> Result<(), String> {
+    fn on_error(exec_id: String, pid: String, error: String) -> Result<(), String> {
         log(
             Level::Info,
             LOG_CTX,
-            &format!(
-                "WF ON_COMPLETE: pid={}, type={}, state={}, name={}",
-                event.pid, event.event_type, event.state, event.name
-            ),
-        );
-        Ok(())
-    }
-
-    fn on_error(pid: String, error: String) -> Result<(), String> {
-        log(
-            Level::Info,
-            LOG_CTX,
-            &format!("WF ON_ERROR: pid={}, error={}", pid, error),
+            &format!("WF ON_ERROR: exec_id={}, pid={}, error={}", exec_id, pid, error),
         );
         Ok(())
     }
