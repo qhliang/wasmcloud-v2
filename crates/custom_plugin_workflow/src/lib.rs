@@ -229,32 +229,36 @@ async fn dispatch_event(
 
     let pid_for_log = q.pid.clone();
     let exec_id = resolve_exec_id(&exec_id_map, &exec_id_notify, &q.pid).await;
-    let result = match q.kind {
-        CallbackKind::Start => handler.call_on_start(&mut store, &exec_id, &q.pid).await,
-        CallbackKind::Message => {
-            handler
-                .call_on_message(&mut store, &exec_id, &q.pid, &q.inputs)
-                .await
-        }
-        CallbackKind::Complete => {
-            handler
-                .call_on_complete(&mut store, &exec_id, &q.pid, &q.outputs)
-                .await
-        }
-        CallbackKind::Error(err) => {
-            handler
-                .call_on_error(&mut store, &exec_id, &q.pid, &err)
-                .await
-        }
-    };
+
+    let result = store
+        .run_concurrent(async move |accessor| match q.kind {
+            CallbackKind::Start => handler.call_on_start(accessor, exec_id, q.pid).await,
+            CallbackKind::Message => {
+                handler
+                    .call_on_message(accessor, exec_id, q.pid, q.inputs)
+                    .await
+            }
+            CallbackKind::Complete => {
+                handler
+                    .call_on_complete(accessor, exec_id, q.pid, q.outputs)
+                    .await
+            }
+            CallbackKind::Error(err) => handler.call_on_error(accessor, exec_id, q.pid, err).await,
+        })
+        .await;
 
     match result {
-        Ok(Ok(())) => debug!(component_id = %component_id, pid = %pid_for_log, "Event handled"),
-        Ok(Err(e)) => {
+        Ok(Ok(Ok(()))) => {
+            debug!(component_id = %component_id, pid = %pid_for_log, "Event handled")
+        }
+        Ok(Ok(Err(e))) => {
             warn!(component_id = %component_id, pid = %pid_for_log, error = %e, "Handler error")
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             warn!(component_id = %component_id, pid = %pid_for_log, error = %e, "Call failed")
+        }
+        Err(e) => {
+            warn!(component_id = %component_id, pid = %pid_for_log, error = %e, "run_concurrent failed")
         }
     }
 }
@@ -442,8 +446,8 @@ impl HostPlugin for WorkflowPlugin {
 
     fn world(&self) -> wash_runtime::wit::WitWorld {
         wash_runtime::wit::WitWorld {
-            imports: HashSet::from([WitInterface::from("custom:workflow/manager,types@0.2.0")]),
-            exports: HashSet::from([WitInterface::from("custom:workflow/handler@0.2.0")]),
+            imports: HashSet::from([WitInterface::from("custom:workflow/manager,types@0.3.0")]),
+            exports: HashSet::from([WitInterface::from("custom:workflow/handler@0.3.0")]),
         }
     }
 

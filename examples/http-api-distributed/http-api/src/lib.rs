@@ -37,7 +37,7 @@ static HOME_HTML: &str = include_str!("../resources/home.html");
 struct CustomHandler;
 
 impl bindings::exports::custom::crontab::handler::Guest for CustomHandler {
-    fn handle_tick(name: String) -> Result<(), String> {
+    async fn handle_tick(name: String) -> Result<(), String> {
         let message = format!(
             "CRONTAB TICK: schedule '{}' fired via handle-tick export",
             name
@@ -137,7 +137,7 @@ impl bindings::exports::custom::wechat::handler::Guest for CustomHandler {
 }
 
 impl bindings::exports::custom::event_monitor::handler::Guest for CustomHandler {
-    fn handle_event(
+    async fn handle_event(
         id: String,
         event: bindings::exports::custom::event_monitor::handler::K8sEvent,
     ) -> Result<(), String> {
@@ -170,7 +170,7 @@ impl bindings::exports::custom::event_monitor::handler::Guest for CustomHandler 
 }
 
 impl bindings::exports::custom::workflow::handler::Guest for CustomHandler {
-    fn on_start(exec_id: String, pid: String) -> Result<(), String> {
+    async fn on_start(exec_id: String, pid: String) -> Result<(), String> {
         log(
             Level::Info,
             LOG_CTX,
@@ -179,7 +179,7 @@ impl bindings::exports::custom::workflow::handler::Guest for CustomHandler {
         Ok(())
     }
 
-    fn on_message(
+    async fn on_message(
         exec_id: String,
         pid: String,
         message: Vec<bindings::custom::workflow::types::VarPair>,
@@ -197,7 +197,7 @@ impl bindings::exports::custom::workflow::handler::Guest for CustomHandler {
         Ok(())
     }
 
-    fn on_complete(
+    async fn on_complete(
         exec_id: String,
         pid: String,
         outputs: Vec<bindings::custom::workflow::types::VarPair>,
@@ -215,7 +215,7 @@ impl bindings::exports::custom::workflow::handler::Guest for CustomHandler {
         Ok(())
     }
 
-    fn on_error(exec_id: String, pid: String, error: String) -> Result<(), String> {
+    async fn on_error(exec_id: String, pid: String, error: String) -> Result<(), String> {
         log(
             Level::Info,
             LOG_CTX,

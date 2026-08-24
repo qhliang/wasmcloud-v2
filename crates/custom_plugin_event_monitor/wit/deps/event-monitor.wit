@@ -1,4 +1,4 @@
-package custom:event-monitor@0.1.0;
+package custom:event-monitor@0.2.0;
 
 interface types {
     variant event-action {
@@ -60,5 +60,5 @@ interface handler {
     use types.{k8s-event};
 
     /// Called when a K8s event matches a watch rule's condition.
-    handle-event: func(id: string, event: k8s-event) -> result<_, string>;
+    handle-event: async func(id: string, event: k8s-event) -> result<_, string>;
 }

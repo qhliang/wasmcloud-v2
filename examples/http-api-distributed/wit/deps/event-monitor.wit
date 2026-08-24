@@ -1,4 +1,4 @@
-package custom:event-monitor@0.1.0;
+package custom:event-monitor@0.2.0;
 
 interface types {
     variant event-action {
@@ -21,24 +21,44 @@ interface types {
         kind: string,
     }
 
+    /// A watch rule: a resource to watch + a jsonlogic condition.
+    /// The condition string is a jsonlogic rule (e.g. {"==": [{"var": "type"}, "Normal"]}).
+    /// An empty string means "match all".
     record watch-rule {
+        /// Unique identifier for this rule, used in handle-event callbacks.
         id: string,
         res: watchable-resource,
+        /// Optional namespace scope. Empty = watch across all namespaces.
+        namespace: option<string>,
+        /// JSONLogic condition string (serialized JSON). Empty = always match.
         condition: string,
     }
 }
 
+/// Host-provided API for managing watchers
 interface watcher {
     use types.{k8s-event, watchable-resource, watch-rule};
 
+    /// Connect to a K8s cluster.
+    /// Must be called before watch-resources or list-all-resources.
     create: func(api-server-url: string, token: string) -> result<_, string>;
+
+    /// List all watchable resources (including CRDs) from the connected cluster.
     list-all-resources: func() -> result<list<watchable-resource>, string>;
+
+    /// Start watching the given rules.
+    /// The host evaluates each rule's jsonlogic condition before calling handle-event.
+    /// Calling again cancels previous watchers and starts new ones.
     watch-resources: func(rules: list<watch-rule>) -> result<_, string>;
+
+    /// Cancel all active watchers.
     unwatch-resources: func() -> result<_, string>;
 }
 
+/// Interface that the guest component must export.
 interface handler {
     use types.{k8s-event};
 
-    handle-event: func(id: string, event: k8s-event) -> result<_, string>;
+    /// Called when a K8s event matches a watch rule's condition.
+    handle-event: async func(id: string, event: k8s-event) -> result<_, string>;
 }

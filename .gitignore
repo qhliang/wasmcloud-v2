@@ -18,6 +18,7 @@ worktrees/
 
 # AI things
 .claude
+.workbuddy
 
 # WIT dependencies (fetched by wash build / build scripts)
 examples/*/wit/deps/

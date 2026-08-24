@@ -1,4 +1,4 @@
-package custom:crontab@0.1.0;
+package custom:crontab@0.2.0;
 
 interface types {
     variant schedule-error {
@@ -34,7 +34,7 @@ interface handler {
     /// Called by the host when a scheduled tick fires.
     ///
     /// `name` is the schedule name that triggered this tick.
-    handle-tick: func(name: string) -> result<_, string>;
+    handle-tick: async func(name: string) -> result<_, string>;
 }
 
 world crontab {

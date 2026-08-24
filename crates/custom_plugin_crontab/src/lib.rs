@@ -21,9 +21,9 @@
 //!
 //! ## Guest Export
 //!
-//! The guest component must export `custom:crontab/handler@0.1.0` with:
+//! The guest component must export `custom:crontab/handler@0.2.0` with:
 //! ```wit
-//! handle-tick: func(name: string) -> result<_, string>;
+//! handle-tick: async func(name: string) -> result<_, string>;
 //! ```
 
 use std::collections::{HashMap, HashSet};
@@ -438,19 +438,22 @@ fn spawn_cron_task(
                         }
                     };
 
-                    match proxy
-                        .custom_crontab_handler()
-                        .call_handle_tick(&mut store, &name)
+                    let handler = proxy.custom_crontab_handler();
+                    let name_for_call = name.clone();
+                    match store
+                        .run_concurrent(async move |accessor| {
+                            handler.call_handle_tick(accessor, name_for_call).await
+                        })
                         .await
                     {
-                        Ok(Ok(())) => {
+                        Ok(Ok(Ok(()))) => {
                             debug!(
                                 component_id = %component_id,
                                 name = %name,
                                 "Tick handled successfully"
                             );
                         }
-                        Ok(Err(e)) => {
+                        Ok(Ok(Err(e))) => {
                             warn!(
                                 component_id = %component_id,
                                 name = %name,
@@ -458,12 +461,20 @@ fn spawn_cron_task(
                                 "Tick handler returned error"
                             );
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             warn!(
                                 component_id = %component_id,
                                 name = %name,
                                 error = %e,
                                 "Tick handler call failed"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                component_id = %component_id,
+                                name = %name,
+                                error = %e,
+                                "run_concurrent failed"
                             );
                         }
                     }
@@ -531,12 +542,15 @@ fn spawn_delay_task(
                     }
                 };
 
-                match proxy
-                    .custom_crontab_handler()
-                    .call_handle_tick(&mut store, &name)
+                let handler = proxy.custom_crontab_handler();
+                let name_for_call = name.clone();
+                match store
+                    .run_concurrent(async move |accessor| {
+                        handler.call_handle_tick(accessor, name_for_call).await
+                    })
                     .await
                 {
-                    Ok(Ok(())) => {
+                    Ok(Ok(Ok(()))) => {
                         debug!(
                             component_id = %component_id,
                             name = %name,
@@ -557,7 +571,7 @@ fn spawn_delay_task(
                             "Delay schedule auto-removed"
                         );
                     }
-                    Ok(Err(e)) => {
+                    Ok(Ok(Err(e))) => {
                         warn!(
                             component_id = %component_id,
                             name = %name,
@@ -565,12 +579,20 @@ fn spawn_delay_task(
                             "Delay tick handler returned error"
                         );
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         warn!(
                             component_id = %component_id,
                             name = %name,
                             error = %e,
                             "Delay tick handler call failed"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            component_id = %component_id,
+                            name = %name,
+                            error = %e,
+                            "run_concurrent failed"
                         );
                     }
                 }
@@ -591,8 +613,8 @@ impl HostPlugin for Crontab {
 
     fn world(&self) -> WitWorld {
         WitWorld {
-            imports: HashSet::from([WitInterface::from("custom:crontab/scheduler,types@0.1.0")]),
-            exports: HashSet::from([WitInterface::from("custom:crontab/handler@0.1.0")]),
+            imports: HashSet::from([WitInterface::from("custom:crontab/scheduler,types@0.2.0")]),
+            exports: HashSet::from([WitInterface::from("custom:crontab/handler@0.2.0")]),
         }
     }
 

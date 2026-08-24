@@ -40,7 +40,7 @@
 ## WIT 接口
 
 ```wit
-package custom:workflow@0.2.0;
+package custom:workflow@0.3.0;
 
 interface types {
     record var-pair {
@@ -82,10 +82,10 @@ interface manager {
 interface handler {
     use types.{var-pair};
 
-    on-start:    func(exec-id: string, pid: string) -> result<_, string>;
-    on-message:  func(exec-id: string, pid: string, message: list<var-pair>) -> result<_, string>;
-    on-complete: func(exec-id: string, pid: string, outputs: list<var-pair>) -> result<_, string>;
-    on-error:    func(exec-id: string, pid: string, error: string) -> result<_, string>;
+    on-start:    async func(exec-id: string, pid: string) -> result<_, string>;
+    on-message:  async func(exec-id: string, pid: string, message: list<var-pair>) -> result<_, string>;
+    on-complete: async func(exec-id: string, pid: string, outputs: list<var-pair>) -> result<_, string>;
+    on-error:    async func(exec-id: string, pid: string, error: string) -> result<_, string>;
 }
 ```
 
@@ -117,8 +117,8 @@ steps:
 ```wit
 // world.wit
 world my-component {
-    import custom:workflow/manager@0.2.0;
-    export custom:workflow/handler@0.2.0;
+    import custom:workflow/manager@0.3.0;
+    export custom:workflow/handler@0.3.0;
 }
 ```
 
@@ -134,12 +134,12 @@ mod bindings {
 struct CustomHandler;
 
 impl bindings::exports::custom::workflow::handler::Guest for CustomHandler {
-    fn on_start(exec_id: String, pid: String) -> Result<(), String> {
+    async fn on_start(exec_id: String, pid: String) -> Result<(), String> {
         log::info!("WF START: exec_id={}, pid={}", exec_id, pid);
         Ok(())
     }
 
-    fn on_message(
+    async fn on_message(
         exec_id: String,
         pid: String,
         message: Vec<bindings::custom::workflow::types::VarPair>,
@@ -148,7 +148,7 @@ impl bindings::exports::custom::workflow::handler::Guest for CustomHandler {
         Ok(())
     }
 
-    fn on_complete(
+    async fn on_complete(
         exec_id: String,
         pid: String,
         outputs: Vec<bindings::custom::workflow::types::VarPair>,
@@ -157,7 +157,7 @@ impl bindings::exports::custom::workflow::handler::Guest for CustomHandler {
         Ok(())
     }
 
-    fn on_error(exec_id: String, pid: String, error: String) -> Result<(), String> {
+    async fn on_error(exec_id: String, pid: String, error: String) -> Result<(), String> {
         log::error!("WF ERROR: exec_id={}, pid={}, error={}", exec_id, pid, error);
         Ok(())
     }

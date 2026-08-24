@@ -35,7 +35,7 @@ Kubernetes 事件监听和分发插件，为 WASM 组件提供集群资源变更
 ## WIT 接口
 
 ```wit
-package custom:event-monitor@0.1.0;
+package custom:event-monitor@0.2.0;
 
 interface types {
     variant event-action { applied, deleted }
@@ -54,17 +54,26 @@ interface types {
         version: string,
         kind: string,
     }
+
+    record watch-rule {
+        id: string,
+        res: watchable-resource,
+        namespace: option<string>,
+        condition: string,
+    }
 }
 
 interface watcher {
     create: func(api-server-url: string, token: string) -> result<_, string>;
     list-all-resources: func() -> result<list<watchable-resource>, string>;
-    watch-resources: func(resources: list<watchable-resource>) -> result<_, string>;
+    watch-resources: func(rules: list<watch-rule>) -> result<_, string>;
     unwatch-resources: func() -> result<_, string>;
 }
 
 interface handler {
-    handle-event: func(event: k8s-event) -> result<_, string>;
+    use types.{k8s-event};
+
+    handle-event: async func(id: string, event: k8s-event) -> result<_, string>;
 }
 ```
 
@@ -75,8 +84,8 @@ interface handler {
 ```wit
 // world.wit
 world my-component {
-    import custom:event-monitor/watcher@0.1.0;
-    export custom:event-monitor/handler@0.1.0;
+    import custom:event-monitor/watcher@0.2.0;
+    export custom:event-monitor/handler@0.2.0;
 }
 ```
 
@@ -92,12 +101,13 @@ mod bindings {
 struct CustomHandler;
 
 impl bindings::exports::custom::event_monitor::handler::Guest for CustomHandler {
-    fn handle_event(
+    async fn handle_event(
+        id: String,
         event: bindings::exports::custom::event_monitor::handler::K8sEvent,
     ) -> Result<(), String> {
         log::info!(
-            "EVENT: action={:?}, gvk={}/{}/{}, name={}, ns={:?}",
-            event.action, event.group, event.version, event.kind, event.name, event.namespace,
+            "EVENT: rule={}, action={:?}, gvk={}/{}/{}, name={}, ns={:?}",
+            id, event.action, event.group, event.version, event.kind, event.name, event.namespace,
         );
         Ok(())
     }
@@ -108,7 +118,7 @@ impl bindings::exports::custom::event_monitor::handler::Guest for CustomHandler 
 
 ```rust
 use bindings::custom::event_monitor::watcher;
-use bindings::custom::event_monitor::types::WatchableResource;
+use bindings::custom::event_monitor::types::WatchRule;
 
 // 连接集群
 watcher::create("https://kubernetes.default.svc", "bearer-token")?;
@@ -116,12 +126,22 @@ watcher::create("https://kubernetes.default.svc", "bearer-token")?;
 // 列出所有可监听资源
 let resources = watcher::list_all_resources()?;
 
-// 选择要监听的资源（例如 Pod 和 Deployment）
-let selected = vec![
-    WatchableResource { group: String::new(), version: "v1".into(), kind: "Pod".into() },
-    WatchableResource { group: "apps".into(), version: "v1".into(), kind: "Deployment".into() },
+// 按规则监听（rule 的 id 会原样回传 handle-event 回调，condition 为 jsonlogic 表达式，空串匹配所有）
+let rules = vec![
+    WatchRule {
+        id: "rule-1".into(),
+        res: WatchableResource { group: String::new(), version: "v1".into(), kind: "Pod".into() },
+        namespace: None,
+        condition: String::new(),
+    },
+    WatchRule {
+        id: "rule-2".into(),
+        res: WatchableResource { group: "apps".into(), version: "v1".into(), kind: "Deployment".into() },
+        namespace: Some("default".into()),
+        condition: r#"{"==": [{"var": "type"}, "Normal"]}"#.into(),
+    },
 ];
-watcher::watch_resources(&selected)?;
+watcher::watch_resources(&rules)?;
 
 // 取消监听
 watcher::unwatch_resources()?;

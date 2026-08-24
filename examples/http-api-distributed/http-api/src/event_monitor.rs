@@ -147,6 +147,7 @@ pub async fn watch_resources(mut req: Request<Body>) -> anyhow::Result<Response<
                 version: r.resource.version.clone(),
                 kind: r.resource.kind.clone(),
             },
+            namespace: None,
             condition: r.condition.clone(),
         })
         .collect();

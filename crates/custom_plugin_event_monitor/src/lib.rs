@@ -238,14 +238,23 @@ async fn dispatch_event(
         return;
     };
 
-    match proxy
-        .custom_event_monitor_handler()
-        .call_handle_event(&mut store, id, &k8s)
+    let handler = proxy.custom_event_monitor_handler();
+    match store
+        .run_concurrent(async move |accessor| {
+            handler
+                .call_handle_event(accessor, id.to_string(), k8s.clone())
+                .await
+        })
         .await
     {
-        Ok(Ok(())) => debug!(component_id = %component_id, id = %id, "Event handled"),
-        Ok(Err(e)) => warn!(component_id = %component_id, id = %id, error = %e, "Handler error"),
-        Err(e) => warn!(component_id = %component_id, id = %id, error = %e, "Call failed"),
+        Ok(Ok(Ok(()))) => debug!(component_id = %component_id, id = %id, "Event handled"),
+        Ok(Ok(Err(e))) => {
+            warn!(component_id = %component_id, id = %id, error = %e, "Handler error")
+        }
+        Ok(Err(e)) => warn!(component_id = %component_id, id = %id, error = %e, "Call failed"),
+        Err(e) => {
+            warn!(component_id = %component_id, id = %id, error = %e, "run_concurrent failed")
+        }
     }
 }
 
@@ -503,9 +512,9 @@ impl HostPlugin for EventMonitor {
     fn world(&self) -> wash_runtime::wit::WitWorld {
         wash_runtime::wit::WitWorld {
             imports: HashSet::from([WitInterface::from(
-                "custom:event-monitor/watcher,types@0.1.0",
+                "custom:event-monitor/watcher,types@0.2.0",
             )]),
-            exports: HashSet::from([WitInterface::from("custom:event-monitor/handler@0.1.0")]),
+            exports: HashSet::from([WitInterface::from("custom:event-monitor/handler@0.2.0")]),
         }
     }
 

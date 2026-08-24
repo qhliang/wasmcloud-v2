@@ -1,4 +1,4 @@
-package custom:workflow@0.2.0;
+package custom:workflow@0.3.0;
 
 interface types {
     record var-pair {
@@ -40,8 +40,8 @@ interface manager {
 interface handler {
     use types.{var-pair};
 
-    on-start:    func(exec-id: string, pid: string) -> result<_, string>;
-    on-message:  func(exec-id: string, pid: string, message: list<var-pair>) -> result<_, string>;
-    on-complete: func(exec-id: string, pid: string, outputs: list<var-pair>) -> result<_, string>;
-    on-error:    func(exec-id: string, pid: string, error: string) -> result<_, string>;
+    on-start:    async func(exec-id: string, pid: string) -> result<_, string>;
+    on-message:  async func(exec-id: string, pid: string, message: list<var-pair>) -> result<_, string>;
+    on-complete: async func(exec-id: string, pid: string, outputs: list<var-pair>) -> result<_, string>;
+    on-error:    async func(exec-id: string, pid: string, error: string) -> result<_, string>;
 }

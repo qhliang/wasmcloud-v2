@@ -1,6 +1,6 @@
 package my:event-monitor;
 
 world event-monitor {
-    import custom:event-monitor/watcher@0.1.0;
-    export custom:event-monitor/handler@0.1.0;
+    import custom:event-monitor/watcher@0.2.0;
+    export custom:event-monitor/handler@0.2.0;
 }
