@@ -219,7 +219,10 @@ impl bindings::exports::custom::workflow::handler::Guest for CustomHandler {
         log(
             Level::Info,
             LOG_CTX,
-            &format!("WF ON_ERROR: exec_id={}, pid={}, error={}", exec_id, pid, error),
+            &format!(
+                "WF ON_ERROR: exec_id={}, pid={}, error={}",
+                exec_id, pid, error
+            ),
         );
         Ok(())
     }

@@ -49,7 +49,9 @@ use hyper_util::client::legacy::connect::{
     CaptureConnection, Connected, Connection, HttpConnector, capture_connection,
 };
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
-use rustls::pki_types::{CertificateDer, pem::PemObject};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, UnixTime, pem::PemObject};
+use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use tokio::net::TcpStream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
@@ -573,6 +575,57 @@ pub struct PooledClient {
     tls: Arc<rustls::ClientConfig>,
 }
 
+/// A TLS certificate verifier that accepts any certificate.
+#[derive(Debug)]
+pub(crate) struct NoCertificateVerification;
+
+impl ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+pub(crate) fn insecure_tls_config() -> Arc<rustls::ClientConfig> {
+    crate::init_crypto();
+    Arc::new(
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+            .with_no_client_auth(),
+    )
+}
+
 impl PooledClient {
     /// Create a standalone client using the given TLS configuration for HTTPS,
     /// bounded by a private quota of default size. Clients created through
@@ -652,6 +705,25 @@ impl PooledClient {
         let client = pool().build(connector(Alpn::Http1));
         let grpc = pool().http2_only(true).build(connector(Alpn::H2));
         Self { client, grpc, tls }
+    }
+
+    /// Create a client that skips server-certificate verification while using
+    /// the same per-workload quota and pool sizing as [`Self::bounded`].
+    fn insecure_bounded(
+        workload: Option<Arc<str>>,
+        workload_permits: Arc<Semaphore>,
+        global_permits: Arc<Semaphore>,
+        permit_wait: Duration,
+        idle_per_authority: usize,
+    ) -> Self {
+        Self::bounded(
+            insecure_tls_config(),
+            workload,
+            workload_permits,
+            global_permits,
+            permit_wait,
+            idle_per_authority,
+        )
     }
 
     /// The TLS configuration this client verifies servers against.
@@ -827,6 +899,7 @@ pub struct WorkloadClients {
     /// before any request builds a client, and is dropped when it unbinds.
     call_concurrency: Arc<std::sync::RwLock<BTreeMap<String, usize>>>,
     clients: moka::sync::Cache<String, PooledClient>,
+    insecure_clients: moka::sync::Cache<String, PooledClient>,
 }
 
 impl WorkloadClients {
@@ -861,6 +934,9 @@ impl WorkloadClients {
             quotas,
             call_concurrency: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
             clients: moka::sync::Cache::builder()
+                .time_to_idle(WORKLOAD_CLIENT_IDLE)
+                .build(),
+            insecure_clients: moka::sync::Cache::builder()
                 .time_to_idle(WORKLOAD_CLIENT_IDLE)
                 .build(),
         }
@@ -927,6 +1003,32 @@ impl WorkloadClients {
         })
     }
 
+    /// The pooled client for `workload_id` used only when host policy has
+    /// explicitly enabled `allowOutboundHttpInsecure`.
+    ///
+    /// This cache is separate from the verifying pool so a workload cannot
+    /// carry an unverified TLS session or connection into strict egress (or
+    /// vice versa).
+    pub(crate) fn insecure_client(&self, workload_id: &str) -> PooledClient {
+        let quota = self.quotas.for_guest(workload_id);
+        self.insecure_clients.get_with_by_ref(workload_id, || {
+            let calls = self
+                .call_concurrency
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(workload_id)
+                .copied()
+                .unwrap_or(1);
+            PooledClient::insecure_bounded(
+                Some(Arc::from(workload_id)),
+                quota.outbound_http_permits(),
+                quota.global_permits().unwrap_or_else(unbounded_permits),
+                self.quotas.http_wait(),
+                idle_per_authority(calls, self.quotas.limits().outbound_http),
+            )
+        })
+    }
+
     /// Drop `workload_id`'s pooled client — call when the workload stops.
     ///
     /// Closes the client's idle connections and releases their
@@ -945,6 +1047,8 @@ impl WorkloadClients {
         // force it so the pool (and the permits its idle connections pin) is
         // released now, not on the next cache access.
         self.clients.run_pending_tasks();
+        self.insecure_clients.invalidate(workload_id);
+        self.insecure_clients.run_pending_tasks();
         self.call_concurrency
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -2271,5 +2375,35 @@ mod tests {
             .await
             .expect("request with the private CA trusted should succeed");
         assert_eq!(response.resp.status(), 200);
+    }
+
+    /// P3 egress must keep strict verification by default, while the
+    /// dedicated insecure client accepts a self-signed certificate.
+    #[tokio::test]
+    async fn p3_insecure_client_skips_verification_strict_client_does_not() {
+        use wasmtime_wasi_http::p3::bindings::http::types::ErrorCode;
+
+        let (port, _ca_pem) = private_ca_tls_server().await;
+        let uri = format!("https://127.0.0.1:{port}/");
+        let clients = WorkloadClients::new(default_client_tls_config());
+
+        let strict_result = clients
+            .client("p3-workload")
+            .send_request_p3(p3_request(&uri), None)
+            .await;
+        let Err(err) = strict_result else {
+            panic!("strict P3 egress must reject an untrusted CA")
+        };
+        assert!(
+            matches!(err, ErrorCode::TlsProtocolError),
+            "expected TlsProtocolError, got {err:?}"
+        );
+
+        let response = clients
+            .insecure_client("p3-workload")
+            .send_request_p3(p3_request(&uri), None)
+            .await
+            .expect("insecure P3 egress should accept the untrusted certificate");
+        assert_eq!(response.0.status(), 200);
     }
 }

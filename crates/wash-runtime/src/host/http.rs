@@ -61,12 +61,7 @@ use wasmtime_wasi_http::{
 };
 
 use rustls::ServerConfig;
-use rustls::{
-    DigitallySignedStruct, Error as RustlsError, SignatureScheme,
-    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-    crypto::aws_lc_rs::default_provider,
-    pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime, pem::PemObject},
-};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use tokio::sync::{RwLock, mpsc};
 use tokio_rustls::TlsAcceptor;
 
@@ -466,6 +461,23 @@ pub trait OutgoingHandler: Send + Sync + 'static {
         fut: crate::host::http_p3::P3RequestErrorFuture,
     ) -> crate::host::http_p3::P3SendFuture;
 
+    /// Host-only variant of [`Self::send_request_p3`] for requests that host
+    /// policy has explicitly marked as insecure.
+    ///
+    /// This is deliberately not part of guest-visible WASI request options:
+    /// the host decides from workload configuration before dispatch. The
+    /// default falls back to the strict path so custom handlers remain source
+    /// compatible unless they explicitly opt into insecure egress.
+    fn send_request_insecure_p3(
+        &self,
+        workload_id: &str,
+        request: hyper::Request<crate::host::http_p3::P3Body>,
+        options: Option<wasmtime_wasi_http::p3::RequestOptions>,
+        fut: crate::host::http_p3::P3RequestErrorFuture,
+    ) -> crate::host::http_p3::P3SendFuture {
+        self.send_request_p3(workload_id, request, options, fut)
+    }
+
     /// TLS configuration used for host-mediated egress that bypasses
     /// `send_request`/`send_request_p3` (currently the gRPC fast path).
     /// `None` (the default) means the process-wide default trust roots.
@@ -505,46 +517,7 @@ pub trait OutgoingHandler: Send + Sync + 'static {
     fn on_workload_unbind(&self, _workload_id: &str) {}
 }
 
-/// A TLS certificate verifier that accepts any certificate, including self-signed ones.
-#[derive(Debug)]
-struct NoCertificateVerification;
-
-impl ServerCertVerifier for NoCertificateVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, RustlsError> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, RustlsError> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, RustlsError> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
+use crate::host::http_client::insecure_tls_config;
 
 /// Default [`OutgoingHandler`] — sends requests through per-workload
 /// keep-alive connection pools ([`crate::host::http_client::WorkloadClients`])
@@ -643,6 +616,36 @@ impl DefaultOutgoingHandler {
     }
 }
 
+impl DefaultOutgoingHandler {
+    fn send_request_with_insecure_p3(
+        &self,
+        workload_id: &str,
+        request: hyper::Request<crate::host::http_p3::P3Body>,
+        options: Option<wasmtime_wasi_http::p3::RequestOptions>,
+        fut: crate::host::http_p3::P3RequestErrorFuture,
+        insecure: bool,
+    ) -> crate::host::http_p3::P3SendFuture {
+        let _ = fut;
+        let span = outbound_client_span(request.method(), request.uri());
+        let client = if insecure {
+            self.clients().insecure_client(workload_id)
+        } else {
+            self.clients().client(workload_id)
+        };
+        Box::new(
+            async move {
+                let result = client.send_request_p3(request, options).await;
+                match &result {
+                    Ok((resp, _)) => record_outbound_status(resp.status()),
+                    Err(_) => record_outbound_error(),
+                }
+                result.map_err(wasmtime_wasi::TrappableError::from)
+            }
+            .instrument(span),
+        )
+    }
+}
+
 impl OutgoingHandler for DefaultOutgoingHandler {
     fn send_request(
         &self,
@@ -668,18 +671,25 @@ impl OutgoingHandler for DefaultOutgoingHandler {
         );
         Ok(HostFutureIncomingResponse::pending(handle))
     }
+
     fn send_request_p3(
         &self,
         workload_id: &str,
         request: hyper::Request<crate::host::http_p3::P3Body>,
         options: Option<wasmtime_wasi_http::p3::RequestOptions>,
-        _fut: crate::host::http_p3::P3RequestErrorFuture,
+        fut: crate::host::http_p3::P3RequestErrorFuture,
     ) -> crate::host::http_p3::P3SendFuture {
-        let client = self.clients().client(workload_id);
-        Box::new(async move {
-            let (res, io) = client.send_request_p3(request, options).await?;
-            Ok((res, io))
-        })
+        self.send_request_with_insecure_p3(workload_id, request, options, fut, false)
+    }
+
+    fn send_request_insecure_p3(
+        &self,
+        workload_id: &str,
+        request: hyper::Request<crate::host::http_p3::P3Body>,
+        options: Option<wasmtime_wasi_http::p3::RequestOptions>,
+        fut: crate::host::http_p3::P3RequestErrorFuture,
+    ) -> crate::host::http_p3::P3SendFuture {
+        self.send_request_with_insecure_p3(workload_id, request, options, fut, true)
     }
 
     fn client_tls_config(&self) -> Option<Arc<rustls::ClientConfig>> {
@@ -1516,8 +1526,20 @@ impl<T: Router, O: OutgoingHandler> HostHandler for Ingress<T, O> {
                 None => send_grpc_request_p3(request, options, self.grpc_tls()),
             }
         } else {
-            self.outgoing_handler
-                .send_request_p3(workload_id, request, options, fut)
+            let allow_insecure = self.allow_insecure
+                || self
+                    .outbound_http_insecure
+                    .read()
+                    .ok()
+                    .and_then(|g| g.get(workload_id).copied())
+                    .unwrap_or(false);
+            if allow_insecure {
+                self.outgoing_handler
+                    .send_request_insecure_p3(workload_id, request, options, fut)
+            } else {
+                self.outgoing_handler
+                    .send_request_p3(workload_id, request, options, fut)
+            }
         };
         // Instrument the whole send so the span is current while the response
         // is awaited; `record_outbound_status` then lands on this span.
@@ -2408,13 +2430,9 @@ async fn send_request_insecure(
     let (mut sender, worker) = if use_tls {
         use rustls::pki_types::ServerName;
 
-        // Build TLS config that accepts any certificate (including self-signed)
-        let config = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(std::sync::Arc::new(NoCertificateVerification))
-            .with_no_client_auth();
+        let config = insecure_tls_config();
 
-        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+        let connector = tokio_rustls::TlsConnector::from(config);
         let host = authority
             .split_once(':')
             .map(|(h, _)| h)
@@ -3230,6 +3248,110 @@ mod tests {
         assert!(
             result.is_err(),
             "NullServer P3 outgoing request should return an error"
+        );
+    }
+
+    /// Host policy, not guest request options, must select the insecure P3
+    /// transport. A custom handler can therefore observe which path was chosen.
+    #[tokio::test]
+    async fn p3_outgoing_request_applies_workload_insecure_policy() {
+        struct RecordingHandler {
+            strict: Arc<std::sync::atomic::AtomicBool>,
+            insecure: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl OutgoingHandler for RecordingHandler {
+            fn send_request(
+                &self,
+                _workload_id: &str,
+                _request: hyper::Request<HyperOutgoingBody>,
+                _config: OutgoingRequestConfig,
+            ) -> wasmtime_wasi_http::p2::HttpResult<HostFutureIncomingResponse> {
+                Err(wasmtime_wasi_http::p2::HttpError::trap(
+                    wasmtime::format_err!("recording handler does not implement P2"),
+                ))
+            }
+
+            fn send_request_p3(
+                &self,
+                _workload_id: &str,
+                _request: hyper::Request<crate::host::http_p3::P3Body>,
+                _options: Option<wasmtime_wasi_http::p3::RequestOptions>,
+                _fut: crate::host::http_p3::P3RequestErrorFuture,
+            ) -> crate::host::http_p3::P3SendFuture {
+                self.strict.store(true, std::sync::atomic::Ordering::SeqCst);
+                Box::new(async {
+                    Err(wasmtime_wasi::TrappableError::from(
+                        wasmtime_wasi_http::p3::bindings::http::types::ErrorCode::InternalError(
+                            None,
+                        ),
+                    ))
+                })
+            }
+
+            fn send_request_insecure_p3(
+                &self,
+                _workload_id: &str,
+                _request: hyper::Request<crate::host::http_p3::P3Body>,
+                _options: Option<wasmtime_wasi_http::p3::RequestOptions>,
+                _fut: crate::host::http_p3::P3RequestErrorFuture,
+            ) -> crate::host::http_p3::P3SendFuture {
+                self.insecure
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Box::new(async {
+                    Err(wasmtime_wasi::TrappableError::from(
+                        wasmtime_wasi_http::p3::bindings::http::types::ErrorCode::InternalError(
+                            None,
+                        ),
+                    ))
+                })
+            }
+        }
+
+        let allow_any = [AllowedHost::Any];
+        let strict = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let insecure = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = Ingress::builder(DevRouter::default(), "127.0.0.1:0".parse().unwrap())
+            .outgoing_handler(RecordingHandler {
+                strict: strict.clone(),
+                insecure: insecure.clone(),
+            })
+            .build()
+            .await
+            .unwrap();
+        let _ = Box::into_pin(server.outgoing_request_p3(
+            "test-workload",
+            build_request_p3("http://example.com/"),
+            None,
+            Box::new(async { Ok(()) }),
+            &allow_any,
+        ))
+        .await;
+
+        let used_strict_first = strict.load(std::sync::atomic::Ordering::SeqCst);
+        let used_insecure_first = insecure.load(std::sync::atomic::Ordering::SeqCst);
+        let _ = server
+            .set_workload_outbound_http_insecure("test-workload", true)
+            .await;
+        let _ = Box::into_pin(server.outgoing_request_p3(
+            "test-workload",
+            build_request_p3("http://example.com/"),
+            None,
+            Box::new(async { Ok(()) }),
+            &allow_any,
+        ))
+        .await;
+
+        assert!(
+            used_strict_first,
+            "default workload must use the strict P3 handler"
+        );
+        assert!(
+            !used_insecure_first,
+            "default workload must not use the insecure P3 handler"
+        );
+        assert!(
+            insecure.load(std::sync::atomic::Ordering::SeqCst),
+            "enabled workload must use the insecure P3 handler"
         );
     }
 
