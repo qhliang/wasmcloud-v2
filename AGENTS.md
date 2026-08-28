@@ -30,8 +30,10 @@ cargo xtask build-fixtures                 # 生成 wash-runtime 集成测试所
 - `crates/custom_plugin_*` — 宿主端插件，编译进宿主二进制：
   - 存储/基础设施：`kv`, `blobstore`, `cf_d1`, `nats_utils`, `event_monitor`
   - LLM/通信：`llm_gateway_provider`, `mail`, `codex`
-  - 调度：`crontab`, `workflow`
+  - 调度：`crontab`, `workflow`, `task_queue`
   - IM：`dingtalk_stream`, `feishu`, `wechat`, `telegram`
+- `crates/task_queue_core/` — task queue 共享核心库：协议类型、`QueueConfig`、JetStream 资源命名、META KV 读写、任务提交/取消、结果 schema 与重试退避；宿主插件与 native worker 共用，避免协议漂移
+- `crates/task_queue_worker/` — Rust native worker 运行时：实现 `task_queue_core::worker::Worker` 后用 `WorkerRunner` 拉取 `<queue>-worker` durable consumer
 - `crates/wash-runtime/src/plugin/mod.rs` — `HostPlugin` trait 定义
 - `crates/wash/src/cli/host.rs` — host 模式插件注册
 - `crates/wash/src/cli/dev.rs` — dev 模式插件注册

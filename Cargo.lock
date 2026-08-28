@@ -710,7 +710,7 @@ dependencies = [
 
 [[package]]
 name = "bench-tools"
-version = "2.7.3"
+version = "2.7.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -1841,7 +1841,7 @@ dependencies = [
 
 [[package]]
 name = "custom_plugin_blobstore"
-version = "2.7.3"
+version = "2.7.4"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -1861,7 +1861,7 @@ dependencies = [
 
 [[package]]
 name = "custom_plugin_cf_d1"
-version = "2.7.3"
+version = "2.7.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1878,7 +1878,7 @@ dependencies = [
 
 [[package]]
 name = "custom_plugin_codex"
-version = "2.7.3"
+version = "2.7.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1898,7 +1898,7 @@ dependencies = [
 
 [[package]]
 name = "custom_plugin_crontab"
-version = "2.7.3"
+version = "2.7.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1913,7 +1913,7 @@ dependencies = [
 
 [[package]]
 name = "custom_plugin_dingtalk_stream"
-version = "2.7.3"
+version = "2.7.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1930,7 +1930,7 @@ dependencies = [
 
 [[package]]
 name = "custom_plugin_event_monitor"
-version = "2.7.3"
+version = "2.7.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1950,7 +1950,7 @@ dependencies = [
 
 [[package]]
 name = "custom_plugin_feishu"
-version = "2.7.3"
+version = "2.7.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1968,7 +1968,7 @@ dependencies = [
 
 [[package]]
 name = "custom_plugin_kv"
-version = "2.7.3"
+version = "2.7.4"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -1989,7 +1989,7 @@ dependencies = [
 
 [[package]]
 name = "custom_plugin_llm_gateway_provider"
-version = "2.7.3"
+version = "2.7.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2006,7 +2006,7 @@ dependencies = [
 
 [[package]]
 name = "custom_plugin_mail"
-version = "2.7.3"
+version = "2.7.4"
 dependencies = [
  "anyhow",
  "async-imap",
@@ -2028,7 +2028,7 @@ dependencies = [
 
 [[package]]
 name = "custom_plugin_nats_utils"
-version = "2.7.3"
+version = "2.7.4"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -2037,7 +2037,7 @@ dependencies = [
 
 [[package]]
 name = "custom_plugin_task_queue"
-version = "2.7.3"
+version = "2.7.4"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -2046,7 +2046,7 @@ dependencies = [
  "futures",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "task_queue_core",
  "tokio",
  "tokio-util",
  "tracing",
@@ -2057,7 +2057,7 @@ dependencies = [
 
 [[package]]
 name = "custom_plugin_telegram"
-version = "2.7.3"
+version = "2.7.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2074,7 +2074,7 @@ dependencies = [
 
 [[package]]
 name = "custom_plugin_wechat"
-version = "2.7.3"
+version = "2.7.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2091,7 +2091,7 @@ dependencies = [
 
 [[package]]
 name = "custom_plugin_workflow"
-version = "2.7.3"
+version = "2.7.4"
 dependencies = [
  "acts",
  "anyhow",
@@ -7528,6 +7528,39 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
+name = "task_queue_core"
+version = "2.7.4"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "async-trait",
+ "bytes",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "task_queue_worker"
+version = "2.7.4"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "async-trait",
+ "bytes",
+ "futures",
+ "serde_json",
+ "task_queue_core",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "teloxide"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8681,7 +8714,7 @@ dependencies = [
 
 [[package]]
 name = "wash"
-version = "2.7.3"
+version = "2.7.4"
 dependencies = [
  "anyhow",
  "bon",
@@ -8740,7 +8773,7 @@ dependencies = [
 
 [[package]]
 name = "wash-runtime"
-version = "2.7.3"
+version = "2.7.4"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -10410,7 +10443,7 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "xtask"
-version = "2.7.3"
+version = "2.7.4"
 dependencies = [
  "anyhow",
  "clap",

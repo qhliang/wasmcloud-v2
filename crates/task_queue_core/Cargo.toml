@@ -1,13 +1,10 @@
 [package]
-name = "custom_plugin_task_queue"
+name = "task_queue_core"
 authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
-description = "Durable NATS JetStream task queue host plugin"
-
-[lib]
-path = "src/lib.rs"
+description = "Shared protocol and JetStream runtime for the task queue"
 
 [lints]
 workspace = true
@@ -20,11 +17,7 @@ bytes = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-task_queue_core = { path = "../task_queue_core" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
-uuid = { workspace = true }
-wasmtime = { workspace = true }
-
-wash-runtime = { path = "../wash-runtime" }
+uuid = { workspace = true, features = ["v7"] }

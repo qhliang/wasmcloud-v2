@@ -5,28 +5,33 @@
 //! `custom:task-queue/task-control` and export `custom:task-queue/worker`.
 //! Both roles must export `custom:task-queue/observer`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use anyhow::Context as _;
-use async_nats::jetstream::consumer::pull::Config as PullConfig;
-use async_nats::jetstream::kv::Config as KvConfig;
-use async_nats::jetstream::stream::{Config as StreamConfig, RetentionPolicy};
-use async_nats::jetstream::{AckKind, Context};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt as _;
-use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
-use uuid::Uuid;
 
 use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use wash_runtime::engine::workload::{ResolvedWorkload, WorkloadItem};
 use wash_runtime::plugin::{HostPlugin, WitInterfaces, WorkloadTracker};
 use wash_runtime::wit::WitInterface;
+
+use task_queue_core::config::{
+    HEARTBEAT_MAX_INFO_BYTES, HEARTBEAT_MIN_INTERVAL_MS, PAYLOAD_MAX_BYTES,
+};
+use task_queue_core::events::{SCHEMA_VERSION as EVENT_SCHEMA_VERSION, TaskResultEvent};
+use task_queue_core::nats::{AckAction, QueueHandles, now_ms};
+use task_queue_core::queue::{TaskProducer, status_variant};
+use task_queue_core::types::base64_encode;
+use task_queue_core::types::{
+    AttemptFailureRecord, Task as CoreTask, TaskMeta, TaskResult as CoreTaskResult, TaskState,
+};
 
 mod bindings {
     wasmtime::component::bindgen!({
@@ -37,211 +42,51 @@ mod bindings {
 }
 
 use bindings::custom::task_queue::types::{
-    AttemptErrorSource, AttemptFailure, Task, TaskInfo, TaskResult, TaskStatus,
+    AttemptErrorSource, AttemptFailure, Task as GuestTask, TaskInfo, TaskResult, TaskStatus,
 };
 
 pub const PLUGIN_ID: &str = "task-queue";
-pub const ACK_WAIT_MS: u64 = 30_000;
-pub const LEASE_RENEW_INTERVAL_MS: u64 = 10_000;
-pub const DEFAULT_DISPATCH_TIMEOUT_MS: u64 = 600_000;
-pub const DEFAULT_EXECUTION_TIMEOUT_MS: u64 = 3_600_000;
-pub const RETRY_BACKOFF_MS: &[u64] = &[1_000, 5_000, 15_000, 60_000];
-pub const PAYLOAD_MAX_BYTES: usize = 1_048_576;
-pub const HEARTBEAT_MAX_INFO_BYTES: usize = 8_192;
-pub const HEARTBEAT_MIN_INTERVAL_MS: u64 = 1_000;
-pub const MAX_MESSAGE_SIZE: i32 = 1_048_576 + 4096;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskState {
-    Queued,
-    DispatchTimeoutPending,
-    Running,
-    DispatchTimeout,
-    ExecutionTimeout,
-    Cancelled,
-    MaxRetriesExceeded,
-    Succeeded,
-    Failed,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskMeta {
-    id: String,
-    queue: String,
-    state: TaskState,
-    attempt: u32,
-    created_at_ms: u64,
-    dispatched_at_ms: Option<u64>,
-    completed_at_ms: Option<u64>,
-    deadline_ms: u64,
-    cancel_requested: bool,
-    #[serde(default)]
-    attempts: Vec<AttemptFailureRecord>,
-}
-
-#[derive(Serialize)]
-pub struct TaskEnvelope {
-    id: String,
-    payload: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AttemptFailureRecord {
-    attempt: u32,
-    source: String,
-    error: String,
-    started_at_ms: Option<u64>,
-    failed_at_ms: Option<u64>,
-    duration_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone)]
-pub struct QueueConfig {
-    name: String,
-    ack_wait: Duration,
-    #[allow(dead_code)]
-    lease_renew_interval: Duration,
-    dispatch_timeout: Duration,
-    execution_timeout: Duration,
-    max_deliver: i64,
-    retry_backoff_ms: Vec<u64>,
-    results_archive: bool,
-}
-
-impl QueueConfig {
-    fn from_config(config: &HashMap<String, String>) -> anyhow::Result<Self> {
-        let name = config_value(config, "queue")?;
-        validate_queue_name(&name)?;
-        Ok(Self {
-            name,
-            ack_wait: parse_duration_ms(config, "ack-wait-ms", ACK_WAIT_MS)?,
-            lease_renew_interval: parse_duration_ms(
-                config,
-                "lease-renew-interval-ms",
-                LEASE_RENEW_INTERVAL_MS,
-            )?,
-            dispatch_timeout: parse_duration_ms(
-                config,
-                "default-dispatch-timeout-ms",
-                DEFAULT_DISPATCH_TIMEOUT_MS,
-            )?,
-            execution_timeout: parse_duration_ms(
-                config,
-                "default-execution-timeout-ms",
-                DEFAULT_EXECUTION_TIMEOUT_MS,
-            )?,
-            max_deliver: parse_i64(config, "max-deliver", 3)?,
-            retry_backoff_ms: parse_backoff_ms(config, "retry-backoff-ms", RETRY_BACKOFF_MS)?,
-            results_archive: parse_bool(config, "results-archive", true)?,
-        })
+fn guest_status(status: task_queue_core::types::TaskStatus) -> TaskStatus {
+    match status {
+        task_queue_core::types::TaskStatus::Succeeded => TaskStatus::Succeeded,
+        task_queue_core::types::TaskStatus::Failed => TaskStatus::Failed,
+        task_queue_core::types::TaskStatus::DispatchTimeout => TaskStatus::DispatchTimeout,
+        task_queue_core::types::TaskStatus::ExecutionTimeout => TaskStatus::ExecutionTimeout,
+        task_queue_core::types::TaskStatus::Cancelled => TaskStatus::Cancelled,
+        task_queue_core::types::TaskStatus::MaxRetriesExceeded => TaskStatus::MaxRetriesExceeded,
     }
 }
 
-pub fn config_value(config: &HashMap<String, String>, key: &str) -> anyhow::Result<String> {
-    config
-        .get(key)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("missing required config: '{key}'"))
-}
-
-pub fn parse_u64(config: &HashMap<String, String>, key: &str, default: u64) -> anyhow::Result<u64> {
-    match config.get(key) {
-        Some(raw) => raw
-            .parse()
-            .map_err(|err| anyhow::anyhow!("invalid {key}: {err}")),
-        None => Ok(default),
+fn guest_task_result(result: CoreTaskResult) -> TaskResult {
+    TaskResult {
+        id: result.id,
+        status: guest_status(result.status),
+        attempt: result.attempt,
+        output: result.output,
+        error: result.error,
     }
 }
 
-pub fn parse_i64(config: &HashMap<String, String>, key: &str, default: i64) -> anyhow::Result<i64> {
-    match config.get(key) {
-        Some(raw) => raw
-            .parse()
-            .map_err(|err| anyhow::anyhow!("invalid {key}: {err}")),
-        None => Ok(default),
+fn guest_task_info(meta: &TaskMeta) -> TaskInfo {
+    TaskInfo {
+        id: meta.id.clone(),
+        status: guest_status(status_variant(&meta.state)),
+        attempt: meta.attempt.checked_sub(1),
+        created_at_ms: meta.created_at_ms,
+        dispatched_at_ms: meta.dispatched_at_ms,
+        completed_at_ms: meta.completed_at_ms,
+        cancel_requested: meta.cancel_requested,
     }
 }
 
-pub fn parse_bool(
-    config: &HashMap<String, String>,
-    key: &str,
-    default: bool,
-) -> anyhow::Result<bool> {
-    match config.get(key) {
-        Some(raw) => raw
-            .parse()
-            .map_err(|err| anyhow::anyhow!("invalid {key}: {err}")),
-        None => Ok(default),
-    }
-}
-
-pub fn parse_duration_ms(
-    config: &HashMap<String, String>,
-    key: &str,
-    default: u64,
-) -> anyhow::Result<Duration> {
-    parse_u64(config, key, default).map(Duration::from_millis)
-}
-
-pub fn parse_backoff_ms(
-    config: &HashMap<String, String>,
-    key: &str,
-    default: &[u64],
-) -> anyhow::Result<Vec<u64>> {
-    match config.get(key) {
-        Some(raw) => raw
-            .split(',')
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| {
-                value
-                    .parse()
-                    .map_err(|err| anyhow::anyhow!("invalid {key}: {err}"))
-            })
-            .collect(),
-        None => Ok(default.to_vec()),
-    }
-}
-
-pub fn validate_queue_name(queue: &str) -> anyhow::Result<()> {
-    let valid = !queue.is_empty()
-        && queue.len() <= 64
-        && queue
-            .chars()
-            .next()
-            .is_some_and(|first| first.is_ascii_alphanumeric())
-        && queue
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    if valid {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("invalid queue name: '{queue}'"))
-    }
-}
-
-pub fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
+pub use task_queue_core::config::QueueConfig;
 
 #[derive(Clone, Debug)]
 pub enum CallbackEvent {
     Heartbeat { id: String, info: String },
     AttemptFailed { event: AttemptFailure },
     Complete { result: TaskResult },
-}
-
-#[derive(Clone)]
-pub struct QueueHandles {
-    config: QueueConfig,
-    tasks: Context,
-    task_stream: async_nats::jetstream::stream::Stream,
-    meta: async_nats::jetstream::kv::Store,
-    results: Option<Context>,
 }
 
 pub struct ComponentData {
@@ -326,51 +171,7 @@ impl TaskQueuePlugin {
         }
 
         let jetstream = async_nats::jetstream::new((*self.client).clone());
-        let subject = format!("{}.tasks.>", config.name);
-        let task_stream = jetstream
-            .get_or_create_stream(StreamConfig {
-                name: config.name.clone(),
-                subjects: vec![subject.clone()],
-                retention: RetentionPolicy::WorkQueue,
-                max_message_size: MAX_MESSAGE_SIZE,
-                ..Default::default()
-            })
-            .await
-            .map_err(|err| anyhow::anyhow!("failed to create task stream: {err}"))?;
-        let meta = jetstream
-            .create_key_value(KvConfig {
-                bucket: format!("{}-meta", config.name),
-                max_value_size: PAYLOAD_MAX_BYTES as i32,
-                history: 1,
-                ..Default::default()
-            })
-            .await
-            .map_err(|err| anyhow::anyhow!("failed to create task metadata: {err}"))?;
-        let results = if config.results_archive {
-            let name = format!("{}-results", config.name);
-            let subject = format!("{}.results.>", config.name);
-            let _stream = jetstream
-                .get_or_create_stream(StreamConfig {
-                    name: name.clone(),
-                    subjects: vec![subject],
-                    retention: RetentionPolicy::Limits,
-                    max_message_size: MAX_MESSAGE_SIZE,
-                    ..Default::default()
-                })
-                .await
-                .map_err(|err| anyhow::anyhow!("failed to create results archive: {err}"))?;
-            Some(jetstream.clone())
-        } else {
-            None
-        };
-
-        let handles = QueueHandles {
-            config,
-            tasks: jetstream.clone(),
-            task_stream,
-            meta,
-            results,
-        };
+        let handles = task_queue_core::nats::QueueHandles::create(jetstream, config).await?;
         self.queues
             .write()
             .await
@@ -379,24 +180,11 @@ impl TaskQueuePlugin {
     }
 
     async fn metadata(&self, handles: &QueueHandles, task_id: &str) -> anyhow::Result<TaskMeta> {
-        let key = metadata_key(&handles.config.name, task_id);
-        let raw = handles
-            .meta
-            .get(key.as_str())
-            .await
-            .map_err(|err| anyhow::anyhow!("failed to read task metadata: {err}"))?
-            .ok_or_else(|| anyhow::anyhow!("task not found"))?;
-        serde_json::from_slice(&raw).context("failed to decode task metadata")
+        handles.get_metadata(task_id).await
     }
 
     async fn put_metadata(&self, handles: &QueueHandles, meta: &TaskMeta) -> anyhow::Result<u64> {
-        let raw = serde_json::to_vec(meta).context("failed to encode task metadata")?;
-        let key = metadata_key(&handles.config.name, &meta.id);
-        handles
-            .meta
-            .put(key.as_str(), Bytes::from(raw))
-            .await
-            .map_err(|err| anyhow::anyhow!("failed to write task metadata: {err}"))
+        handles.put_metadata(meta).await
     }
 
     async fn observe(&self, component_id: &str, event: CallbackEvent) -> anyhow::Result<()> {
@@ -431,16 +219,16 @@ impl TaskQueuePlugin {
         let cancel = CancellationToken::new();
         let (_task, acker) = message.clone().split();
         let acker = Arc::new(acker);
-        let lease = RunningTask { acker, cancel };
-        let renew_acker = lease.acker.clone();
+        let renew_acker = acker.clone();
         let renew_task = tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(Duration::from_millis(LEASE_RENEW_INTERVAL_MS));
+            let mut interval = tokio::time::interval(Duration::from_millis(
+                task_queue_core::config::LEASE_RENEW_INTERVAL_MS,
+            ));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             interval.tick().await;
             loop {
                 interval.tick().await;
-                if renew_acker.ack_with(AckKind::Progress).await.is_err() {
+                if AckAction::Progress.apply(&renew_acker).await.is_err() {
                     break;
                 }
             }
@@ -469,7 +257,7 @@ impl TaskQueuePlugin {
                 call_worker(
                     &workload,
                     &component_id,
-                    Task {
+                    GuestTask {
                         payload: message.payload.to_vec(),
                     },
                 )
@@ -488,14 +276,14 @@ impl TaskQueuePlugin {
 
         match result {
             Ok(()) => {
-                let state = if lease.cancel.is_cancelled() {
+                let state = if cancel.is_cancelled() {
                     TaskState::Cancelled
                 } else {
                     TaskState::Succeeded
                 };
                 self.complete_task(&handles, &task_id, attempt, state, output, None, started)
                     .await;
-                let _ = lease.acker.ack_with(AckKind::Ack).await;
+                let _ = AckAction::Ack.apply(&acker).await;
             }
             Err(error) => {
                 let duration = now_ms().saturating_sub(started);
@@ -514,25 +302,10 @@ impl TaskQueuePlugin {
                         started,
                     )
                     .await;
-                    let _ = lease.acker.ack_with(AckKind::Term).await;
+                    let _ = AckAction::Term.apply(&acker).await;
                 } else {
-                    let index = (attempt - 1).saturating_sub(1) as usize;
-                    let backoff_ms = handles
-                        .config
-                        .retry_backoff_ms
-                        .get(index)
-                        .copied()
-                        .unwrap_or_else(|| {
-                            handles
-                                .config
-                                .retry_backoff_ms
-                                .last()
-                                .copied()
-                                .unwrap_or(1_000)
-                        });
-                    let _ = lease
-                        .acker
-                        .ack_with(AckKind::Nak(Some(Duration::from_millis(backoff_ms))))
+                    let _ = AckAction::Nak(Some(handles.config.backoff_for_attempt(attempt)))
+                        .apply(&acker)
                         .await;
                 }
             }
@@ -657,33 +430,34 @@ impl TaskQueuePlugin {
             warn!(task_id = %task_id, err = %err, "failed to update completed metadata");
         }
 
-        let status = match state {
-            TaskState::Succeeded => TaskStatus::Succeeded,
-            TaskState::Cancelled => TaskStatus::Cancelled,
-            TaskState::DispatchTimeout => TaskStatus::DispatchTimeout,
-            TaskState::ExecutionTimeout => TaskStatus::ExecutionTimeout,
-            TaskState::MaxRetriesExceeded => TaskStatus::MaxRetriesExceeded,
-            _ => TaskStatus::Failed,
-        };
-        let result = TaskResult {
+        let status = status_variant(&state);
+        let result = CoreTaskResult {
             id: task_id.to_string(),
             status,
             attempt,
             output,
             error,
         };
-        let archived = ArchivedResult {
+        let archived = TaskResultEvent {
+            schema_version: EVENT_SCHEMA_VERSION,
             id: result.id.clone(),
-            status: status_name(&result.status),
+            status: result.status,
             attempt: result.attempt,
-            output: result.output.clone(),
+            output_base64: result.output.as_deref().map(base64_encode),
+            output: None,
             error: result.error.clone(),
+            completed_at_ms: meta.completed_at_ms,
         };
         self.archive_result(handles, &archived).await;
 
         if let Some(component_id) = self.find_producer_component(&handles.config.name).await
             && let Err(err) = self
-                .observe(&component_id, CallbackEvent::Complete { result })
+                .observe(
+                    &component_id,
+                    CallbackEvent::Complete {
+                        result: guest_task_result(result),
+                    },
+                )
                 .await
         {
             warn!(err = %err, "failed to queue completion callback");
@@ -691,11 +465,8 @@ impl TaskQueuePlugin {
         debug!(task_id = %task_id, started_at_ms, "task completed");
     }
 
-    async fn archive_result(&self, handles: &QueueHandles, result: &ArchivedResult) {
-        let Some(stream) = handles.results.as_ref() else {
-            return;
-        };
-        let subject = format!("{}.results.{}", handles.config.name, result.id);
+    async fn archive_result(&self, handles: &QueueHandles, result: &TaskResultEvent) {
+        let subject = task_queue_core::nats::result_subject(&handles.config.name, &result.id);
         let raw = match serde_json::to_vec(result) {
             Ok(raw) => raw,
             Err(err) => {
@@ -703,27 +474,13 @@ impl TaskQueuePlugin {
                 return;
             }
         };
-        if let Err(err) = stream.publish(subject, Bytes::from(raw)).await {
+        if let Err(err) = handles.jetstream.publish(subject, Bytes::from(raw)).await {
             warn!(err = %err, "failed to archive task result");
         }
     }
 
     async fn start_queue_loop(&self, handles: QueueHandles, cancel: CancellationToken) {
-        let consumer_name = format!("{}-worker", handles.config.name);
-        let consumer = match handles
-            .task_stream
-            .get_or_create_consumer(
-                consumer_name.as_str(),
-                PullConfig {
-                    durable_name: Some(consumer_name.clone()),
-                    filter_subject: format!("{}.tasks.>", handles.config.name),
-                    ack_wait: handles.config.ack_wait,
-                    max_deliver: handles.config.max_deliver,
-                    ..Default::default()
-                },
-            )
-            .await
-        {
+        let consumer = match handles.ensure_worker().await {
             Ok(consumer) => consumer,
             Err(err) => {
                 warn!(err = %err, "failed to create task consumer");
@@ -780,35 +537,6 @@ impl std::fmt::Debug for TaskQueuePlugin {
     }
 }
 
-pub fn status_name(status: &TaskStatus) -> String {
-    match status {
-        TaskStatus::Succeeded => "succeeded".into(),
-        TaskStatus::Failed => "failed".to_string(),
-        TaskStatus::DispatchTimeout => "dispatch-timeout".to_string(),
-        TaskStatus::ExecutionTimeout => "execution-timeout".to_string(),
-        TaskStatus::Cancelled => "cancelled".to_string(),
-        TaskStatus::MaxRetriesExceeded => "max-retries-exceeded".to_string(),
-    }
-}
-
-pub fn status_variant(state: &TaskState) -> TaskStatus {
-    match state {
-        TaskState::Succeeded => TaskStatus::Succeeded,
-        TaskState::Failed => TaskStatus::Failed,
-        TaskState::DispatchTimeoutPending | TaskState::DispatchTimeout => {
-            TaskStatus::DispatchTimeout
-        }
-        TaskState::ExecutionTimeout => TaskStatus::ExecutionTimeout,
-        TaskState::Cancelled => TaskStatus::Cancelled,
-        TaskState::MaxRetriesExceeded => TaskStatus::MaxRetriesExceeded,
-        TaskState::Running | TaskState::Queued => TaskStatus::Failed,
-    }
-}
-
-pub fn metadata_key(queue: &str, task_id: &str) -> String {
-    format!("{queue}.{task_id}")
-}
-
 pub struct CallbackDispatcher {
     #[allow(dead_code)]
     receiver: tokio::sync::mpsc::UnboundedReceiver<(String, CallbackEvent)>,
@@ -851,24 +579,10 @@ async fn dispatch_observer(
     Ok(())
 }
 
-pub struct RunningTask {
-    acker: Arc<async_nats::jetstream::message::Acker>,
-    cancel: CancellationToken,
-}
-
-#[derive(Serialize)]
-pub struct ArchivedResult {
-    id: String,
-    status: String,
-    attempt: u32,
-    output: Option<Vec<u8>>,
-    error: Option<String>,
-}
-
 async fn call_worker(
     workload: &ResolvedWorkload,
     component_id: &str,
-    task: Task,
+    task: GuestTask,
 ) -> (Result<(), String>, Option<Vec<u8>>) {
     let mut store = match workload.new_store(component_id).await {
         Ok(store) => store,
@@ -901,7 +615,7 @@ async fn call_worker(
 impl<'a> bindings::custom::task_queue::types::Host for ActiveCtx<'a> {}
 
 impl<'a> bindings::custom::task_queue::producer::Host for ActiveCtx<'a> {
-    async fn submit(&mut self, task: Task) -> wasmtime::Result<Result<String, String>> {
+    async fn submit(&mut self, task: GuestTask) -> wasmtime::Result<Result<String, String>> {
         let Ok(plugin) = self.try_get_plugin::<TaskQueuePlugin>(PLUGIN_ID) else {
             return Ok(Err("plugin not available".into()));
         };
@@ -924,35 +638,16 @@ impl<'a> bindings::custom::task_queue::producer::Host for ActiveCtx<'a> {
             return Ok(Err(format!("payload exceeds {PAYLOAD_MAX_BYTES} bytes")));
         }
 
-        let task_id = Uuid::now_v7().to_string();
-        let created_at_ms = now_ms();
-        let meta = TaskMeta {
-            id: task_id.clone(),
-            queue: queue.clone(),
-            state: TaskState::Queued,
-            attempt: 0,
-            created_at_ms,
-            dispatched_at_ms: None,
-            completed_at_ms: None,
-            deadline_ms: created_at_ms + handles.config.dispatch_timeout.as_millis() as u64,
-            cancel_requested: false,
-            attempts: Vec::new(),
-        };
-        if let Err(err) = plugin.put_metadata(&handles, &meta).await {
-            return Ok(Err(format!("failed to store task metadata: {err}")));
+        let producer = TaskProducer::from_handles(Arc::new(handles));
+        match producer
+            .submit(CoreTask {
+                payload: task.payload,
+            })
+            .await
+        {
+            Ok(task_id) => Ok(Ok(task_id)),
+            Err(err) => Ok(Err(err.to_string())),
         }
-        let subject = format!("{}.tasks.{task_id}", handles.config.name);
-        let payload = match serde_json::to_vec(&TaskEnvelope {
-            id: task_id.clone(),
-            payload: task.payload,
-        }) {
-            Ok(payload) => Bytes::from(payload),
-            Err(err) => return Ok(Err(format!("failed to encode task: {err}"))),
-        };
-        if let Err(err) = handles.tasks.publish(subject, payload).await {
-            return Ok(Err(format!("failed to publish task: {err}")));
-        }
-        Ok(Ok(task_id))
     }
 
     async fn query_status(
@@ -978,15 +673,7 @@ impl<'a> bindings::custom::task_queue::producer::Host for ActiveCtx<'a> {
             return Ok(Ok(None));
         };
         match plugin.metadata(&handles, &task_id).await {
-            Ok(meta) => Ok(Ok(Some(TaskInfo {
-                id: meta.id,
-                status: status_variant(&meta.state),
-                attempt: meta.attempt.checked_sub(1),
-                created_at_ms: meta.created_at_ms,
-                dispatched_at_ms: meta.dispatched_at_ms,
-                completed_at_ms: meta.completed_at_ms,
-                cancel_requested: meta.cancel_requested,
-            }))),
+            Ok(meta) => Ok(Ok(Some(guest_task_info(&meta)))),
             Err(_) => Ok(Ok(None)),
         }
     }
@@ -1199,16 +886,7 @@ impl HostPlugin for TaskQueuePlugin {
             data.workload = Some(workload.clone());
             data.queue.clone()
         };
-        let config = QueueConfig {
-            name: queue,
-            ack_wait: Duration::from_millis(ACK_WAIT_MS),
-            lease_renew_interval: Duration::from_millis(LEASE_RENEW_INTERVAL_MS),
-            dispatch_timeout: Duration::from_millis(DEFAULT_DISPATCH_TIMEOUT_MS),
-            execution_timeout: Duration::from_millis(DEFAULT_EXECUTION_TIMEOUT_MS),
-            max_deliver: 3,
-            retry_backoff_ms: RETRY_BACKOFF_MS.to_vec(),
-            results_archive: true,
-        };
+        let config = QueueConfig::new(queue);
         let handles = self.ensure_queue(config).await?;
         self.start_queue_loop(handles, self.callback_cancel.child_token())
             .await;
@@ -1240,12 +918,17 @@ impl HostPlugin for TaskQueuePlugin {
     }
 }
 
-use std::collections::HashSet;
 pub type WitWorld = wash_runtime::wit::WitWorld;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use task_queue_core::config::{
+        DEFAULT_RETRY_BACKOFF_MS as RETRY_BACKOFF_MS, parse_backoff_ms, validate_queue_name,
+    };
+    use task_queue_core::nats::metadata_key;
+    use task_queue_core::types::TaskStatus as CoreTaskStatus;
 
     #[test]
     fn queue_name_accepts_valid_characters() {
@@ -1308,22 +991,19 @@ mod tests {
 
     #[test]
     fn status_names_are_stable() {
-        assert_eq!(status_name(&TaskStatus::Succeeded), "succeeded");
-        assert_eq!(
-            status_name(&TaskStatus::DispatchTimeout),
-            "dispatch-timeout"
-        );
+        assert_eq!(CoreTaskStatus::Succeeded.as_str(), "succeeded");
+        assert_eq!(CoreTaskStatus::DispatchTimeout.as_str(), "dispatch-timeout");
     }
 
     #[test]
     fn status_variants_are_stable() {
         assert!(matches!(
             status_variant(&TaskState::DispatchTimeoutPending),
-            TaskStatus::DispatchTimeout
+            CoreTaskStatus::DispatchTimeout
         ));
         assert!(matches!(
             status_variant(&TaskState::Cancelled),
-            TaskStatus::Cancelled
+            CoreTaskStatus::Cancelled
         ));
     }
 }
