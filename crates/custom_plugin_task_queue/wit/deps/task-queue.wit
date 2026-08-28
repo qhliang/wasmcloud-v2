@@ -1,0 +1,76 @@
+package custom:task-queue@0.1.0;
+
+interface types {
+    record task {
+        payload: list<u8>,
+    }
+
+    variant task-status {
+        succeeded,
+        failed,
+        dispatch-timeout,
+        execution-timeout,
+        cancelled,
+        max-retries-exceeded,
+    }
+
+    record task-result {
+        id: string,
+        status: task-status,
+        attempt: u32,
+        output: option<list<u8>>,
+        error: option<string>,
+    }
+
+    record task-info {
+        id: string,
+        status: task-status,
+        attempt: option<u32>,
+        created-at-ms: u64,
+        dispatched-at-ms: option<u64>,
+        completed-at-ms: option<u64>,
+        cancel-requested: bool,
+    }
+
+    variant attempt-error-source {
+        guest,
+        system,
+    }
+
+    record attempt-failure {
+        id: string,
+        attempt: u32,
+        source: attempt-error-source,
+        error: string,
+        started-at-ms: option<u64>,
+        failed-at-ms: option<u64>,
+        duration-ms: option<u64>,
+    }
+}
+
+interface producer {
+    use types.{task, task-info};
+
+    submit: func(task: task) -> result<string, string>;
+    query-status: func(task-id: string) -> result<option<task-info>, string>;
+    cancel-task: func(task-id: string) -> result<_, string>;
+}
+
+interface task-control {
+    send-heartbeat: func(task-id: string, info: string) -> result<_, string>;
+    is-cancelled: func(task-id: string) -> bool;
+}
+
+interface observer {
+    use types.{attempt-failure, task-result};
+
+    on-heartbeat: async func(task-id: string, info: string) -> result<_, string>;
+    on-attempt-failed: async func(event: attempt-failure) -> result<_, string>;
+    on-complete: async func(outcome: task-result) -> result<_, string>;
+}
+
+interface worker {
+    use types.{task};
+
+    handle-task: async func(task: task) -> result<option<list<u8>>, string>;
+}

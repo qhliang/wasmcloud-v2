@@ -1,0 +1,8 @@
+package my:task-queue;
+
+world task-queue {
+    import custom:task-queue/producer@0.1.0;
+    import custom:task-queue/task-control@0.1.0;
+    export custom:task-queue/observer@0.1.0;
+    export custom:task-queue/worker@0.1.0;
+}

@@ -572,6 +572,13 @@ impl CliCommand for HostCommand {
         // Enable workflow plugin
         cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(WorkflowPlugin::new()))?;
         tracing::info!("Workflow plugin enabled");
+
+        // Enable durable task queue plugin
+        cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(
+            custom_plugin_task_queue::TaskQueuePlugin::new(Arc::clone(&data_nats_client))?,
+        ))?;
+        tracing::info!("Task queue plugin enabled");
+
         if let Some(postgres_url) = &self.postgres_url {
             cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(
                 plugin::wasmcloud_postgres::WasmcloudPostgres::new(postgres_url)

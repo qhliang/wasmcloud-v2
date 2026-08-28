@@ -321,6 +321,15 @@ impl CliCommand for DevCommand {
             host_builder.with_plugin(Arc::new(custom_plugin_workflow::WorkflowPlugin::new()))?;
         debug!("Workflow plugin enabled");
 
+        // Enable durable task queue plugin. Unlike other data-plane plugins,
+        // it requires JetStream and must not silently fall back to memory.
+        if let Some(client) = &data_nats_client {
+            host_builder = host_builder.with_plugin(Arc::new(
+                custom_plugin_task_queue::TaskQueuePlugin::new(client.clone())?,
+            ))?;
+            debug!("Task queue plugin enabled with JetStream backend");
+        }
+
         // Add postgres plugin if configured
         if let Some(postgres_url) = &dev_config.postgres_url {
             host_builder = host_builder.with_plugin(Arc::new(

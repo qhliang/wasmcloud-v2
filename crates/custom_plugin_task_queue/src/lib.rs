@@ -1,0 +1,1329 @@
+//! # Task Queue Host Plugin
+//!
+//! A durable work queue backed by the host's shared data-plane NATS
+//! connection. Producers import `custom:task-queue/producer`; workers import
+//! `custom:task-queue/task-control` and export `custom:task-queue/worker`.
+//! Both roles must export `custom:task-queue/observer`.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use anyhow::Context as _;
+use async_nats::jetstream::consumer::pull::Config as PullConfig;
+use async_nats::jetstream::kv::Config as KvConfig;
+use async_nats::jetstream::stream::{Config as StreamConfig, RetentionPolicy};
+use async_nats::jetstream::{AckKind, Context};
+use async_trait::async_trait;
+use bytes::Bytes;
+use futures::StreamExt as _;
+use serde::{Deserialize, Serialize};
+use tokio::sync::{Mutex, RwLock};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
+use uuid::Uuid;
+
+use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
+use wash_runtime::engine::workload::{ResolvedWorkload, WorkloadItem};
+use wash_runtime::plugin::{HostPlugin, WitInterfaces, WorkloadTracker};
+use wash_runtime::wit::WitInterface;
+
+mod bindings {
+    wasmtime::component::bindgen!({
+        world: "task-queue",
+        imports: { default: async | trappable | tracing },
+        exports: { default: async | trappable | tracing },
+    });
+}
+
+use bindings::custom::task_queue::types::{
+    AttemptErrorSource, AttemptFailure, Task, TaskInfo, TaskResult, TaskStatus,
+};
+
+pub const PLUGIN_ID: &str = "task-queue";
+pub const ACK_WAIT_MS: u64 = 30_000;
+pub const LEASE_RENEW_INTERVAL_MS: u64 = 10_000;
+pub const DEFAULT_DISPATCH_TIMEOUT_MS: u64 = 600_000;
+pub const DEFAULT_EXECUTION_TIMEOUT_MS: u64 = 3_600_000;
+pub const RETRY_BACKOFF_MS: &[u64] = &[1_000, 5_000, 15_000, 60_000];
+pub const PAYLOAD_MAX_BYTES: usize = 1_048_576;
+pub const HEARTBEAT_MAX_INFO_BYTES: usize = 8_192;
+pub const HEARTBEAT_MIN_INTERVAL_MS: u64 = 1_000;
+pub const MAX_MESSAGE_SIZE: i32 = 1_048_576 + 4096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskState {
+    Queued,
+    DispatchTimeoutPending,
+    Running,
+    DispatchTimeout,
+    ExecutionTimeout,
+    Cancelled,
+    MaxRetriesExceeded,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskMeta {
+    id: String,
+    queue: String,
+    state: TaskState,
+    attempt: u32,
+    created_at_ms: u64,
+    dispatched_at_ms: Option<u64>,
+    completed_at_ms: Option<u64>,
+    deadline_ms: u64,
+    cancel_requested: bool,
+    #[serde(default)]
+    attempts: Vec<AttemptFailureRecord>,
+}
+
+#[derive(Serialize)]
+pub struct TaskEnvelope {
+    id: String,
+    payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttemptFailureRecord {
+    attempt: u32,
+    source: String,
+    error: String,
+    started_at_ms: Option<u64>,
+    failed_at_ms: Option<u64>,
+    duration_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueueConfig {
+    name: String,
+    ack_wait: Duration,
+    #[allow(dead_code)]
+    lease_renew_interval: Duration,
+    dispatch_timeout: Duration,
+    execution_timeout: Duration,
+    max_deliver: i64,
+    retry_backoff_ms: Vec<u64>,
+    results_archive: bool,
+}
+
+impl QueueConfig {
+    fn from_config(config: &HashMap<String, String>) -> anyhow::Result<Self> {
+        let name = config_value(config, "queue")?;
+        validate_queue_name(&name)?;
+        Ok(Self {
+            name,
+            ack_wait: parse_duration_ms(config, "ack-wait-ms", ACK_WAIT_MS)?,
+            lease_renew_interval: parse_duration_ms(
+                config,
+                "lease-renew-interval-ms",
+                LEASE_RENEW_INTERVAL_MS,
+            )?,
+            dispatch_timeout: parse_duration_ms(
+                config,
+                "default-dispatch-timeout-ms",
+                DEFAULT_DISPATCH_TIMEOUT_MS,
+            )?,
+            execution_timeout: parse_duration_ms(
+                config,
+                "default-execution-timeout-ms",
+                DEFAULT_EXECUTION_TIMEOUT_MS,
+            )?,
+            max_deliver: parse_i64(config, "max-deliver", 3)?,
+            retry_backoff_ms: parse_backoff_ms(config, "retry-backoff-ms", RETRY_BACKOFF_MS)?,
+            results_archive: parse_bool(config, "results-archive", true)?,
+        })
+    }
+}
+
+pub fn config_value(config: &HashMap<String, String>, key: &str) -> anyhow::Result<String> {
+    config
+        .get(key)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("missing required config: '{key}'"))
+}
+
+pub fn parse_u64(config: &HashMap<String, String>, key: &str, default: u64) -> anyhow::Result<u64> {
+    match config.get(key) {
+        Some(raw) => raw
+            .parse()
+            .map_err(|err| anyhow::anyhow!("invalid {key}: {err}")),
+        None => Ok(default),
+    }
+}
+
+pub fn parse_i64(config: &HashMap<String, String>, key: &str, default: i64) -> anyhow::Result<i64> {
+    match config.get(key) {
+        Some(raw) => raw
+            .parse()
+            .map_err(|err| anyhow::anyhow!("invalid {key}: {err}")),
+        None => Ok(default),
+    }
+}
+
+pub fn parse_bool(
+    config: &HashMap<String, String>,
+    key: &str,
+    default: bool,
+) -> anyhow::Result<bool> {
+    match config.get(key) {
+        Some(raw) => raw
+            .parse()
+            .map_err(|err| anyhow::anyhow!("invalid {key}: {err}")),
+        None => Ok(default),
+    }
+}
+
+pub fn parse_duration_ms(
+    config: &HashMap<String, String>,
+    key: &str,
+    default: u64,
+) -> anyhow::Result<Duration> {
+    parse_u64(config, key, default).map(Duration::from_millis)
+}
+
+pub fn parse_backoff_ms(
+    config: &HashMap<String, String>,
+    key: &str,
+    default: &[u64],
+) -> anyhow::Result<Vec<u64>> {
+    match config.get(key) {
+        Some(raw) => raw
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                value
+                    .parse()
+                    .map_err(|err| anyhow::anyhow!("invalid {key}: {err}"))
+            })
+            .collect(),
+        None => Ok(default.to_vec()),
+    }
+}
+
+pub fn validate_queue_name(queue: &str) -> anyhow::Result<()> {
+    let valid = !queue.is_empty()
+        && queue.len() <= 64
+        && queue
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphanumeric())
+        && queue
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if valid {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("invalid queue name: '{queue}'"))
+    }
+}
+
+pub fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[derive(Clone, Debug)]
+pub enum CallbackEvent {
+    Heartbeat { id: String, info: String },
+    AttemptFailed { event: AttemptFailure },
+    Complete { result: TaskResult },
+}
+
+#[derive(Clone)]
+pub struct QueueHandles {
+    config: QueueConfig,
+    tasks: Context,
+    task_stream: async_nats::jetstream::stream::Stream,
+    meta: async_nats::jetstream::kv::Store,
+    results: Option<Context>,
+}
+
+pub struct ComponentData {
+    queue: String,
+    workload: Option<ResolvedWorkload>,
+    cancel_token: CancellationToken,
+}
+
+#[derive(Default)]
+struct HeartbeatState {
+    last_heartbeat_at: Option<SystemTime>,
+}
+
+pub struct TaskQueuePlugin {
+    client: Arc<async_nats::Client>,
+    tracker: Arc<RwLock<WorkloadTracker<(), ComponentData>>>,
+    queues: Arc<RwLock<HashMap<String, QueueHandles>>>,
+    heartbeats: Arc<Mutex<HashMap<String, HeartbeatState>>>,
+    callback_tx: tokio::sync::mpsc::UnboundedSender<(String, CallbackEvent)>,
+    callback_cancel: CancellationToken,
+    #[allow(dead_code)]
+    lifetime: Mutex<()>,
+}
+
+impl TaskQueuePlugin {
+    pub fn new(client: Arc<async_nats::Client>) -> anyhow::Result<Self> {
+        let callback_cancel = CancellationToken::new();
+        let (callback_tx, callback_rx) = tokio::sync::mpsc::unbounded_channel();
+        Ok(Self {
+            client,
+            tracker: Arc::new(RwLock::new(WorkloadTracker::default())),
+            queues: Arc::new(RwLock::new(HashMap::new())),
+            heartbeats: Arc::new(Mutex::new(HashMap::new())),
+            callback_tx,
+            callback_cancel,
+            lifetime: Mutex::new(()),
+        })
+        .inspect(|plugin| plugin.spawn_callback_dispatcher(callback_rx))
+    }
+
+    fn spawn_callback_dispatcher(
+        &self,
+        mut receiver: tokio::sync::mpsc::UnboundedReceiver<(String, CallbackEvent)>,
+    ) {
+        let tracker = self.tracker.clone();
+        let cancel = self.callback_cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    event = receiver.recv() => match event {
+                        Some((component_id, event)) => {
+                            let workload = {
+                                let tracker = tracker.read().await;
+                                tracker
+                                    .get_component_data(&component_id)
+                                    .and_then(|data| data.workload.clone())
+                            };
+                            if let Some(workload) = workload {
+                                if let Err(err) =
+                                    dispatch_observer(&workload, &component_id, event).await
+                                {
+                                    warn!(component_id = %component_id, err = %err, "failed to dispatch observer callback");
+                                }
+                            } else {
+                                warn!(component_id = %component_id, "observer component not ready");
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        });
+    }
+
+    async fn ensure_queue(&self, config: QueueConfig) -> anyhow::Result<QueueHandles> {
+        {
+            let queues = self.queues.read().await;
+            if let Some(handles) = queues.get(&config.name) {
+                return Ok(handles.clone());
+            }
+        }
+
+        let jetstream = async_nats::jetstream::new((*self.client).clone());
+        let subject = format!("{}.tasks.>", config.name);
+        let task_stream = jetstream
+            .get_or_create_stream(StreamConfig {
+                name: config.name.clone(),
+                subjects: vec![subject.clone()],
+                retention: RetentionPolicy::WorkQueue,
+                max_message_size: MAX_MESSAGE_SIZE,
+                ..Default::default()
+            })
+            .await
+            .map_err(|err| anyhow::anyhow!("failed to create task stream: {err}"))?;
+        let meta = jetstream
+            .create_key_value(KvConfig {
+                bucket: format!("{}-meta", config.name),
+                max_value_size: PAYLOAD_MAX_BYTES as i32,
+                history: 1,
+                ..Default::default()
+            })
+            .await
+            .map_err(|err| anyhow::anyhow!("failed to create task metadata: {err}"))?;
+        let results = if config.results_archive {
+            let name = format!("{}-results", config.name);
+            let subject = format!("{}.results.>", config.name);
+            let _stream = jetstream
+                .get_or_create_stream(StreamConfig {
+                    name: name.clone(),
+                    subjects: vec![subject],
+                    retention: RetentionPolicy::Limits,
+                    max_message_size: MAX_MESSAGE_SIZE,
+                    ..Default::default()
+                })
+                .await
+                .map_err(|err| anyhow::anyhow!("failed to create results archive: {err}"))?;
+            Some(jetstream.clone())
+        } else {
+            None
+        };
+
+        let handles = QueueHandles {
+            config,
+            tasks: jetstream.clone(),
+            task_stream,
+            meta,
+            results,
+        };
+        self.queues
+            .write()
+            .await
+            .insert(handles.config.name.clone(), handles.clone());
+        Ok(handles)
+    }
+
+    async fn metadata(&self, handles: &QueueHandles, task_id: &str) -> anyhow::Result<TaskMeta> {
+        let key = metadata_key(&handles.config.name, task_id);
+        let raw = handles
+            .meta
+            .get(key.as_str())
+            .await
+            .map_err(|err| anyhow::anyhow!("failed to read task metadata: {err}"))?
+            .ok_or_else(|| anyhow::anyhow!("task not found"))?;
+        serde_json::from_slice(&raw).context("failed to decode task metadata")
+    }
+
+    async fn put_metadata(&self, handles: &QueueHandles, meta: &TaskMeta) -> anyhow::Result<u64> {
+        let raw = serde_json::to_vec(meta).context("failed to encode task metadata")?;
+        let key = metadata_key(&handles.config.name, &meta.id);
+        handles
+            .meta
+            .put(key.as_str(), Bytes::from(raw))
+            .await
+            .map_err(|err| anyhow::anyhow!("failed to write task metadata: {err}"))
+    }
+
+    async fn observe(&self, component_id: &str, event: CallbackEvent) -> anyhow::Result<()> {
+        self.callback_tx
+            .send((component_id.to_string(), event))
+            .context("callback channel closed")
+    }
+
+    async fn worker_component(
+        &self,
+        component_id: &str,
+    ) -> Option<(ResolvedWorkload, CancellationToken)> {
+        let tracker = self.tracker.read().await;
+        let data = tracker.get_component_data(component_id)?;
+        Some((data.workload.clone()?, data.cancel_token.clone()))
+    }
+
+    async fn execute_task(
+        &self,
+        handles: QueueHandles,
+        message: &mut async_nats::jetstream::Message,
+    ) {
+        let subject = message.subject.clone();
+        let info = message.info().ok();
+        let task_id = subject
+            .as_ref()
+            .rsplit('.')
+            .next()
+            .map(str::to_string)
+            .unwrap_or_default();
+        let attempt = info.as_ref().map(|info| info.delivered).unwrap_or(1).max(1) as u32;
+        let cancel = CancellationToken::new();
+        let (_task, acker) = message.clone().split();
+        let acker = Arc::new(acker);
+        let lease = RunningTask { acker, cancel };
+        let renew_acker = lease.acker.clone();
+        let renew_task = tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_millis(LEASE_RENEW_INTERVAL_MS));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                if renew_acker.ack_with(AckKind::Progress).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        if let Err(err) = self
+            .put_metadata_with(&handles, &task_id, |meta| {
+                meta.state = TaskState::Running;
+                meta.attempt = attempt;
+                meta.dispatched_at_ms = Some(now_ms());
+                meta.deadline_ms = now_ms() + handles.config.execution_timeout.as_millis() as u64;
+            })
+            .await
+        {
+            warn!(task_id = %task_id, err = %err, "failed to mark task running");
+            return;
+        }
+
+        let component_id = self.find_worker_component(&handles.config.name).await;
+        let started = now_ms();
+        let (result, output) = match (
+            self.worker_component(&component_id).await,
+            component_id.is_empty(),
+        ) {
+            (Some((workload, _)), false) => {
+                call_worker(
+                    &workload,
+                    &component_id,
+                    Task {
+                        payload: message.payload.to_vec(),
+                    },
+                )
+                .await
+            }
+            _ => {
+                let duration = now_ms().saturating_sub(started);
+                let error = "no worker component bound to queue".to_string();
+                self.record_attempt_failure(
+                    &handles, &task_id, attempt, "system", &error, started, duration,
+                )
+                .await;
+                (Err(error), None)
+            }
+        };
+
+        match result {
+            Ok(()) => {
+                let state = if lease.cancel.is_cancelled() {
+                    TaskState::Cancelled
+                } else {
+                    TaskState::Succeeded
+                };
+                self.complete_task(&handles, &task_id, attempt, state, output, None, started)
+                    .await;
+                let _ = lease.acker.ack_with(AckKind::Ack).await;
+            }
+            Err(error) => {
+                let duration = now_ms().saturating_sub(started);
+                self.record_attempt_failure(
+                    &handles, &task_id, attempt, "guest", &error, started, duration,
+                )
+                .await;
+                if attempt >= handles.config.max_deliver.max(1) as u32 {
+                    self.complete_task(
+                        &handles,
+                        &task_id,
+                        attempt,
+                        TaskState::MaxRetriesExceeded,
+                        None,
+                        Some("max retries exceeded".to_string()),
+                        started,
+                    )
+                    .await;
+                    let _ = lease.acker.ack_with(AckKind::Term).await;
+                } else {
+                    let index = (attempt - 1).saturating_sub(1) as usize;
+                    let backoff_ms = handles
+                        .config
+                        .retry_backoff_ms
+                        .get(index)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            handles
+                                .config
+                                .retry_backoff_ms
+                                .last()
+                                .copied()
+                                .unwrap_or(1_000)
+                        });
+                    let _ = lease
+                        .acker
+                        .ack_with(AckKind::Nak(Some(Duration::from_millis(backoff_ms))))
+                        .await;
+                }
+            }
+        }
+        renew_task.abort();
+    }
+
+    async fn put_metadata_with<F>(
+        &self,
+        handles: &QueueHandles,
+        task_id: &str,
+        mutate: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnOnce(&mut TaskMeta),
+    {
+        let mut meta = self.metadata(handles, task_id).await?;
+        mutate(&mut meta);
+        self.put_metadata(handles, &meta).await?;
+        Ok(())
+    }
+
+    async fn find_worker_component(&self, queue: &str) -> String {
+        let tracker = self.tracker.read().await;
+        tracker
+            .components
+            .keys()
+            .find_map(|component_id| {
+                tracker
+                    .get_component_data(component_id)
+                    .filter(|data| data.queue == queue)
+                    .map(|_| component_id.clone())
+            })
+            .unwrap_or_default()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn record_attempt_failure(
+        &self,
+        handles: &QueueHandles,
+        task_id: &str,
+        attempt: u32,
+        source: &str,
+        error: &str,
+        started_at_ms: u64,
+        duration_ms: u64,
+    ) {
+        let failure = AttemptFailureRecord {
+            attempt,
+            source: source.to_string(),
+            error: error.to_string(),
+            started_at_ms: Some(started_at_ms),
+            failed_at_ms: Some(now_ms()),
+            duration_ms: Some(duration_ms),
+        };
+        let mut meta = match self.metadata(handles, task_id).await {
+            Ok(meta) => meta,
+            Err(err) => {
+                warn!(task_id = %task_id, err = %err, "failed to read task before failure record");
+                return;
+            }
+        };
+        meta.attempts.push(failure.clone());
+        if let Err(err) = self.put_metadata(handles, &meta).await {
+            warn!(task_id = %task_id, err = %err, "failed to record attempt failure");
+        }
+
+        let source = if source == "guest" {
+            AttemptErrorSource::Guest
+        } else {
+            AttemptErrorSource::System
+        };
+        let event = AttemptFailure {
+            id: task_id.to_string(),
+            attempt,
+            source,
+            error: error.to_string(),
+            started_at_ms: failure.started_at_ms,
+            failed_at_ms: failure.failed_at_ms,
+            duration_ms: failure.duration_ms,
+        };
+        if let Some(component_id) = self.find_producer_component(&handles.config.name).await
+            && let Err(err) = self
+                .observe(&component_id, CallbackEvent::AttemptFailed { event })
+                .await
+        {
+            warn!(err = %err, "failed to queue attempt failure callback");
+        }
+    }
+
+    async fn find_producer_component(&self, queue: &str) -> Option<String> {
+        let tracker = self.tracker.read().await;
+        tracker.components.keys().find_map(|component_id| {
+            tracker
+                .get_component_data(component_id)
+                .filter(|data| data.queue == queue)
+                .map(|_| component_id.clone())
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_task(
+        &self,
+        handles: &QueueHandles,
+        task_id: &str,
+        attempt: u32,
+        state: TaskState,
+        output: Option<Vec<u8>>,
+        error: Option<String>,
+        started_at_ms: u64,
+    ) {
+        let mut meta = match self.metadata(handles, task_id).await {
+            Ok(meta) => meta,
+            Err(err) => {
+                warn!(task_id = %task_id, err = %err, "failed to read task before completion");
+                return;
+            }
+        };
+        meta.state = state;
+        meta.completed_at_ms = Some(now_ms());
+        if let Err(err) = self.put_metadata(handles, &meta).await {
+            warn!(task_id = %task_id, err = %err, "failed to update completed metadata");
+        }
+
+        let status = match state {
+            TaskState::Succeeded => TaskStatus::Succeeded,
+            TaskState::Cancelled => TaskStatus::Cancelled,
+            TaskState::DispatchTimeout => TaskStatus::DispatchTimeout,
+            TaskState::ExecutionTimeout => TaskStatus::ExecutionTimeout,
+            TaskState::MaxRetriesExceeded => TaskStatus::MaxRetriesExceeded,
+            _ => TaskStatus::Failed,
+        };
+        let result = TaskResult {
+            id: task_id.to_string(),
+            status,
+            attempt,
+            output,
+            error,
+        };
+        let archived = ArchivedResult {
+            id: result.id.clone(),
+            status: status_name(&result.status),
+            attempt: result.attempt,
+            output: result.output.clone(),
+            error: result.error.clone(),
+        };
+        self.archive_result(handles, &archived).await;
+
+        if let Some(component_id) = self.find_producer_component(&handles.config.name).await
+            && let Err(err) = self
+                .observe(&component_id, CallbackEvent::Complete { result })
+                .await
+        {
+            warn!(err = %err, "failed to queue completion callback");
+        }
+        debug!(task_id = %task_id, started_at_ms, "task completed");
+    }
+
+    async fn archive_result(&self, handles: &QueueHandles, result: &ArchivedResult) {
+        let Some(stream) = handles.results.as_ref() else {
+            return;
+        };
+        let subject = format!("{}.results.{}", handles.config.name, result.id);
+        let raw = match serde_json::to_vec(result) {
+            Ok(raw) => raw,
+            Err(err) => {
+                warn!(err = %err, "failed to encode archived result");
+                return;
+            }
+        };
+        if let Err(err) = stream.publish(subject, Bytes::from(raw)).await {
+            warn!(err = %err, "failed to archive task result");
+        }
+    }
+
+    async fn start_queue_loop(&self, handles: QueueHandles, cancel: CancellationToken) {
+        let consumer_name = format!("{}-worker", handles.config.name);
+        let consumer = match handles
+            .task_stream
+            .get_or_create_consumer(
+                consumer_name.as_str(),
+                PullConfig {
+                    durable_name: Some(consumer_name.clone()),
+                    filter_subject: format!("{}.tasks.>", handles.config.name),
+                    ack_wait: handles.config.ack_wait,
+                    max_deliver: handles.config.max_deliver,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(consumer) => consumer,
+            Err(err) => {
+                warn!(err = %err, "failed to create task consumer");
+                return;
+            }
+        };
+
+        let mut messages = match consumer.messages().await {
+            Ok(messages) => messages,
+            Err(err) => {
+                warn!(err = %err, "failed to subscribe to task consumer");
+                return;
+            }
+        };
+        let plugin_self = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    message = messages.next() => match message {
+                        Some(Ok(mut message)) => {
+                            let plugin = plugin_self.clone();
+                            let handles = handles.clone();
+                            tokio::spawn(async move {
+                                plugin.execute_task(handles, &mut message).await;
+                            });
+                        }
+                        Some(Err(err)) => warn!(err = %err, "task consumer stream error"),
+                        None => break,
+                    }
+                }
+            }
+        });
+    }
+}
+
+impl Clone for TaskQueuePlugin {
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            tracker: self.tracker.clone(),
+            queues: self.queues.clone(),
+            heartbeats: Arc::clone(&self.heartbeats),
+            callback_tx: self.callback_tx.clone(),
+            callback_cancel: self.callback_cancel.clone(),
+            lifetime: Mutex::new(()),
+        }
+    }
+}
+
+impl std::fmt::Debug for TaskQueuePlugin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskQueuePlugin").finish()
+    }
+}
+
+pub fn status_name(status: &TaskStatus) -> String {
+    match status {
+        TaskStatus::Succeeded => "succeeded".into(),
+        TaskStatus::Failed => "failed".to_string(),
+        TaskStatus::DispatchTimeout => "dispatch-timeout".to_string(),
+        TaskStatus::ExecutionTimeout => "execution-timeout".to_string(),
+        TaskStatus::Cancelled => "cancelled".to_string(),
+        TaskStatus::MaxRetriesExceeded => "max-retries-exceeded".to_string(),
+    }
+}
+
+pub fn status_variant(state: &TaskState) -> TaskStatus {
+    match state {
+        TaskState::Succeeded => TaskStatus::Succeeded,
+        TaskState::Failed => TaskStatus::Failed,
+        TaskState::DispatchTimeoutPending | TaskState::DispatchTimeout => {
+            TaskStatus::DispatchTimeout
+        }
+        TaskState::ExecutionTimeout => TaskStatus::ExecutionTimeout,
+        TaskState::Cancelled => TaskStatus::Cancelled,
+        TaskState::MaxRetriesExceeded => TaskStatus::MaxRetriesExceeded,
+        TaskState::Running | TaskState::Queued => TaskStatus::Failed,
+    }
+}
+
+pub fn metadata_key(queue: &str, task_id: &str) -> String {
+    format!("{queue}.{task_id}")
+}
+
+pub struct CallbackDispatcher {
+    #[allow(dead_code)]
+    receiver: tokio::sync::mpsc::UnboundedReceiver<(String, CallbackEvent)>,
+}
+
+async fn dispatch_observer(
+    workload: &ResolvedWorkload,
+    component_id: &str,
+    event: CallbackEvent,
+) -> anyhow::Result<()> {
+    let mut store = workload
+        .new_store(component_id)
+        .await
+        .context("failed to create observer store")?;
+    let instance_pre = workload
+        .instantiate_pre(component_id)
+        .await
+        .context("failed to instantiate observer")?;
+    let pre = bindings::TaskQueuePre::new(instance_pre)
+        .map_err(|err| anyhow::anyhow!("failed to bind observer: {err}"))?;
+    let proxy = pre
+        .instantiate_async(&mut store)
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to start observer: {err}"))?;
+    let observer = proxy.custom_task_queue_observer();
+    let call_result = store
+        .run_concurrent(async move |accessor| match event {
+            CallbackEvent::Heartbeat { id, info } => {
+                observer.call_on_heartbeat(accessor, id, info).await
+            }
+            CallbackEvent::AttemptFailed { event } => {
+                observer.call_on_attempt_failed(accessor, event).await
+            }
+            CallbackEvent::Complete { result } => observer.call_on_complete(accessor, result).await,
+        })
+        .await
+        .map_err(|err| anyhow::anyhow!("observer store call failed: {err}"))?
+        .map_err(|err| anyhow::anyhow!("observer handler failed: {err}"))?;
+    drop(call_result);
+    Ok(())
+}
+
+pub struct RunningTask {
+    acker: Arc<async_nats::jetstream::message::Acker>,
+    cancel: CancellationToken,
+}
+
+#[derive(Serialize)]
+pub struct ArchivedResult {
+    id: String,
+    status: String,
+    attempt: u32,
+    output: Option<Vec<u8>>,
+    error: Option<String>,
+}
+
+async fn call_worker(
+    workload: &ResolvedWorkload,
+    component_id: &str,
+    task: Task,
+) -> (Result<(), String>, Option<Vec<u8>>) {
+    let mut store = match workload.new_store(component_id).await {
+        Ok(store) => store,
+        Err(err) => return (Err(format!("failed to create worker store: {err}")), None),
+    };
+    let instance_pre = match workload.instantiate_pre(component_id).await {
+        Ok(pre) => pre,
+        Err(err) => return (Err(format!("failed to instantiate worker: {err}")), None),
+    };
+    let pre = match bindings::TaskQueuePre::new(instance_pre) {
+        Ok(pre) => pre,
+        Err(err) => return (Err(format!("failed to bind worker export: {err}")), None),
+    };
+    let proxy = match pre.instantiate_async(&mut store).await {
+        Ok(proxy) => proxy,
+        Err(err) => return (Err(format!("failed to start worker: {err}")), None),
+    };
+    let worker = proxy.custom_task_queue_worker();
+    match store
+        .run_concurrent(async move |accessor| worker.call_handle_task(accessor, task).await)
+        .await
+    {
+        Ok(Ok(Ok(output))) => (Ok(()), output),
+        Ok(Ok(Err(error))) => (Err(error), None),
+        Ok(Err(err)) => (Err(format!("worker call failed: {err}")), None),
+        Err(err) => (Err(format!("worker store call failed: {err}")), None),
+    }
+}
+
+impl<'a> bindings::custom::task_queue::types::Host for ActiveCtx<'a> {}
+
+impl<'a> bindings::custom::task_queue::producer::Host for ActiveCtx<'a> {
+    async fn submit(&mut self, task: Task) -> wasmtime::Result<Result<String, String>> {
+        let Ok(plugin) = self.try_get_plugin::<TaskQueuePlugin>(PLUGIN_ID) else {
+            return Ok(Err("plugin not available".into()));
+        };
+        let component_id = self.component_id.as_ref().to_string();
+        let queue = {
+            let tracker = plugin.tracker.read().await;
+            let Some(data) = tracker.get_component_data(&component_id) else {
+                return Ok(Err("component not tracked".into()));
+            };
+            data.queue.clone()
+        };
+        let handles = {
+            let queues = plugin.queues.read().await;
+            queues.get(&queue).cloned()
+        };
+        let Some(handles) = handles else {
+            return Ok(Err("queue not ready".into()));
+        };
+        if task.payload.len() > PAYLOAD_MAX_BYTES {
+            return Ok(Err(format!("payload exceeds {PAYLOAD_MAX_BYTES} bytes")));
+        }
+
+        let task_id = Uuid::now_v7().to_string();
+        let created_at_ms = now_ms();
+        let meta = TaskMeta {
+            id: task_id.clone(),
+            queue: queue.clone(),
+            state: TaskState::Queued,
+            attempt: 0,
+            created_at_ms,
+            dispatched_at_ms: None,
+            completed_at_ms: None,
+            deadline_ms: created_at_ms + handles.config.dispatch_timeout.as_millis() as u64,
+            cancel_requested: false,
+            attempts: Vec::new(),
+        };
+        if let Err(err) = plugin.put_metadata(&handles, &meta).await {
+            return Ok(Err(format!("failed to store task metadata: {err}")));
+        }
+        let subject = format!("{}.tasks.{task_id}", handles.config.name);
+        let payload = match serde_json::to_vec(&TaskEnvelope {
+            id: task_id.clone(),
+            payload: task.payload,
+        }) {
+            Ok(payload) => Bytes::from(payload),
+            Err(err) => return Ok(Err(format!("failed to encode task: {err}"))),
+        };
+        if let Err(err) = handles.tasks.publish(subject, payload).await {
+            return Ok(Err(format!("failed to publish task: {err}")));
+        }
+        Ok(Ok(task_id))
+    }
+
+    async fn query_status(
+        &mut self,
+        task_id: String,
+    ) -> wasmtime::Result<Result<Option<TaskInfo>, String>> {
+        let Ok(plugin) = self.try_get_plugin::<TaskQueuePlugin>(PLUGIN_ID) else {
+            return Ok(Err("plugin not available".into()));
+        };
+        let component_id = self.component_id.as_ref().to_string();
+        let queue = {
+            let tracker = plugin.tracker.read().await;
+            let Some(data) = tracker.get_component_data(&component_id) else {
+                return Ok(Err("component not tracked".into()));
+            };
+            data.queue.clone()
+        };
+        let handles = {
+            let queues = plugin.queues.read().await;
+            queues.get(&queue).cloned()
+        };
+        let Some(handles) = handles else {
+            return Ok(Ok(None));
+        };
+        match plugin.metadata(&handles, &task_id).await {
+            Ok(meta) => Ok(Ok(Some(TaskInfo {
+                id: meta.id,
+                status: status_variant(&meta.state),
+                attempt: meta.attempt.checked_sub(1),
+                created_at_ms: meta.created_at_ms,
+                dispatched_at_ms: meta.dispatched_at_ms,
+                completed_at_ms: meta.completed_at_ms,
+                cancel_requested: meta.cancel_requested,
+            }))),
+            Err(_) => Ok(Ok(None)),
+        }
+    }
+
+    async fn cancel_task(&mut self, task_id: String) -> wasmtime::Result<Result<(), String>> {
+        let Ok(plugin) = self.try_get_plugin::<TaskQueuePlugin>(PLUGIN_ID) else {
+            return Ok(Err("plugin not available".into()));
+        };
+        let component_id = self.component_id.as_ref().to_string();
+        let queue = {
+            let tracker = plugin.tracker.read().await;
+            let Some(data) = tracker.get_component_data(&component_id) else {
+                return Ok(Err("component not tracked".into()));
+            };
+            data.queue.clone()
+        };
+        let handles = {
+            let queues = plugin.queues.read().await;
+            queues.get(&queue).cloned()
+        };
+        let Some(handles) = handles else {
+            return Ok(Err("queue not ready".into()));
+        };
+        let mut meta = match plugin.metadata(&handles, &task_id).await {
+            Ok(meta) => meta,
+            Err(err) => return Ok(Err(format!("task not found: {err}"))),
+        };
+        if matches!(
+            meta.state,
+            TaskState::Succeeded
+                | TaskState::Failed
+                | TaskState::DispatchTimeout
+                | TaskState::ExecutionTimeout
+                | TaskState::Cancelled
+                | TaskState::MaxRetriesExceeded
+        ) {
+            return Ok(Err("task already completed".into()));
+        }
+        meta.cancel_requested = true;
+        meta.state = if meta.state == TaskState::Queued {
+            TaskState::Cancelled
+        } else {
+            meta.state
+        };
+        if let Err(err) = plugin.put_metadata(&handles, &meta).await {
+            return Ok(Err(format!("failed to update task metadata: {err}")));
+        }
+        if meta.state == TaskState::Cancelled {
+            let subject = format!("{}.tasks.{task_id}", handles.config.name);
+            let _ = handles.task_stream.purge().filter(subject).await;
+        }
+        Ok(Ok(()))
+    }
+}
+
+impl<'a> bindings::custom::task_queue::task_control::Host for ActiveCtx<'a> {
+    async fn send_heartbeat(
+        &mut self,
+        task_id: String,
+        info: String,
+    ) -> wasmtime::Result<Result<(), String>> {
+        let Ok(plugin) = self.try_get_plugin::<TaskQueuePlugin>(PLUGIN_ID) else {
+            return Ok(Err("plugin not available".into()));
+        };
+        let component_id = self.component_id.as_ref().to_string();
+        let queue = {
+            let tracker = plugin.tracker.read().await;
+            let Some(data) = tracker.get_component_data(&component_id) else {
+                return Ok(Err("component not tracked".into()));
+            };
+            data.queue.clone()
+        };
+        if info.len() > HEARTBEAT_MAX_INFO_BYTES {
+            return Ok(Err(format!(
+                "info exceeds {HEARTBEAT_MAX_INFO_BYTES} bytes"
+            )));
+        }
+        if let Some(component_id) = plugin.find_producer_component(&queue).await {
+            let now = SystemTime::now();
+            let mut heartbeats = plugin.heartbeats.lock().await;
+            let accepted = match heartbeats.get_mut(&task_id) {
+                Some(state) => state.last_heartbeat_at.is_none_or(|last| {
+                    now.duration_since(last).is_ok_and(|elapsed| {
+                        elapsed >= Duration::from_millis(HEARTBEAT_MIN_INTERVAL_MS)
+                    })
+                }),
+                None => true,
+            };
+            if !accepted {
+                return Ok(Err(format!(
+                    "heartbeat exceeds minimum interval of {HEARTBEAT_MIN_INTERVAL_MS} ms"
+                )));
+            }
+            heartbeats.insert(
+                task_id.clone(),
+                HeartbeatState {
+                    last_heartbeat_at: Some(now),
+                },
+            );
+            drop(heartbeats);
+            return plugin
+                .observe(
+                    &component_id,
+                    CallbackEvent::Heartbeat { id: task_id, info },
+                )
+                .await
+                .map(|_| Ok(()))
+                .map_err(|err| wasmtime::Error::msg(err.to_string()));
+        }
+        Ok(Ok(()))
+    }
+
+    async fn is_cancelled(&mut self, task_id: String) -> wasmtime::Result<bool> {
+        let Ok(plugin) = self.try_get_plugin::<TaskQueuePlugin>(PLUGIN_ID) else {
+            return Ok(false);
+        };
+        let component_id = self.component_id.as_ref().to_string();
+        let queue = {
+            let tracker = plugin.tracker.read().await;
+            let Some(data) = tracker.get_component_data(&component_id) else {
+                return Ok(false);
+            };
+            data.queue.clone()
+        };
+        let handles = {
+            let queues = plugin.queues.read().await;
+            queues.get(&queue).cloned()
+        };
+        let Some(handles) = handles else {
+            return Ok(false);
+        };
+        Ok(matches!(
+            plugin.metadata(&handles, &task_id).await,
+            Ok(meta) if meta.cancel_requested
+        ))
+    }
+}
+
+#[async_trait]
+impl HostPlugin for TaskQueuePlugin {
+    fn id(&self) -> &'static str {
+        PLUGIN_ID
+    }
+
+    fn world(&self) -> WitWorld {
+        WitWorld {
+            imports: HashSet::from([WitInterface::from(
+                "custom:task-queue/producer,task-control,types@0.1.0",
+            )]),
+            exports: HashSet::from([WitInterface::from(
+                "custom:task-queue/observer,worker@0.1.0",
+            )]),
+        }
+    }
+
+    async fn start(&self) -> anyhow::Result<()> {
+        info!("task queue plugin started");
+        Ok(())
+    }
+
+    async fn on_workload_item_bind<'a>(
+        &self,
+        item: &mut WorkloadItem<'a>,
+        interfaces: WitInterfaces<'_>,
+    ) -> anyhow::Result<()> {
+        let Some(interface) = interfaces.get("custom", "task-queue", &[]) else {
+            return Ok(());
+        };
+        bindings::custom::task_queue::types::add_to_linker::<_, SharedCtx>(
+            item.linker(),
+            extract_active_ctx,
+        )?;
+        bindings::custom::task_queue::producer::add_to_linker::<_, SharedCtx>(
+            item.linker(),
+            extract_active_ctx,
+        )?;
+        bindings::custom::task_queue::task_control::add_to_linker::<_, SharedCtx>(
+            item.linker(),
+            extract_active_ctx,
+        )?;
+
+        let WorkloadItem::Component(component) = item else {
+            return Ok(());
+        };
+        let mut config = component.local_resources().config.clone();
+        config.extend(interface.config.clone());
+        let queue_config = QueueConfig::from_config(&config)?;
+
+        self.tracker.write().await.add_component(
+            component,
+            ComponentData {
+                queue: queue_config.name.clone(),
+                workload: None,
+                cancel_token: CancellationToken::new(),
+            },
+        );
+        Ok(())
+    }
+
+    async fn on_workload_resolved(
+        &self,
+        workload: &ResolvedWorkload,
+        component_id: &str,
+    ) -> anyhow::Result<()> {
+        let queue = {
+            let mut tracker = self.tracker.write().await;
+            let Some(data) = tracker.get_component_data_mut(component_id) else {
+                return Ok(());
+            };
+            data.workload = Some(workload.clone());
+            data.queue.clone()
+        };
+        let config = QueueConfig {
+            name: queue,
+            ack_wait: Duration::from_millis(ACK_WAIT_MS),
+            lease_renew_interval: Duration::from_millis(LEASE_RENEW_INTERVAL_MS),
+            dispatch_timeout: Duration::from_millis(DEFAULT_DISPATCH_TIMEOUT_MS),
+            execution_timeout: Duration::from_millis(DEFAULT_EXECUTION_TIMEOUT_MS),
+            max_deliver: 3,
+            retry_backoff_ms: RETRY_BACKOFF_MS.to_vec(),
+            results_archive: true,
+        };
+        let handles = self.ensure_queue(config).await?;
+        self.start_queue_loop(handles, self.callback_cancel.child_token())
+            .await;
+        Ok(())
+    }
+
+    async fn on_workload_unbind(
+        &self,
+        workload_id: &str,
+        _interfaces: WitInterfaces<'_>,
+    ) -> anyhow::Result<()> {
+        self.tracker
+            .write()
+            .await
+            .remove_workload_with_cleanup(
+                workload_id,
+                |_| async {},
+                |data: ComponentData| async move {
+                    data.cancel_token.cancel();
+                },
+            )
+            .await;
+        Ok(())
+    }
+
+    async fn stop(&self) -> anyhow::Result<()> {
+        self.callback_cancel.cancel();
+        Ok(())
+    }
+}
+
+use std::collections::HashSet;
+pub type WitWorld = wash_runtime::wit::WitWorld;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queue_name_accepts_valid_characters() {
+        assert!(validate_queue_name("agent-task").is_ok());
+        assert!(validate_queue_name("Agent_2").is_ok());
+    }
+
+    #[test]
+    fn queue_name_rejects_invalid_names() {
+        assert!(validate_queue_name("").is_err());
+        assert!(validate_queue_name("-agent").is_err());
+        assert!(validate_queue_name("agent.*").is_err());
+        assert!(validate_queue_name("agent task").is_err());
+        let long = "a".repeat(65);
+        assert!(validate_queue_name(&long).is_err());
+    }
+
+    #[test]
+    fn missing_queue_is_required() {
+        let err = QueueConfig::from_config(&HashMap::new()).unwrap_err();
+        assert!(err.to_string().contains("missing required config: 'queue'"));
+    }
+
+    #[test]
+    fn backoff_parses_csv_values() {
+        let mut config = HashMap::new();
+        config.insert("queue".to_string(), "agent-task".to_string());
+        config.insert(
+            "retry-backoff-ms".to_string(),
+            "1000, 5000,15000 ,60000".to_string(),
+        );
+        let parsed =
+            parse_backoff_ms(&config, "retry-backoff-ms", RETRY_BACKOFF_MS).expect("valid backoff");
+        assert_eq!(parsed, vec![1_000, 5_000, 15_000, 60_000]);
+    }
+
+    #[test]
+    fn backoff_uses_default_without_config() {
+        assert_eq!(
+            parse_backoff_ms(&HashMap::new(), "retry-backoff-ms", RETRY_BACKOFF_MS)
+                .expect("valid default backoff"),
+            RETRY_BACKOFF_MS.to_vec()
+        );
+    }
+
+    #[test]
+    fn backoff_rejects_invalid_values() {
+        let mut config = HashMap::new();
+        config.insert("retry-backoff-ms".to_string(), "1000,invalid".to_string());
+        assert!(parse_backoff_ms(&config, "retry-backoff-ms", RETRY_BACKOFF_MS).is_err());
+    }
+
+    #[test]
+    fn metadata_keys_are_namespaced_by_queue() {
+        assert_eq!(
+            metadata_key("agent-task", "0198e57c-0000-7000-8000-000000000000"),
+            "agent-task.0198e57c-0000-7000-8000-000000000000"
+        );
+    }
+
+    #[test]
+    fn status_names_are_stable() {
+        assert_eq!(status_name(&TaskStatus::Succeeded), "succeeded");
+        assert_eq!(
+            status_name(&TaskStatus::DispatchTimeout),
+            "dispatch-timeout"
+        );
+    }
+
+    #[test]
+    fn status_variants_are_stable() {
+        assert!(matches!(
+            status_variant(&TaskState::DispatchTimeoutPending),
+            TaskStatus::DispatchTimeout
+        ));
+        assert!(matches!(
+            status_variant(&TaskState::Cancelled),
+            TaskStatus::Cancelled
+        ));
+    }
+}

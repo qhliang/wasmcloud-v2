@@ -16,6 +16,7 @@ members = [
     "crates/custom_plugin_telegram",
     "crates/custom_plugin_event_monitor",
     "crates/custom_plugin_workflow",
+    "crates/custom_plugin_task_queue",
     # Repo task runner (`cargo xtask`). Deliberately excluded from
     # default-members so normal builds/tests don't pull it in.
     "xtask",

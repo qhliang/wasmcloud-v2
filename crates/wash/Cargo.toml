@@ -85,6 +85,7 @@ custom_plugin_wechat = { path = "../custom_plugin_wechat" }
 custom_plugin_telegram = { path = "../custom_plugin_telegram" }
 custom_plugin_event_monitor = { path = "../custom_plugin_event_monitor" }
 custom_plugin_workflow = { path = "../custom_plugin_workflow" }
+custom_plugin_task_queue = { path = "../custom_plugin_task_queue" }
 
 [build-dependencies]
 anyhow = { workspace = true, default-features = true }

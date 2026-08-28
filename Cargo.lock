@@ -2036,6 +2036,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "custom_plugin_task_queue"
+version = "2.7.3"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "async-trait",
+ "bytes",
+ "futures",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "wash-runtime",
+ "wasmtime",
+]
+
+[[package]]
 name = "custom_plugin_telegram"
 version = "2.7.3"
 dependencies = [
@@ -8679,6 +8699,7 @@ dependencies = [
  "custom_plugin_feishu",
  "custom_plugin_llm_gateway_provider",
  "custom_plugin_mail",
+ "custom_plugin_task_queue",
  "custom_plugin_telegram",
  "custom_plugin_wechat",
  "custom_plugin_workflow",
