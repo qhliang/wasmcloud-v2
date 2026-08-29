@@ -94,6 +94,37 @@ runner.run(shutdown).await?;
 | 续期 | `WorkerRunner` 每 10 秒自动发送 JetStream `Progress`，业务代码无需续期 |
 | 完成 | 返回 `Some(output)`，由 runner ack 任务 |
 
+`WorkerRunner` 中的续期代码如下；这段由框架执行，业务示例里不需要重复实现：
+
+```rust
+let renew_acker = acker.clone();
+let renew_cancel = CancellationToken::new();
+let renew_cancel_in_task = renew_cancel.clone();
+let renewer = tokio::spawn(async move {
+    let mut ticker = tokio::time::interval(Duration::from_millis(
+        task_queue_core::config::LEASE_RENEW_INTERVAL_MS,
+    ));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            _ = renew_cancel_in_task.cancelled() => break,
+            _ = ticker.tick() => {
+                if AckAction::Progress.apply(&renew_acker).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+});
+
+let result = worker.handle_task(context).await;
+renew_cancel.cancel();
+let _ = renewer.await;
+```
+
+完整实现位于 `crates/task_queue_worker/src/lib.rs` 的 `WorkerRunner::handle_message`。
+
 真实业务不要假设 heartbeat 成功代表结果已持久化。所有可恢复状态应在下一个检查点前写入业务存储，并在重试时按 `task_id` 幂等处理。
 
 ## 运行语义
