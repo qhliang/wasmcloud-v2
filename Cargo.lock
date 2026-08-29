@@ -2050,7 +2050,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "uuid",
  "wash-runtime",
  "wasmtime",
 ]
@@ -7535,12 +7534,9 @@ dependencies = [
  "async-nats",
  "async-trait",
  "bytes",
- "futures",
  "serde",
  "serde_json",
- "tokio",
  "tokio-util",
- "tracing",
  "uuid",
 ]
 
@@ -7550,8 +7546,6 @@ version = "2.7.0"
 dependencies = [
  "anyhow",
  "async-nats",
- "async-trait",
- "bytes",
  "futures",
  "serde_json",
  "task_queue_core",
