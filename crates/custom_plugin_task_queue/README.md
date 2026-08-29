@@ -46,7 +46,13 @@ interface worker {
 }
 ```
 
-导入 `producer` 的组件必须导出 `observer`。导入 `task-control` 的组件必须导出 `worker`。同一个组件可以同时扮演生产者和消费者。
+组件角色分为三类，彼此独立、互不强制：
+
+- **生产者（producer-only）**：导入 `producer`，导出 `observer`；
+- **消费者（worker-only）**：导入 `task-control`，导出 `worker`；
+- **两者兼具**：同时导入 `producer` 与 `task-control`，并导出 `observer` 与 `worker`。
+
+插件按各组件实际导出的接口分别绑定 `observer` / `worker`，因此上述三类组件均可正常接收回调或执行任务。
 
 ## 配置
 
@@ -211,6 +217,30 @@ runner_task.await??;
 |---|---|---|
 | `send_heartbeat()` | 业务 worker | 在启动、进度、取消等关键节点向 observer 发布业务状态 |
 | JetStream `Progress` | `WorkerRunner` | 任务执行期间每 10 秒续租，防止 `AckWait` 到期重投 |
+
+`WorkerRunner` 中的续期逻辑会克隆当前消息的 JetStream acker，并启动独立 ticker：
+
+```rust
+let renewer = tokio::spawn(async move {
+    let mut ticker = tokio::time::interval(Duration::from_millis(
+        task_queue_core::config::LEASE_RENEW_INTERVAL_MS,
+    ));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            _ = renew_cancel.cancelled() => break,
+            _ = ticker.tick() => {
+                if AckAction::Progress.apply(&renew_acker).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+});
+```
+
+业务 `handle_task` 返回后，runner 会先取消这个续期任务，再根据结果发送 `Ack`、`Nak` 或 `Term`。
 
 `TaskContext::payload` 是解码后的原始字节。真实业务可以把 JSON heartbeat 替换为普通字符串或压缩数据；超过 8 KiB 会失败。业务副作用必须放在取消检查之后并按 `task_id` 保证幂等。
 

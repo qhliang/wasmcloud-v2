@@ -1,8 +1,23 @@
 package my:task-queue;
 
+/// Full role: a component that both produces tasks and executes them.
 world task-queue {
     import custom:task-queue/producer@0.1.0;
     import custom:task-queue/task-control@0.1.0;
     export custom:task-queue/observer@0.1.0;
+    export custom:task-queue/worker@0.1.0;
+}
+
+/// Observer-only role: a producer that receives task lifecycle callbacks.
+/// Exports `observer` but not `worker`, so it must NOT be bound against the
+/// full `task-queue` world (which would require `worker` too).
+world task-queue-observer {
+    export custom:task-queue/observer@0.1.0;
+}
+
+/// Worker-only role: a consumer that executes tasks.
+/// Exports `worker` but not `observer`, so it must NOT be bound against the
+/// full `task-queue` world (which would require `observer` too).
+world task-queue-worker {
     export custom:task-queue/worker@0.1.0;
 }

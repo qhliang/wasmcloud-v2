@@ -1,9 +1,10 @@
 //! # Task Queue Host Plugin
 //!
 //! A durable work queue backed by the host's shared data-plane NATS
-//! connection. Producers import `custom:task-queue/producer`; workers import
-//! `custom:task-queue/task-control` and export `custom:task-queue/worker`.
-//! Both roles must export `custom:task-queue/observer`.
+//! connection. Producers import `custom:task-queue/producer` and export
+//! `custom:task-queue/observer`; workers import `custom:task-queue/task-control`
+//! and export `custom:task-queue/worker`. A single component may implement
+//! both roles (import both interfaces and export both interfaces).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -41,9 +42,30 @@ mod bindings {
     });
 }
 
+// Role-scoped binding worlds. The monolithic `task-queue` world forces every
+// bound component to export BOTH `observer` and `worker`, which breaks the
+// normal single-role components: a producer exports only `observer`, a worker
+// exports only `worker`. These worlds let `dispatch_observer` / `call_worker`
+// bind the matching export without requiring the other one.
+mod observer_bindings {
+    wasmtime::component::bindgen!({
+        world: "task-queue-observer",
+        exports: { default: async | trappable | tracing },
+    });
+}
+
+mod worker_bindings {
+    wasmtime::component::bindgen!({
+        world: "task-queue-worker",
+        exports: { default: async | trappable | tracing },
+    });
+}
+
 use bindings::custom::task_queue::types::{
     AttemptErrorSource, AttemptFailure, Task as GuestTask, TaskInfo, TaskResult, TaskStatus,
 };
+use observer_bindings::custom::task_queue::types as obs;
+use worker_bindings::custom::task_queue::types as wk;
 
 pub const PLUGIN_ID: &str = "task-queue";
 
@@ -77,6 +99,42 @@ fn guest_task_info(meta: &TaskMeta) -> TaskInfo {
         dispatched_at_ms: meta.dispatched_at_ms,
         completed_at_ms: meta.completed_at_ms,
         cancel_requested: meta.cancel_requested,
+    }
+}
+
+/// Convert the full-world `AttemptFailure` carried by `CallbackEvent` into the
+/// observer-only binding world's `AttemptFailure`.
+fn to_observer_attempt_failure(event: AttemptFailure) -> obs::AttemptFailure {
+    obs::AttemptFailure {
+        id: event.id,
+        attempt: event.attempt,
+        source: match event.source {
+            AttemptErrorSource::Guest => obs::AttemptErrorSource::Guest,
+            AttemptErrorSource::System => obs::AttemptErrorSource::System,
+        },
+        error: event.error,
+        started_at_ms: event.started_at_ms,
+        failed_at_ms: event.failed_at_ms,
+        duration_ms: event.duration_ms,
+    }
+}
+
+/// Convert the full-world `TaskResult` carried by `CallbackEvent` into the
+/// observer-only binding world's `TaskResult`.
+fn to_observer_task_result(result: TaskResult) -> obs::TaskResult {
+    obs::TaskResult {
+        id: result.id,
+        status: match result.status {
+            TaskStatus::Succeeded => obs::TaskStatus::Succeeded,
+            TaskStatus::Failed => obs::TaskStatus::Failed,
+            TaskStatus::DispatchTimeout => obs::TaskStatus::DispatchTimeout,
+            TaskStatus::ExecutionTimeout => obs::TaskStatus::ExecutionTimeout,
+            TaskStatus::Cancelled => obs::TaskStatus::Cancelled,
+            TaskStatus::MaxRetriesExceeded => obs::TaskStatus::MaxRetriesExceeded,
+        },
+        attempt: result.attempt,
+        output: result.output,
+        error: result.error,
     }
 }
 
@@ -555,7 +613,9 @@ async fn dispatch_observer(
         .instantiate_pre(component_id)
         .await
         .context("failed to instantiate observer")?;
-    let pre = bindings::TaskQueuePre::new(instance_pre)
+    // Bind against the observer-only world so producer-only components (which
+    // export `observer` but not `worker`) can receive lifecycle callbacks.
+    let pre = observer_bindings::TaskQueueObserverPre::new(instance_pre)
         .map_err(|err| anyhow::anyhow!("failed to bind observer: {err}"))?;
     let proxy = pre
         .instantiate_async(&mut store)
@@ -568,9 +628,15 @@ async fn dispatch_observer(
                 observer.call_on_heartbeat(accessor, id, info).await
             }
             CallbackEvent::AttemptFailed { event } => {
-                observer.call_on_attempt_failed(accessor, event).await
+                observer
+                    .call_on_attempt_failed(accessor, to_observer_attempt_failure(event))
+                    .await
             }
-            CallbackEvent::Complete { result } => observer.call_on_complete(accessor, result).await,
+            CallbackEvent::Complete { result } => {
+                observer
+                    .call_on_complete(accessor, to_observer_task_result(result))
+                    .await
+            }
         })
         .await
         .map_err(|err| anyhow::anyhow!("observer store call failed: {err}"))?
@@ -592,7 +658,10 @@ async fn call_worker(
         Ok(pre) => pre,
         Err(err) => return (Err(format!("failed to instantiate worker: {err}")), None),
     };
-    let pre = match bindings::TaskQueuePre::new(instance_pre) {
+    // Bind against the worker-only world so worker-only components (which export
+    // `worker` but not `observer`) can be driven without also exporting
+    // `observer`.
+    let pre = match worker_bindings::TaskQueueWorkerPre::new(instance_pre) {
         Ok(pre) => pre,
         Err(err) => return (Err(format!("failed to bind worker export: {err}")), None),
     };
@@ -601,8 +670,11 @@ async fn call_worker(
         Err(err) => return (Err(format!("failed to start worker: {err}")), None),
     };
     let worker = proxy.custom_task_queue_worker();
+    let worker_task = wk::Task {
+        payload: task.payload,
+    };
     match store
-        .run_concurrent(async move |accessor| worker.call_handle_task(accessor, task).await)
+        .run_concurrent(async move |accessor| worker.call_handle_task(accessor, worker_task).await)
         .await
     {
         Ok(Ok(Ok(output))) => (Ok(()), output),
