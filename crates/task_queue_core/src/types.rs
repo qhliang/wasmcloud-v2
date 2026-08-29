@@ -40,8 +40,15 @@ impl TaskState {
     }
 }
 
+/// Canonical, public task status for the task queue.
+///
+/// This is the single source of truth for task status in `task-queue-core`;
+/// the WIT `task-status` variant and the host-plugin binding types are derived
+/// from it. Its string form (via [`TaskStatus::as_str`]) is kebab-case and must
+/// stay in lock-step with the WIT `task-status` variant (`dispatch-timeout`,
+/// `execution-timeout`, `max-retries-exceeded`, ...).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "kebab-case")]
 pub enum TaskStatus {
     Succeeded,
     Failed,
@@ -52,6 +59,8 @@ pub enum TaskStatus {
 }
 
 impl TaskStatus {
+    /// Single source of the string form; serde serializes with the same
+    /// kebab-case spelling (see `#[serde(rename_all = "kebab-case")]`).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Succeeded => "succeeded",
