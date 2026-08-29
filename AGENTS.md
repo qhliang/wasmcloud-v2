@@ -49,6 +49,12 @@ cargo xtask build-fixtures                 # 生成 wash-runtime 集成测试所
 - 错误消息：小写开头，无末尾句号
 - `warnings = 'deny'` — 任何警告都会导致编译失败
 
+## 版本规范
+
+- **代码变更后无需改动 wasmcloud 项目版本**：修改任何代码（bug 修复 / 功能新增 / 重构 / 配置调整）后，不需要修改 workspace 根 `Cargo.toml` 的 `[workspace.package].version`。
+- **custom host plugin 子 crate 可单独更新版本**：若改动落在某个 custom host plugin 子 crate（`crates/custom_plugin_*`），可以更新该子 crate 自己的版本号（在子 crate 的 `Cargo.toml` 中声明独立 `version`，不再继承 `workspace.package`）。其余子 crate 与 workspace 根版本保持不变。
+- 仅当子 crate 即将对外发布时才需要 bump 版本；内部未发布的功能改动可暂不更新。
+
 ## 新增/修改 custom plugin 清单
 
 **新增 custom plugin：**
