@@ -151,6 +151,10 @@ pub struct ComponentData {
     queue: String,
     workload: Option<ResolvedWorkload>,
     cancel_token: CancellationToken,
+    /// 外部/原生 worker 模式：队列由独立的原生 worker（如 agent-manager）消费，
+    /// 插件不再启动 JetStream dispatcher（避免与原始 worker 竞争同一 durable consumer），
+    /// 仅订阅 `{queue}.events` 将原生 worker 发布的生命周期事件转发给 observer 的 on_xx 回调。
+    external_worker: bool,
 }
 
 #[derive(Default)]
@@ -573,6 +577,131 @@ impl TaskQueuePlugin {
             }
         });
     }
+
+    /// 订阅 `{queue}.events`，将原生/外部 worker 发布的生命周期事件转发给
+    /// observer 的 on_xx 回调。外部 worker 模式下这是 status 回报的唯一通道。
+    async fn start_events_loop(
+        &self,
+        _handles: QueueHandles,
+        queue: &str,
+        cancel: CancellationToken,
+    ) {
+        let subject = format!("{queue}.events");
+        let client = (*self.client).clone();
+        let producer = self
+            .find_producer_component(queue)
+            .await
+            .unwrap_or_default();
+        let plugin = self.clone();
+        tokio::spawn(async move {
+            let mut subscriber = match client.subscribe(subject.clone()).await {
+                Ok(subscriber) => subscriber,
+                Err(err) => {
+                    warn!(subject = %subject, err = %err, "failed to subscribe to task events");
+                    return;
+                }
+            };
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    message = subscriber.next() => match message {
+                        Some(message) => {
+                            if let Some(event) = parse_control_event(&message.payload) {
+                                let _ = plugin.observe(&producer, event).await;
+                            }
+                        }
+                        None => break,
+                    },
+                }
+            }
+        });
+    }
+}
+
+/// 解析原生 worker 发布的 `{queue}.events` JSON 事件为插件内部的 `CallbackEvent`。
+/// 约定负载：
+/// ```json
+/// { "type": "complete", "id": "<queue-task-id>", "attempt": 1,
+///   "status": "succeeded|failed|execution-timeout|...", "output": "<base64>", "error": "..." }
+/// { "type": "attempt_failed", "id": "...", "attempt": 1, "source": "guest|system", "error": "..." }
+/// { "type": "heartbeat", "id": "...", "info": "..." }
+/// ```
+fn parse_control_event(payload: &[u8]) -> Option<CallbackEvent> {
+    let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    let id = value.get("id")?.as_str()?.to_string();
+    let event_type = value.get("type").and_then(serde_json::Value::as_str)?;
+    match event_type {
+        "complete" => {
+            let status = match value
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("failed")
+            {
+                "succeeded" => TaskStatus::Succeeded,
+                "execution-timeout" => TaskStatus::ExecutionTimeout,
+                "dispatch-timeout" => TaskStatus::DispatchTimeout,
+                "cancelled" => TaskStatus::Cancelled,
+                "max-retries-exceeded" => TaskStatus::MaxRetriesExceeded,
+                _ => TaskStatus::Failed,
+            };
+            let attempt = value
+                .get("attempt")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(1) as u32;
+            let output = value
+                .get("output")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|b64| task_queue_core::types::base64_decode(b64).ok());
+            let error = value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string);
+            Some(CallbackEvent::Complete {
+                result: TaskResult {
+                    id,
+                    status,
+                    attempt,
+                    output,
+                    error,
+                },
+            })
+        }
+        "attempt_failed" => {
+            let attempt = value
+                .get("attempt")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(1) as u32;
+            let source = match value.get("source").and_then(serde_json::Value::as_str) {
+                Some("system") => AttemptErrorSource::System,
+                _ => AttemptErrorSource::Guest,
+            };
+            let error = value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            Some(CallbackEvent::AttemptFailed {
+                event: AttemptFailure {
+                    id,
+                    attempt,
+                    source,
+                    error,
+                    started_at_ms: None,
+                    failed_at_ms: None,
+                    duration_ms: None,
+                },
+            })
+        }
+        "heartbeat" => {
+            let info = value
+                .get("info")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            Some(CallbackEvent::Heartbeat { id, info })
+        }
+        _ => None,
+    }
 }
 
 impl Clone for TaskQueuePlugin {
@@ -934,12 +1063,18 @@ impl HostPlugin for TaskQueuePlugin {
         config.extend(interface.config.clone());
         let queue_config = QueueConfig::from_config(&config)?;
 
+        let external_worker = config
+            .get("external-worker")
+            .and_then(|value| value.parse::<bool>().ok())
+            .unwrap_or(false);
+
         self.tracker.write().await.add_component(
             component,
             ComponentData {
                 queue: queue_config.name.clone(),
                 workload: None,
                 cancel_token: CancellationToken::new(),
+                external_worker,
             },
         );
         Ok(())
@@ -950,17 +1085,25 @@ impl HostPlugin for TaskQueuePlugin {
         workload: &ResolvedWorkload,
         component_id: &str,
     ) -> anyhow::Result<()> {
-        let queue = {
+        let (queue, external_worker) = {
             let mut tracker = self.tracker.write().await;
             let Some(data) = tracker.get_component_data_mut(component_id) else {
                 return Ok(());
             };
             data.workload = Some(workload.clone());
-            data.queue.clone()
+            (data.queue.clone(), data.external_worker)
         };
-        let config = QueueConfig::new(queue);
+        let config = QueueConfig::new(queue.clone());
         let handles = self.ensure_queue(config).await?;
-        self.start_queue_loop(handles, self.callback_cancel.child_token())
+        // 外部/原生 worker 模式下，队列由独立原生 worker（agent-manager）消费，
+        // 插件不启动 JetStream dispatcher，避免与原始 worker 竞争同一 durable consumer。
+        if !external_worker {
+            self.start_queue_loop(handles.clone(), self.callback_cancel.child_token())
+                .await;
+        }
+        // 无论是否自消费，插件都订阅 `{queue}.events`，将原生 worker 发布的
+        // 生命周期事件转发给 observer 的 on_xx 回调（status 经此通道回报）。
+        self.start_events_loop(handles, &queue, self.callback_cancel.child_token())
             .await;
         Ok(())
     }

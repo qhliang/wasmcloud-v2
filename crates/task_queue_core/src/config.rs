@@ -30,6 +30,9 @@ pub struct QueueConfig {
     pub max_deliver: i64,
     pub retry_backoff_ms: Vec<u64>,
     pub results_archive: bool,
+    /// 外部/原生 worker 模式：队列由独立的原生 worker（如 agent-manager）消费，
+    /// 插件不启动 JetStream dispatcher，仅订阅 `{queue}.events` 转发生命周期事件给 observer 的 on_xx。
+    pub external_worker: bool,
 }
 
 impl QueueConfig {
@@ -44,6 +47,7 @@ impl QueueConfig {
             max_deliver: MAX_DELIVERIES,
             retry_backoff_ms: DEFAULT_RETRY_BACKOFF_MS.to_vec(),
             results_archive: true,
+            external_worker: false,
         }
     }
 
@@ -77,6 +81,7 @@ impl QueueConfig {
                 DEFAULT_RETRY_BACKOFF_MS,
             )?,
             results_archive: parse_bool(config, "results-archive", true)?,
+            external_worker: parse_bool(config, "external-worker", false)?,
         })
     }
 
