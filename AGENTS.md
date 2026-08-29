@@ -75,11 +75,13 @@ cargo xtask build-fixtures                 # 生成 wash-runtime 集成测试所
 - 格式：`<type>: <description>`，类型：`feat` / `fix` / `docs` / `style` / `refactor` / `test` / `chore`
 - **禁止自动 push** — push 前必须征得用户明确同意
 - **更新代码后需同步更新 `AGENTS.md`** — 若改动影响构建命令、feature 标志、仓库结构、插件清单或代码规范，应同步更新本文件
-- commit 前必须执行（全 workspace 范围，不可用 `-p` 缩小）：
-  1. `cargo test --workspace` + `cargo test -p wash-runtime --features wasi-tls,host-component-plugins`
-  2. `cargo +nightly fmt -- --check`
-  3. `cargo clippy --workspace --features wasi-tls,host-component-plugins`
-  4. `cargo machete`
+- **push 前必须执行轻量检查（`cargo machete` 与 `fmt`/`test`/`clippy` 同等地位，必须跑）**：
+  - 按改动范围用 `-p <crate>` 缩小，**不跑全 workspace 编译/测试**
+  1. `cargo +nightly fmt -- --check`
+  2. `cargo test -p <改动crate>`
+  3. `cargo clippy -p <改动crate>`
+  4. `cargo machete` —— 未使用依赖检查（CI lint 任务中作为硬失败项，发现未使用依赖即 exit 1）
+- **全量 `cargo test --workspace` / `cargo clippy --workspace --features wasi-tls,host-component-plugins` 仅在显式要求时才跑**，默认 push 前不需要
 - **fixtures 导致的失败可忽略，不用处理** — `cargo test --workspace` 编译集成测试需要 `crates/wash-runtime/tests/wasm/*.wasm`（构建产物，被 gitignore，需 `cargo xtask build-fixtures` 生成；部分 fixture 如 `http-egress-plugin` 需从 ghcr.io 拉取 WASI 依赖，网络受限时会失败）。此类失败属于环境问题，与代码改动无关，可直接提交
 
 ## http-api-distributed example 编译
