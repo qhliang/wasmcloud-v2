@@ -1085,26 +1085,33 @@ impl HostPlugin for TaskQueuePlugin {
         workload: &ResolvedWorkload,
         component_id: &str,
     ) -> anyhow::Result<()> {
-        let (queue, external_worker) = {
+        let (queue, external_worker, cancel_token) = {
             let mut tracker = self.tracker.write().await;
             let Some(data) = tracker.get_component_data_mut(component_id) else {
                 return Ok(());
             };
             data.workload = Some(workload.clone());
-            (data.queue.clone(), data.external_worker)
+            // 使用 per-component 的 cancel_token 派生子令牌：workload 解绑时
+            // on_workload_unbind 会取消 data.cancel_token，从而真正终止本组件
+            // 启动的队列/事件循环。此前误用 plugin 级 callback_cancel，导致解绑后
+            // 循环永不停止（僵尸队列循环持续消费 agent-task 并调用 call_worker）。
+            (
+                data.queue.clone(),
+                data.external_worker,
+                data.cancel_token.child_token(),
+            )
         };
         let config = QueueConfig::new(queue.clone());
         let handles = self.ensure_queue(config).await?;
         // 外部/原生 worker 模式下，队列由独立原生 worker（agent-manager）消费，
         // 插件不启动 JetStream dispatcher，避免与原始 worker 竞争同一 durable consumer。
         if !external_worker {
-            self.start_queue_loop(handles.clone(), self.callback_cancel.child_token())
+            self.start_queue_loop(handles.clone(), cancel_token.clone())
                 .await;
         }
         // 无论是否自消费，插件都订阅 `{queue}.events`，将原生 worker 发布的
         // 生命周期事件转发给 observer 的 on_xx 回调（status 经此通道回报）。
-        self.start_events_loop(handles, &queue, self.callback_cancel.child_token())
-            .await;
+        self.start_events_loop(handles, &queue, cancel_token).await;
         Ok(())
     }
 
