@@ -13,50 +13,118 @@ use task_queue_core::config::QueueConfig;
 use task_queue_core::nats::{AckAction, QueueHandles, now_ms};
 use task_queue_core::types::{TaskEnvelope, TaskError, TaskErrorSource};
 use task_queue_core::worker::{SharedWorker, TaskContext, Worker};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+
+/// Upper bound on how long `run` waits for in-flight deliveries to finish after
+/// shutdown. Aligned with the queue `ack_wait` window: a delivery that has not
+/// acked by then will lose its lease and be redelivered anyway, so waiting
+/// longer buys nothing.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct WorkerRunner {
     handles: Arc<QueueHandles>,
     worker: SharedWorker,
+    /// Maximum number of deliveries processed at the same time.
+    concurrency: usize,
 }
 
 impl WorkerRunner {
     /// Creates or reuses the queue resources and wraps the application worker.
+    ///
+    /// Deliveries are processed one at a time; use
+    /// [`connect_with_concurrency`](Self::connect_with_concurrency) to allow
+    /// several in parallel.
     pub async fn connect(
         client: JetStreamContext,
         config: QueueConfig,
         worker: impl Worker + 'static,
     ) -> Result<Self> {
+        Self::connect_with_concurrency(client, config, worker, 1).await
+    }
+
+    /// Same as [`connect`](Self::connect) but processes up to `concurrency`
+    /// deliveries at the same time.
+    ///
+    /// The value is clamped to at least one, so a misconfigured zero degrades
+    /// to serial processing instead of stalling the runner.
+    pub async fn connect_with_concurrency(
+        client: JetStreamContext,
+        config: QueueConfig,
+        worker: impl Worker + 'static,
+        concurrency: usize,
+    ) -> Result<Self> {
         let handles = Arc::new(QueueHandles::create(client, config).await?);
         Ok(Self {
             handles,
             worker: Arc::new(worker),
+            concurrency: concurrency.max(1),
         })
     }
 
     /// Consumes tasks until `shutdown` is cancelled.
     ///
-    /// Messages are processed sequentially; process shutdown stops accepting
-    /// new messages but does not force-cancel a call already in progress.
+    /// Each delivery occupies one of `concurrency` slots from the moment it is
+    /// pulled until its terminal ack is applied. A slot is acquired *before*
+    /// pulling, so when every slot is busy the runner stops fetching and
+    /// surplus tasks stay queued in the stream rather than being pulled,
+    /// Nak'd and eventually dropped once the delivery budget is exhausted.
+    ///
+    /// Process shutdown stops accepting new messages but waits (bounded by
+    /// [`DRAIN_TIMEOUT`]) for deliveries already in progress to ack.
     pub async fn run(&self, shutdown: CancellationToken) -> Result<()> {
         let consumer = self.handles.ensure_worker().await?;
+        // Keep the client-side prefetch window at a single message. The runner
+        // must never buffer more deliveries than it has slots for, otherwise
+        // buffered messages sit idle burning their `ack_wait` lease while
+        // waiting for a free slot.
         let mut messages = consumer
+            .stream()
+            .max_messages_per_batch(1)
             .messages()
             .await
             .context("failed to subscribe to task consumer")?;
+        let gate = Arc::new(Semaphore::new(self.concurrency));
+        let mut in_flight = JoinSet::new();
+        tracing::info!(concurrency = self.concurrency, "task queue worker running");
         loop {
-            tokio::select! {
+            // Reap finished deliveries so the set does not grow unbounded.
+            while in_flight.try_join_next().is_some() {}
+            // Acquiring the permit before fetching is the backpressure point.
+            let permit = tokio::select! {
                 _ = shutdown.cancelled() => break,
-                message = messages.next() => match message {
-                    Some(Ok(message)) => self.handle_message(message.clone()).await,
-                    Some(Err(err)) => {
-                        tracing::warn!(err = %err, "task consumer stream error");
-                    }
-                    None => break,
+                acquired = gate.clone().acquire_owned() => match acquired {
+                    Ok(permit) => permit,
+                    Err(_) => break,
+                },
+            };
+            let next = tokio::select! {
+                _ = shutdown.cancelled() => None,
+                next = messages.next() => next,
+            };
+            let Some(next) = next else {
+                drop(permit);
+                break;
+            };
+            match next {
+                Ok(message) => {
+                    let runner = self.clone();
+                    in_flight.spawn(async move {
+                        runner.handle_message(message).await;
+                        // Released only after the terminal ack, so the number of
+                        // in-flight deliveries never exceeds the configured limit.
+                        drop(permit);
+                    });
+                }
+                Err(err) => {
+                    tracing::warn!(err = %err, "task consumer stream error");
+                    drop(permit);
                 }
             }
         }
+        drain(&mut in_flight).await;
         Ok(())
     }
 
@@ -159,10 +227,56 @@ impl WorkerRunner {
     }
 }
 
+/// Waits for in-flight deliveries to ack after shutdown.
+///
+/// Deliveries that overrun [`DRAIN_TIMEOUT`] are aborted: they will lose their
+/// lease and be redelivered, which is safer than blocking shutdown forever.
+async fn drain(in_flight: &mut JoinSet<()>) {
+    if in_flight.is_empty() {
+        return;
+    }
+    let pending = in_flight.len();
+    tracing::info!(pending, "draining in-flight task deliveries");
+    let drained = tokio::time::timeout(DRAIN_TIMEOUT, async {
+        while in_flight.join_next().await.is_some() {}
+    })
+    .await;
+    if drained.is_err() {
+        tracing::warn!(
+            pending = in_flight.len(),
+            "timed out draining in-flight task deliveries; aborting"
+        );
+        in_flight.abort_all();
+        while in_flight.join_next().await.is_some() {}
+    }
+}
+
 pub fn heartbeat_subject(queue: &str) -> String {
     format!("{queue}.heartbeat")
 }
 
 pub fn task_context(worker: impl Worker + 'static) -> SharedWorker {
     Arc::new(worker)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn drain_waits_for_in_flight_deliveries() {
+        let mut in_flight = JoinSet::new();
+        in_flight.spawn(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        });
+        drain(&mut in_flight).await;
+        assert!(in_flight.is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_returns_immediately_when_nothing_is_in_flight() {
+        let mut in_flight = JoinSet::new();
+        drain(&mut in_flight).await;
+        assert!(in_flight.is_empty());
+    }
 }
