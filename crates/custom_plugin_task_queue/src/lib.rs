@@ -147,6 +147,31 @@ pub enum CallbackEvent {
     Complete { result: TaskResult },
 }
 
+/// 为回调事件生成简短的调试摘要（不含完整 payload）。
+fn callback_event_summary(event: &CallbackEvent) -> String {
+    match event {
+        CallbackEvent::Heartbeat { id, info } => {
+            format!("Heartbeat id={id} info_len={}", info.len())
+        }
+        CallbackEvent::AttemptFailed { event } => {
+            format!(
+                "AttemptFailed id={} attempt={} source={:?} error={}",
+                event.id, event.attempt, event.source, event.error
+            )
+        }
+        CallbackEvent::Complete { result } => {
+            format!(
+                "Complete id={} attempt={} status={:?} error={:?} output_len={}",
+                result.id,
+                result.attempt,
+                result.status,
+                result.error,
+                result.output.as_ref().map_or(0, Vec::len)
+            )
+        }
+    }
+}
+
 pub struct ComponentData {
     queue: String,
     workload: Option<ResolvedWorkload>,
@@ -201,6 +226,7 @@ impl TaskQueuePlugin {
                     _ = cancel.cancelled() => break,
                     event = receiver.recv() => match event {
                         Some((component_id, event)) => {
+                            debug!(component_id = %component_id, event = %callback_event_summary(&event), "callback dispatcher: dequeued event");
                             let workload = {
                                 let tracker = tracker.read().await;
                                 tracker
@@ -208,10 +234,13 @@ impl TaskQueuePlugin {
                                     .and_then(|data| data.workload.clone())
                             };
                             if let Some(workload) = workload {
+                                debug!(component_id = %component_id, "callback dispatcher: dispatching to observer");
                                 if let Err(err) =
                                     dispatch_observer(&workload, &component_id, event).await
                                 {
                                     warn!(component_id = %component_id, err = %err, "failed to dispatch observer callback");
+                                } else {
+                                    debug!(component_id = %component_id, "callback dispatcher: observer callback dispatched ok");
                                 }
                             } else {
                                 warn!(component_id = %component_id, "observer component not ready");
@@ -250,6 +279,7 @@ impl TaskQueuePlugin {
     }
 
     async fn observe(&self, component_id: &str, event: CallbackEvent) -> anyhow::Result<()> {
+        debug!(component_id = %component_id, event = %callback_event_summary(&event), "task-queue: queueing observer callback");
         self.callback_tx
             .send((component_id.to_string(), event))
             .context("callback channel closed")
@@ -456,6 +486,7 @@ impl TaskQueuePlugin {
         {
             warn!(err = %err, "failed to queue attempt failure callback");
         }
+        debug!(task_id = %task_id, "attempt failed callback queued");
     }
 
     async fn find_producer_component(&self, queue: &str) -> Option<String> {
@@ -592,6 +623,7 @@ impl TaskQueuePlugin {
             .find_producer_component(queue)
             .await
             .unwrap_or_default();
+        debug!(subject = %subject, producer_component = %producer, "events loop: starting, resolved producer component");
         let plugin = self.clone();
         tokio::spawn(async move {
             let mut subscriber = match client.subscribe(subject.clone()).await {
@@ -601,16 +633,27 @@ impl TaskQueuePlugin {
                     return;
                 }
             };
+            debug!(subject = %subject, producer_component = %producer, "events loop: subscribed");
             loop {
                 tokio::select! {
-                    _ = cancel.cancelled() => break,
+                    _ = cancel.cancelled() => {
+                        debug!(subject = %subject, producer_component = %producer, "events loop: cancelled, stopping");
+                        break;
+                    }
                     message = subscriber.next() => match message {
                         Some(message) => {
+                            debug!(subject = %subject, producer_component = %producer, event_type = ?message.payload.first().map(|b| *b as char), payload_len = message.payload.len(), "events loop: received message");
                             if let Some(event) = parse_control_event(&message.payload) {
+                                debug!(subject = %subject, producer_component = %producer, event = %callback_event_summary(&event), "events loop: parsed event, forwarding to observer");
                                 let _ = plugin.observe(&producer, event).await;
+                            } else {
+                                debug!(subject = %subject, producer_component = %producer, payload_len = message.payload.len(), "events loop: message failed to parse as control event");
                             }
                         }
-                        None => break,
+                        None => {
+                            debug!(subject = %subject, producer_component = %producer, "events loop: subscription ended");
+                            break;
+                        }
                     },
                 }
             }
@@ -734,6 +777,7 @@ async fn dispatch_observer(
     component_id: &str,
     event: CallbackEvent,
 ) -> anyhow::Result<()> {
+    debug!(component_id = %component_id, event = %callback_event_summary(&event), "dispatch_observer: binding observer store");
     let mut store = workload
         .new_store(component_id)
         .await
@@ -754,17 +798,23 @@ async fn dispatch_observer(
     let call_result = store
         .run_concurrent(async move |accessor| match event {
             CallbackEvent::Heartbeat { id, info } => {
-                observer.call_on_heartbeat(accessor, id, info).await
+                let res = observer.call_on_heartbeat(accessor, id, info).await;
+                debug!(component_id = %component_id, "dispatch_observer: on_heartbeat called, ok={}", res.is_ok());
+                res
             }
             CallbackEvent::AttemptFailed { event } => {
-                observer
+                let res = observer
                     .call_on_attempt_failed(accessor, to_observer_attempt_failure(event))
-                    .await
+                    .await;
+                debug!(component_id = %component_id, "dispatch_observer: on_attempt_failed called, ok={}", res.is_ok());
+                res
             }
             CallbackEvent::Complete { result } => {
-                observer
+                let res = observer
                     .call_on_complete(accessor, to_observer_task_result(result))
-                    .await
+                    .await;
+                debug!(component_id = %component_id, "dispatch_observer: on_complete called, ok={}", res.is_ok());
+                res
             }
         })
         .await
@@ -821,9 +871,11 @@ impl<'a> bindings::custom::task_queue::producer::Host for ActiveCtx<'a> {
             return Ok(Err("plugin not available".into()));
         };
         let component_id = self.component_id.as_ref().to_string();
+        debug!(component_id = %component_id, payload_len = task.payload.len(), "task-queue: submit called");
         let queue = {
             let tracker = plugin.tracker.read().await;
             let Some(data) = tracker.get_component_data(&component_id) else {
+                debug!(component_id = %component_id, "task-queue: submit from untracked component");
                 return Ok(Err("component not tracked".into()));
             };
             data.queue.clone()
@@ -846,8 +898,14 @@ impl<'a> bindings::custom::task_queue::producer::Host for ActiveCtx<'a> {
             })
             .await
         {
-            Ok(task_id) => Ok(Ok(task_id)),
-            Err(err) => Ok(Err(err.to_string())),
+            Ok(task_id) => {
+                debug!(component_id = %component_id, queue = %queue, task_id = %task_id, "task-queue: task submitted");
+                Ok(Ok(task_id))
+            }
+            Err(err) => {
+                warn!(component_id = %component_id, queue = %queue, err = %err, "task-queue: submit failed");
+                Ok(Err(err.to_string()))
+            }
         }
     }
 
@@ -1062,12 +1120,14 @@ impl HostPlugin for TaskQueuePlugin {
         let mut config = component.local_resources().config.clone();
         config.extend(interface.config.clone());
         let queue_config = QueueConfig::from_config(&config)?;
+        let component_id = component.id().to_string();
 
         let external_worker = config
             .get("external-worker")
             .and_then(|value| value.parse::<bool>().ok())
             .unwrap_or(false);
 
+        debug!(component_id = %component_id, queue = %queue_config.name, external_worker, "task-queue: component bound");
         self.tracker.write().await.add_component(
             component,
             ComponentData {
@@ -1085,9 +1145,11 @@ impl HostPlugin for TaskQueuePlugin {
         workload: &ResolvedWorkload,
         component_id: &str,
     ) -> anyhow::Result<()> {
+        debug!(component_id = %component_id, "task-queue: workload resolved, setting observer workload");
         let (queue, external_worker, cancel_token) = {
             let mut tracker = self.tracker.write().await;
             let Some(data) = tracker.get_component_data_mut(component_id) else {
+                debug!(component_id = %component_id, "task-queue: workload resolved but component not tracked, skipping");
                 return Ok(());
             };
             data.workload = Some(workload.clone());
@@ -1101,6 +1163,7 @@ impl HostPlugin for TaskQueuePlugin {
                 data.cancel_token.child_token(),
             )
         };
+        debug!(component_id = %component_id, queue = %queue, external_worker, "task-queue: workload resolved, starting loops");
         let config = QueueConfig::new(queue.clone());
         let handles = self.ensure_queue(config).await?;
         // 外部/原生 worker 模式下，队列由独立原生 worker（agent-manager）消费，
@@ -1120,6 +1183,7 @@ impl HostPlugin for TaskQueuePlugin {
         workload_id: &str,
         _interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
+        debug!(workload_id = %workload_id, "task-queue: workload unbinding");
         self.tracker
             .write()
             .await
