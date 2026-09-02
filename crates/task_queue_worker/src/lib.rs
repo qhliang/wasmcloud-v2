@@ -4,6 +4,7 @@
 //! invokes the application worker, and maps success/failure to ack semantics.
 
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
@@ -13,7 +14,7 @@ use task_queue_core::config::QueueConfig;
 use task_queue_core::nats::{AckAction, QueueHandles, now_ms};
 use task_queue_core::types::{TaskEnvelope, TaskError, TaskErrorSource};
 use task_queue_core::worker::{SharedWorker, TaskContext, Worker};
-use tokio::sync::Semaphore;
+use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -23,12 +24,92 @@ use tokio_util::sync::CancellationToken;
 /// longer buys nothing.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How often a parked acquisition re-reads the limit. The limit can be raised
+/// while runners are parked; without a periodic re-check they would stay parked
+/// until some unrelated release happened to wake them.
+const LIMIT_RECHECK: Duration = Duration::from_secs(1);
+
+/// Supplies the number of deliveries that may be processed concurrently.
+///
+/// It is polled before every acquisition, so an embedder whose limit changes at
+/// runtime (for example one pushed through config sync) is honoured without
+/// restarting the runner. Snapshotting the value at startup instead would
+/// silently apply a stale limit for the whole process lifetime.
+pub type ConcurrencyLimit = Arc<dyn Fn() -> usize + Send + Sync>;
+
+/// Wraps a constant value in a [`ConcurrencyLimit`].
+pub fn fixed_limit(concurrency: usize) -> ConcurrencyLimit {
+    let concurrency = concurrency.max(1);
+    Arc::new(move || concurrency)
+}
+
+/// Counting gate whose capacity comes from a [`ConcurrencyLimit`].
+struct Gate {
+    limit: ConcurrencyLimit,
+    active: StdMutex<usize>,
+    freed: Notify,
+}
+
+impl Gate {
+    fn new(limit: ConcurrencyLimit) -> Self {
+        Self {
+            limit,
+            // A std mutex is deliberate: `Permit::drop` must release the slot
+            // synchronously, and the critical section never awaits.
+            active: StdMutex::new(0),
+            freed: Notify::new(),
+        }
+    }
+
+    /// Takes a slot synchronously; `None` when the gate is at its limit.
+    fn try_acquire(self: &Arc<Self>) -> Option<Permit> {
+        let limit = (self.limit)().max(1);
+        let mut active = self.active.lock().unwrap_or_else(|err| err.into_inner());
+        if *active < limit {
+            *active += 1;
+            return Some(Permit { gate: self.clone() });
+        }
+        None
+    }
+
+    /// Takes a slot, waiting until one is free or `shutdown` is cancelled.
+    async fn acquire(self: &Arc<Self>, shutdown: &CancellationToken) -> Option<Permit> {
+        loop {
+            if let Some(permit) = self.try_acquire() {
+                return Some(permit);
+            }
+            tokio::select! {
+                _ = shutdown.cancelled() => return None,
+                _ = self.freed.notified() => {}
+                _ = tokio::time::sleep(LIMIT_RECHECK) => {}
+            }
+        }
+    }
+}
+
+/// An occupied slot in a [`Gate`], released when dropped.
+struct Permit {
+    gate: Arc<Gate>,
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        let mut active = self
+            .gate
+            .active
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        *active = active.saturating_sub(1);
+        drop(active);
+        self.gate.freed.notify_one();
+    }
+}
+
 #[derive(Clone)]
 pub struct WorkerRunner {
     handles: Arc<QueueHandles>,
     worker: SharedWorker,
-    /// Maximum number of deliveries processed at the same time.
-    concurrency: usize,
+    limit: ConcurrencyLimit,
 }
 
 impl WorkerRunner {
@@ -56,11 +137,22 @@ impl WorkerRunner {
         worker: impl Worker + 'static,
         concurrency: usize,
     ) -> Result<Self> {
+        Self::connect_with_limit(client, config, worker, fixed_limit(concurrency)).await
+    }
+
+    /// Same as [`connect`](Self::connect) but re-reads the concurrency limit
+    /// from `limit` before taking every slot.
+    pub async fn connect_with_limit(
+        client: JetStreamContext,
+        config: QueueConfig,
+        worker: impl Worker + 'static,
+        limit: ConcurrencyLimit,
+    ) -> Result<Self> {
         let handles = Arc::new(QueueHandles::create(client, config).await?);
         Ok(Self {
             handles,
             worker: Arc::new(worker),
-            concurrency: concurrency.max(1),
+            limit,
         })
     }
 
@@ -86,18 +178,18 @@ impl WorkerRunner {
             .messages()
             .await
             .context("failed to subscribe to task consumer")?;
-        let gate = Arc::new(Semaphore::new(self.concurrency));
+        let gate = Arc::new(Gate::new(self.limit.clone()));
         let mut in_flight = JoinSet::new();
-        tracing::info!(concurrency = self.concurrency, "task queue worker running");
+        tracing::info!("task queue worker running");
         loop {
             // Reap finished deliveries so the set does not grow unbounded.
             while in_flight.try_join_next().is_some() {}
             // Acquiring the permit before fetching is the backpressure point.
             let permit = tokio::select! {
                 _ = shutdown.cancelled() => break,
-                acquired = gate.clone().acquire_owned() => match acquired {
-                    Ok(permit) => permit,
-                    Err(_) => break,
+                acquired = gate.acquire(&shutdown) => match acquired {
+                    Some(permit) => permit,
+                    None => break,
                 },
             };
             let next = tokio::select! {
