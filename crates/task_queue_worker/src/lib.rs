@@ -11,6 +11,7 @@ use anyhow::{Context as _, Result};
 use async_nats::jetstream::Context as JetStreamContext;
 use futures::StreamExt as _;
 use task_queue_core::config::QueueConfig;
+use task_queue_core::events::ControlEvent;
 use task_queue_core::nats::{AckAction, QueueHandles, now_ms};
 use task_queue_core::types::{TaskEnvelope, TaskError, TaskErrorSource};
 use task_queue_core::worker::{SharedWorker, TaskContext, Worker};
@@ -239,6 +240,11 @@ impl WorkerRunner {
             Ok(envelope) => envelope,
             Err(err) => {
                 tracing::warn!(task_id = %task_id, err = %err, "invalid task envelope");
+                // A delivery that is terminated without success must still be
+                // reported, otherwise the producer's observer never learns the
+                // task is gone and any execution it tracks stays pending.
+                self.publish_attempt_failed(&task_id, attempt, "system", &err.to_string())
+                    .await;
                 let _ = AckAction::Term.apply(&acker).await;
                 return;
             }
@@ -248,6 +254,8 @@ impl WorkerRunner {
             Ok(payload) => payload,
             Err(err) => {
                 tracing::warn!(task_id = %task_id, err = %err, "invalid task payload");
+                self.publish_attempt_failed(&task_id, attempt, "system", &err.to_string())
+                    .await;
                 let _ = AckAction::Term.apply(&acker).await;
                 return;
             }
@@ -298,9 +306,11 @@ impl WorkerRunner {
             // Guest errors are recoverable until the delivery budget is spent.
             Err(TaskError {
                 source: TaskErrorSource::Guest,
-                message: _,
+                message,
             }) => {
                 if attempt >= self.handles.config.max_deliver.max(1) as u32 {
+                    self.publish_attempt_failed(&task_id, attempt, "guest", &message)
+                        .await;
                     AckAction::Term
                 } else {
                     AckAction::Nak(Some(self.handles.config.backoff_for_attempt(attempt)))
@@ -309,12 +319,49 @@ impl WorkerRunner {
             // Deadlines and infrastructure failures should not spin on retries.
             Err(err) => {
                 tracing::warn!(task_id = %task_id, err = %err, "worker system failure");
+                self.publish_attempt_failed(&task_id, attempt, "system", &err.to_string())
+                    .await;
                 AckAction::Term
             }
         };
         // The lease renewal task must stop before applying the terminal ack.
         if let Err(err) = action.apply(&acker).await {
             tracing::warn!(task_id = %task_id, err = %err, "failed to acknowledge task");
+        }
+    }
+
+    /// Reports a delivery that is being terminated without success to the
+    /// producer's observer via `{queue}.events`.
+    ///
+    /// Every [`AckAction::Term`](AckAction::Term) path must publish this first:
+    /// the workqueue message is about to disappear, no other component will
+    /// emit a terminal result, and executions tracked on the producer side
+    /// would stay pending forever. The event schema matches the
+    /// `custom:task-queue` provider's `attempt_failed` contract; publishing is
+    /// advisory (core NATS, fire-and-forget) and must never block the ack.
+    async fn publish_attempt_failed(&self, task_id: &str, attempt: u32, source: &str, error: &str) {
+        let subject = ControlEvent::subject(&self.handles.config.name);
+        let payload = serde_json::json!({
+            "type": "attempt_failed",
+            "id": task_id,
+            "attempt": attempt,
+            "source": source,
+            "error": error,
+        })
+        .to_string()
+        .into_bytes();
+        if let Err(err) = self
+            .handles
+            .jetstream
+            .client()
+            .publish(subject, payload.into())
+            .await
+        {
+            tracing::warn!(
+                task_id = %task_id,
+                err = %err,
+                "failed to publish attempt_failed event"
+            );
         }
     }
 }
