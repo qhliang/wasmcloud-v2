@@ -491,12 +491,26 @@ impl TaskQueuePlugin {
 
     async fn find_producer_component(&self, queue: &str) -> Option<String> {
         let tracker = self.tracker.read().await;
-        tracker.components.keys().find_map(|component_id| {
-            tracker
+        let mut fallback = None;
+        for component_id in tracker.components.keys() {
+            let matches = tracker
                 .get_component_data(component_id)
-                .filter(|data| data.queue == queue)
-                .map(|_| component_id.clone())
-        })
+                .is_some_and(|data| data.queue == queue);
+            if !matches {
+                continue;
+            }
+            // 优先返回已 resolve（workload 就绪）的 observer 组件；滚动更新期间
+            // 旧 worklod 尚未解绑时，其组件会先出现在 tracker 中，避免把回调
+            // 固定到即将解绑的陈旧组件上。
+            let ready = tracker
+                .get_component_data(component_id)
+                .is_some_and(|data| data.workload.is_some());
+            if ready {
+                return Some(component_id.clone());
+            }
+            fallback.get_or_insert_with(|| component_id.clone());
+        }
+        fallback
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -618,12 +632,8 @@ impl TaskQueuePlugin {
         cancel: CancellationToken,
     ) {
         let subject = format!("{queue}.events");
+        let queue = queue.to_string();
         let client = (*self.client).clone();
-        let producer = self
-            .find_producer_component(queue)
-            .await
-            .unwrap_or_default();
-        debug!(subject = %subject, producer_component = %producer, "events loop: starting, resolved producer component");
         let plugin = self.clone();
         tokio::spawn(async move {
             let mut subscriber = match client.subscribe(subject.clone()).await {
@@ -633,25 +643,31 @@ impl TaskQueuePlugin {
                     return;
                 }
             };
-            debug!(subject = %subject, producer_component = %producer, "events loop: subscribed");
+            debug!(subject = %subject, "events loop: subscribed");
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => {
-                        debug!(subject = %subject, producer_component = %producer, "events loop: cancelled, stopping");
+                        debug!(subject = %subject, "events loop: cancelled, stopping");
                         break;
                     }
                     message = subscriber.next() => match message {
                         Some(message) => {
-                            debug!(subject = %subject, producer_component = %producer, event_type = ?message.payload.first().map(|b| *b as char), payload_len = message.payload.len(), "events loop: received message");
+                            debug!(subject = %subject, event_type = ?message.payload.first().map(|b| *b as char), payload_len = message.payload.len(), "events loop: received message");
                             if let Some(event) = parse_control_event(&message.payload) {
+                                // 每条事件动态解析当前可用的 observer 组件：滚动更新
+                                // 期间旧组件未解绑时，仍能路由到已 resolve 的新组件。
+                                let Some(producer) = plugin.find_producer_component(&queue).await else {
+                                    debug!(subject = %subject, event = %callback_event_summary(&event), "events loop: no producer component available, dropping event");
+                                    continue;
+                                };
                                 debug!(subject = %subject, producer_component = %producer, event = %callback_event_summary(&event), "events loop: parsed event, forwarding to observer");
                                 let _ = plugin.observe(&producer, event).await;
                             } else {
-                                debug!(subject = %subject, producer_component = %producer, payload_len = message.payload.len(), "events loop: message failed to parse as control event");
+                                debug!(subject = %subject, payload_len = message.payload.len(), "events loop: message failed to parse as control event");
                             }
                         }
                         None => {
-                            debug!(subject = %subject, producer_component = %producer, "events loop: subscription ended");
+                            debug!(subject = %subject, "events loop: subscription ended");
                             break;
                         }
                     },
