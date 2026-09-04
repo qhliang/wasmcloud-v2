@@ -39,8 +39,24 @@ mod bindings {
         world: "task-queue",
         imports: { default: async | trappable | tracing },
         exports: { default: async | trappable | tracing },
+        // `custom:task-queue/producer` 支持 named 多实例：一个组件可多次 import
+        // 同一接口（`import agentq: custom:task-queue/producer@0.1.0;` 等），
+        // 每个命名实例经清单中对应 hostInterfaces 条目的 `queue` 配置路由到
+        // 各自的 JetStream 队列。运行时按 import 名解析出 [`QueueId`] 注入
+        // Host 方法；无名 import 走组件主队列，行为不变。
+        named_imports: {
+            "custom:task-queue/producer": super::QueueId,
+        },
     });
 }
+
+/// named producer import 的路由键：值即该实例绑定的队列名。
+///
+/// 在 `on_workload_item_bind` 阶段由命名 hostInterfaces 条目的 `queue`
+/// 配置构建 `import name -> QueueId` 注册表，运行时经 `add_to_linker`
+/// 的 lookup 闭包按 import 名解析。
+#[derive(Clone, Debug)]
+pub struct QueueId(pub String);
 
 // Role-scoped binding worlds. The monolithic `task-queue` world forces every
 // bound component to export BOTH `observer` and `worker`, which breaks the
@@ -173,13 +189,26 @@ fn callback_event_summary(event: &CallbackEvent) -> String {
 }
 
 pub struct ComponentData {
+    /// 组件主队列（无名 producer / task-control 的默认队列）。
     queue: String,
+    /// named producer import 的路由表：import 名（如 `workflowq`）→ 队列名。
+    /// 由 `on_workload_item_bind` 从命名 hostInterfaces 条目构建。
+    named_queues: HashMap<String, String>,
     workload: Option<ResolvedWorkload>,
     cancel_token: CancellationToken,
     /// 外部/原生 worker 模式：队列由独立的原生 worker（如 agent-manager）消费，
     /// 插件不再启动 JetStream dispatcher（避免与原始 worker 竞争同一 durable consumer），
     /// 仅订阅 `{queue}.events` 将原生 worker 发布的生命周期事件转发给 observer 的 on_xx 回调。
-    external_worker: bool,
+    /// 以外部 worker 模式运行的队列集合（主队列 + 各 named 队列）。
+    /// named 条目可独立配置 `external-worker`，与主条目互不影响。
+    external_queues: HashSet<String>,
+}
+
+impl ComponentData {
+    /// 该组件是否绑定了指定队列（主队列或任一 named 队列）。
+    fn serves_queue(&self, queue: &str) -> bool {
+        self.queue == queue || self.named_queues.values().any(|q| q == queue)
+    }
 }
 
 #[derive(Default)]
@@ -283,6 +312,109 @@ impl TaskQueuePlugin {
         self.callback_tx
             .send((component_id.to_string(), event))
             .context("callback channel closed")
+    }
+
+    // ── producer 队列操作（无名与 named Host 实现共用）──────────────
+
+    async fn submit_on(
+        &self,
+        queue: &str,
+        component_id: &str,
+        payload: Vec<u8>,
+    ) -> wasmtime::Result<Result<String, String>> {
+        debug!(component_id = %component_id, queue = %queue, payload_len = payload.len(), "task-queue: submit called");
+        let handles = {
+            let queues = self.queues.read().await;
+            queues.get(queue).cloned()
+        };
+        let Some(handles) = handles else {
+            return Ok(Err("queue not ready".into()));
+        };
+        if payload.len() > PAYLOAD_MAX_BYTES {
+            return Ok(Err(format!("payload exceeds {PAYLOAD_MAX_BYTES} bytes")));
+        }
+
+        let producer = TaskProducer::from_handles(Arc::new(handles));
+        match producer.submit(CoreTask { payload }).await {
+            Ok(task_id) => {
+                debug!(component_id = %component_id, queue = %queue, task_id = %task_id, "task-queue: task submitted");
+                Ok(Ok(task_id))
+            }
+            Err(err) => {
+                warn!(component_id = %component_id, queue = %queue, err = %err, "task-queue: submit failed");
+                Ok(Err(err.to_string()))
+            }
+        }
+    }
+
+    async fn query_status_on(
+        &self,
+        queue: &str,
+        task_id: &str,
+    ) -> wasmtime::Result<Result<Option<TaskInfo>, String>> {
+        let handles = {
+            let queues = self.queues.read().await;
+            queues.get(queue).cloned()
+        };
+        let Some(handles) = handles else {
+            return Ok(Ok(None));
+        };
+        match self.metadata(&handles, task_id).await {
+            Ok(meta) => Ok(Ok(Some(guest_task_info(&meta)))),
+            Err(_) => Ok(Ok(None)),
+        }
+    }
+
+    async fn cancel_task_on(
+        &self,
+        queue: &str,
+        task_id: &str,
+    ) -> wasmtime::Result<Result<(), String>> {
+        let handles = {
+            let queues = self.queues.read().await;
+            queues.get(queue).cloned()
+        };
+        let Some(handles) = handles else {
+            return Ok(Err("queue not ready".into()));
+        };
+        let mut meta = match self.metadata(&handles, task_id).await {
+            Ok(meta) => meta,
+            Err(err) => return Ok(Err(format!("task not found: {err}"))),
+        };
+        if matches!(
+            meta.state,
+            TaskState::Succeeded
+                | TaskState::Failed
+                | TaskState::DispatchTimeout
+                | TaskState::ExecutionTimeout
+                | TaskState::Cancelled
+                | TaskState::MaxRetriesExceeded
+        ) {
+            return Ok(Err("task already completed".into()));
+        }
+        meta.cancel_requested = true;
+        meta.state = if meta.state == TaskState::Queued {
+            TaskState::Cancelled
+        } else {
+            meta.state
+        };
+        if let Err(err) = self.put_metadata(&handles, &meta).await {
+            return Ok(Err(format!("failed to update task metadata: {err}")));
+        }
+        if meta.state == TaskState::Cancelled {
+            let subject = format!("{}.tasks.{task_id}", handles.config.name);
+            let _ = handles.task_stream.purge().filter(subject).await;
+        }
+        Ok(Ok(()))
+    }
+
+    /// 解析组件调用 producer 时的目标队列：无名调用用主队列；
+    /// named 调用由 [`QueueId`] 直接携带，不经本方法。
+    async fn default_queue_for(&self, component_id: &str) -> Option<String> {
+        let tracker = self.tracker.read().await;
+        tracker
+            .get_component_data(component_id)
+            .map(|data| data.queue.clone())
     }
 
     async fn worker_component(
@@ -428,7 +560,7 @@ impl TaskQueuePlugin {
             .find_map(|component_id| {
                 tracker
                     .get_component_data(component_id)
-                    .filter(|data| data.queue == queue)
+                    .filter(|data| data.serves_queue(queue))
                     .map(|_| component_id.clone())
             })
             .unwrap_or_default()
@@ -495,7 +627,7 @@ impl TaskQueuePlugin {
         for component_id in tracker.components.keys() {
             let matches = tracker
                 .get_component_data(component_id)
-                .is_some_and(|data| data.queue == queue);
+                .is_some_and(|data| data.serves_queue(queue));
             if !matches {
                 continue;
             }
@@ -887,42 +1019,11 @@ impl<'a> bindings::custom::task_queue::producer::Host for ActiveCtx<'a> {
             return Ok(Err("plugin not available".into()));
         };
         let component_id = self.component_id.as_ref().to_string();
-        debug!(component_id = %component_id, payload_len = task.payload.len(), "task-queue: submit called");
-        let queue = {
-            let tracker = plugin.tracker.read().await;
-            let Some(data) = tracker.get_component_data(&component_id) else {
-                debug!(component_id = %component_id, "task-queue: submit from untracked component");
-                return Ok(Err("component not tracked".into()));
-            };
-            data.queue.clone()
+        let Some(queue) = plugin.default_queue_for(&component_id).await else {
+            debug!(component_id = %component_id, "task-queue: submit from untracked component");
+            return Ok(Err("component not tracked".into()));
         };
-        let handles = {
-            let queues = plugin.queues.read().await;
-            queues.get(&queue).cloned()
-        };
-        let Some(handles) = handles else {
-            return Ok(Err("queue not ready".into()));
-        };
-        if task.payload.len() > PAYLOAD_MAX_BYTES {
-            return Ok(Err(format!("payload exceeds {PAYLOAD_MAX_BYTES} bytes")));
-        }
-
-        let producer = TaskProducer::from_handles(Arc::new(handles));
-        match producer
-            .submit(CoreTask {
-                payload: task.payload,
-            })
-            .await
-        {
-            Ok(task_id) => {
-                debug!(component_id = %component_id, queue = %queue, task_id = %task_id, "task-queue: task submitted");
-                Ok(Ok(task_id))
-            }
-            Err(err) => {
-                warn!(component_id = %component_id, queue = %queue, err = %err, "task-queue: submit failed");
-                Ok(Err(err.to_string()))
-            }
-        }
+        plugin.submit_on(&queue, &component_id, task.payload).await
     }
 
     async fn query_status(
@@ -933,24 +1034,10 @@ impl<'a> bindings::custom::task_queue::producer::Host for ActiveCtx<'a> {
             return Ok(Err("plugin not available".into()));
         };
         let component_id = self.component_id.as_ref().to_string();
-        let queue = {
-            let tracker = plugin.tracker.read().await;
-            let Some(data) = tracker.get_component_data(&component_id) else {
-                return Ok(Err("component not tracked".into()));
-            };
-            data.queue.clone()
+        let Some(queue) = plugin.default_queue_for(&component_id).await else {
+            return Ok(Err("component not tracked".into()));
         };
-        let handles = {
-            let queues = plugin.queues.read().await;
-            queues.get(&queue).cloned()
-        };
-        let Some(handles) = handles else {
-            return Ok(Ok(None));
-        };
-        match plugin.metadata(&handles, &task_id).await {
-            Ok(meta) => Ok(Ok(Some(guest_task_info(&meta)))),
-            Err(_) => Ok(Ok(None)),
-        }
+        plugin.query_status_on(&queue, &task_id).await
     }
 
     async fn cancel_task(&mut self, task_id: String) -> wasmtime::Result<Result<(), String>> {
@@ -958,49 +1045,49 @@ impl<'a> bindings::custom::task_queue::producer::Host for ActiveCtx<'a> {
             return Ok(Err("plugin not available".into()));
         };
         let component_id = self.component_id.as_ref().to_string();
-        let queue = {
-            let tracker = plugin.tracker.read().await;
-            let Some(data) = tracker.get_component_data(&component_id) else {
-                return Ok(Err("component not tracked".into()));
-            };
-            data.queue.clone()
+        let Some(queue) = plugin.default_queue_for(&component_id).await else {
+            return Ok(Err("component not tracked".into()));
         };
-        let handles = {
-            let queues = plugin.queues.read().await;
-            queues.get(&queue).cloned()
+        plugin.cancel_task_on(&queue, &task_id).await
+    }
+}
+
+/// named producer 实例（`import <name>: custom:task-queue/producer@0.1.0;`）。
+/// 目标队列由 [`QueueId`] 携带（bind 阶段按 import 名从清单配置解析），
+/// 因此调用方无法误投到其他队列。
+impl<'a> bindings::named_imports::custom::task_queue::producer::Host for ActiveCtx<'a> {
+    async fn submit(
+        &mut self,
+        id: QueueId,
+        task: GuestTask,
+    ) -> wasmtime::Result<Result<String, String>> {
+        let Ok(plugin) = self.try_get_plugin::<TaskQueuePlugin>(PLUGIN_ID) else {
+            return Ok(Err("plugin not available".into()));
         };
-        let Some(handles) = handles else {
-            return Ok(Err("queue not ready".into()));
+        let component_id = self.component_id.as_ref().to_string();
+        plugin.submit_on(&id.0, &component_id, task.payload).await
+    }
+
+    async fn query_status(
+        &mut self,
+        id: QueueId,
+        task_id: String,
+    ) -> wasmtime::Result<Result<Option<TaskInfo>, String>> {
+        let Ok(plugin) = self.try_get_plugin::<TaskQueuePlugin>(PLUGIN_ID) else {
+            return Ok(Err("plugin not available".into()));
         };
-        let mut meta = match plugin.metadata(&handles, &task_id).await {
-            Ok(meta) => meta,
-            Err(err) => return Ok(Err(format!("task not found: {err}"))),
+        plugin.query_status_on(&id.0, &task_id).await
+    }
+
+    async fn cancel_task(
+        &mut self,
+        id: QueueId,
+        task_id: String,
+    ) -> wasmtime::Result<Result<(), String>> {
+        let Ok(plugin) = self.try_get_plugin::<TaskQueuePlugin>(PLUGIN_ID) else {
+            return Ok(Err("plugin not available".into()));
         };
-        if matches!(
-            meta.state,
-            TaskState::Succeeded
-                | TaskState::Failed
-                | TaskState::DispatchTimeout
-                | TaskState::ExecutionTimeout
-                | TaskState::Cancelled
-                | TaskState::MaxRetriesExceeded
-        ) {
-            return Ok(Err("task already completed".into()));
-        }
-        meta.cancel_requested = true;
-        meta.state = if meta.state == TaskState::Queued {
-            TaskState::Cancelled
-        } else {
-            meta.state
-        };
-        if let Err(err) = plugin.put_metadata(&handles, &meta).await {
-            return Ok(Err(format!("failed to update task metadata: {err}")));
-        }
-        if meta.state == TaskState::Cancelled {
-            let subject = format!("{}.tasks.{task_id}", handles.config.name);
-            let _ = handles.task_stream.purge().filter(subject).await;
-        }
-        Ok(Ok(()))
+        plugin.cancel_task_on(&id.0, &task_id).await
     }
 }
 
@@ -1104,6 +1191,12 @@ impl HostPlugin for TaskQueuePlugin {
         }
     }
 
+    /// 支持同名接口的多命名实例（`import agentq: custom:task-queue/producer@0.1.0;`
+    /// 等），按 import 名路由到各自 `queue` 配置的队列。
+    fn supports_named_instances(&self) -> bool {
+        true
+    }
+
     async fn start(&self) -> anyhow::Result<()> {
         info!("task queue plugin started");
         Ok(())
@@ -1114,14 +1207,18 @@ impl HostPlugin for TaskQueuePlugin {
         item: &mut WorkloadItem<'a>,
         interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
-        let Some(interface) = interfaces.get("custom", "task-queue", &[]) else {
+        // 注意：不能用 `interfaces.get(...)` —— 其内部是 `.find()`，同名接口存在
+        // 多个条目（无名 + named）时只会返回其中一个且不按 name 过滤。
+        let tq_entries: Vec<WitInterface> = interfaces
+            .iter()
+            .filter(|i| i.namespace == "custom" && i.package == "task-queue")
+            .cloned()
+            .collect();
+        if tq_entries.is_empty() {
             return Ok(());
-        };
+        }
+
         bindings::custom::task_queue::types::add_to_linker::<_, SharedCtx>(
-            item.linker(),
-            extract_active_ctx,
-        )?;
-        bindings::custom::task_queue::producer::add_to_linker::<_, SharedCtx>(
             item.linker(),
             extract_active_ctx,
         )?;
@@ -1129,28 +1226,88 @@ impl HostPlugin for TaskQueuePlugin {
             item.linker(),
             extract_active_ctx,
         )?;
+        // 无名 producer：单队列语义（组件主队列），向后兼容既有组件。
+        if tq_entries
+            .iter()
+            .any(|i| i.name.is_none() && i.interfaces.contains("producer"))
+        {
+            bindings::custom::task_queue::producer::add_to_linker::<_, SharedCtx>(
+                item.linker(),
+                extract_active_ctx,
+            )?;
+        }
+        // named producer：每个命名实例按其 `queue` 配置路由。
+        let named_queues: HashMap<String, String> = tq_entries
+            .iter()
+            .filter_map(|i| {
+                let name = i.name.as_ref()?;
+                let queue = i.config.get("queue")?;
+                Some((name.clone(), queue.clone()))
+            })
+            .collect();
+        if !named_queues.is_empty() {
+            let registry = named_queues.clone();
+            let component = item.component().clone();
+            bindings::named_imports::custom::task_queue::producer::add_to_linker::<_, SharedCtx>(
+                item.linker(),
+                &component,
+                move |name| {
+                    registry.get(name).cloned().map(QueueId).ok_or_else(|| {
+                        wasmtime::Error::msg(format!(
+                            "no queue configured for named task-queue import '{name}'"
+                        ))
+                    })
+                },
+                extract_active_ctx,
+            )?;
+        }
 
         let WorkloadItem::Component(component) = item else {
             return Ok(());
         };
-        let mut config = component.local_resources().config.clone();
-        config.extend(interface.config.clone());
-        let queue_config = QueueConfig::from_config(&config)?;
         let component_id = component.id().to_string();
+        // 主队列取自无名条目（与既有行为一致）；named 条目各自独立成队列。
+        let primary = tq_entries.iter().find(|i| i.name.is_none());
+        let Some(primary) = primary else {
+            anyhow::bail!("task-queue requires an unnamed hostInterfaces entry")
+        };
+        let mut config = component.local_resources().config.clone();
+        config.extend(primary.config.clone());
+        let queue_config = QueueConfig::from_config(&config)?;
 
-        let external_worker = config
+        let mut external_queues = HashSet::new();
+        if config
             .get("external-worker")
             .and_then(|value| value.parse::<bool>().ok())
-            .unwrap_or(false);
+            .unwrap_or(false)
+        {
+            external_queues.insert(queue_config.name.clone());
+        }
+        for iface in &tq_entries {
+            let Some(name) = &iface.name else { continue };
+            let external = iface
+                .config
+                .get("external-worker")
+                .and_then(|value| value.parse::<bool>().ok())
+                .unwrap_or(false);
+            if external && let Some(q) = named_queues.get(name) {
+                external_queues.insert(q.clone());
+            }
+        }
 
-        debug!(component_id = %component_id, queue = %queue_config.name, external_worker, "task-queue: component bound");
+        debug!(
+            component_id = %component_id, queue = %queue_config.name,
+            named = ?named_queues, external = ?external_queues,
+            "task-queue: component bound"
+        );
         self.tracker.write().await.add_component(
             component,
             ComponentData {
                 queue: queue_config.name.clone(),
+                named_queues,
                 workload: None,
                 cancel_token: CancellationToken::new(),
-                external_worker,
+                external_queues,
             },
         );
         Ok(())
@@ -1162,7 +1319,7 @@ impl HostPlugin for TaskQueuePlugin {
         component_id: &str,
     ) -> anyhow::Result<()> {
         debug!(component_id = %component_id, "task-queue: workload resolved, setting observer workload");
-        let (queue, external_worker, cancel_token) = {
+        let (queue, named_queues, external_queues, cancel_token) = {
             let mut tracker = self.tracker.write().await;
             let Some(data) = tracker.get_component_data_mut(component_id) else {
                 debug!(component_id = %component_id, "task-queue: workload resolved but component not tracked, skipping");
@@ -1175,22 +1332,33 @@ impl HostPlugin for TaskQueuePlugin {
             // 循环永不停止（僵尸队列循环持续消费 agent-task 并调用 call_worker）。
             (
                 data.queue.clone(),
-                data.external_worker,
+                data.named_queues.values().cloned().collect::<Vec<_>>(),
+                data.external_queues.clone(),
                 data.cancel_token.child_token(),
             )
         };
-        debug!(component_id = %component_id, queue = %queue, external_worker, "task-queue: workload resolved, starting loops");
-        let config = QueueConfig::new(queue.clone());
-        let handles = self.ensure_queue(config).await?;
-        // 外部/原生 worker 模式下，队列由独立原生 worker（agent-manager）消费，
-        // 插件不启动 JetStream dispatcher，避免与原始 worker 竞争同一 durable consumer。
-        if !external_worker {
-            self.start_queue_loop(handles.clone(), cancel_token.clone())
+        // 主队列 + 各 named 队列（去重，named 可能与主队列同名）。
+        let mut targets = vec![queue.clone()];
+        targets.extend(named_queues);
+        targets.sort();
+        targets.dedup();
+        debug!(component_id = %component_id, queues = ?targets, "task-queue: workload resolved, starting loops");
+        for target in targets {
+            let external = external_queues.contains(&target);
+            let config = QueueConfig::new(target.clone());
+            let handles = self.ensure_queue(config).await?;
+            // 外部/原生 worker 模式下，队列由独立原生 worker（agent-manager /
+            // workflow-manager）消费，插件不启动 JetStream dispatcher，避免与
+            // 原始 worker 竞争同一 durable consumer。
+            if !external {
+                self.start_queue_loop(handles.clone(), cancel_token.clone())
+                    .await;
+            }
+            // 无论是否自消费，插件都订阅 `{queue}.events`，将原生 worker 发布的
+            // 生命周期事件转发给 observer 的 on_xx 回调（status 经此通道回报）。
+            self.start_events_loop(handles, &target, cancel_token.clone())
                 .await;
         }
-        // 无论是否自消费，插件都订阅 `{queue}.events`，将原生 worker 发布的
-        // 生命周期事件转发给 observer 的 on_xx 回调（status 经此通道回报）。
-        self.start_events_loop(handles, &queue, cancel_token).await;
         Ok(())
     }
 
