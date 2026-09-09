@@ -82,6 +82,15 @@ runner.run(shutdown).await?;
 
 业务代码实现 `Worker::handle_task`，并在长任务检查点先调用 `is_cancelled()`，再发送 heartbeat 和执行下一分片。返回 `Some(output)` 表示成功；`TaskError::guest` 表示可恢复业务失败，会按 backoff 重试；`TaskError::system` 表示系统/deadline 失败。heartbeat 与 JetStream `Progress` 租约续期互不替代。
 
+除业务 heartbeat 外，`WorkerRunner` 还会向 `{queue}.events` 发布生命周期事件（fire-and-forget，不阻塞执行与 ack）：
+
+| 事件 | 时机 | 负载 |
+|---|---|---|
+| `start` | 每次投递开始执行 `handle_task` 前 | `{"type":"start","id":...,"attempt":N}` |
+| `attempt_failed` | 每次失败（guest/system）及任何 Term 终止前 | `{"type":"attempt_failed","id":...,"attempt":N,"source":"guest|system","error":...}` |
+
+宿主插件订阅 `{queue}.events` 后把它们转发给生产者 observer 的 `on-start` / `on-attempt-failed` 回调；终态结果（成功或最终失败）由宿主在取消/重试耗尽后发布，对应 `on-terminate`。
+
 示例中的 `LongRunningWorker` 展示了长任务骨架：
 
 | 阶段 | 动作 |

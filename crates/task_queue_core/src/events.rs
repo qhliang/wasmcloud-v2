@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{AttemptFailure, TaskId, TaskOutput, TaskStatus, decode_base64};
 
-pub const SCHEMA_VERSION: u32 = 1;
+/// v2: observer 接口新增 `on-start`（external worker 可发布 `start` 事件类型），
+/// `on-complete` 更名为 `on-terminate`。
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventProducer {

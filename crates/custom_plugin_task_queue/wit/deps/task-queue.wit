@@ -1,4 +1,4 @@
-package custom:task-queue@0.1.0;
+package custom:task-queue@0.2.0;
 
 interface types {
     record task {
@@ -64,9 +64,12 @@ interface task-control {
 interface observer {
     use types.{attempt-failure, task-result};
 
+    /// 任务开始执行（每次 attempt 派发到 worker 时触发一次）。
+    on-start: async func(task-id: string, attempt: u32) -> result<_, string>;
     on-heartbeat: async func(task-id: string, info: string) -> result<_, string>;
     on-attempt-failed: async func(event: attempt-failure) -> result<_, string>;
-    on-complete: async func(outcome: task-result) -> result<_, string>;
+    /// 任务到达终态（成功或最终失败），即原 on-complete。
+    on-terminate: async func(outcome: task-result) -> result<_, string>;
 }
 
 interface worker {

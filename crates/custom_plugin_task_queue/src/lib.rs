@@ -158,14 +158,30 @@ pub use task_queue_core::config::QueueConfig;
 
 #[derive(Clone, Debug)]
 pub enum CallbackEvent {
-    Heartbeat { id: String, info: String },
-    AttemptFailed { event: AttemptFailure },
-    Complete { result: TaskResult },
+    /// 任务开始执行（每次 attempt 派发到 worker 时触发）。
+    Start {
+        id: String,
+        attempt: u32,
+    },
+    Heartbeat {
+        id: String,
+        info: String,
+    },
+    AttemptFailed {
+        event: AttemptFailure,
+    },
+    /// 任务到达终态（成功或最终失败），对应 observer 的 `on-terminate`。
+    Terminate {
+        result: TaskResult,
+    },
 }
 
 /// 为回调事件生成简短的调试摘要（不含完整 payload）。
 fn callback_event_summary(event: &CallbackEvent) -> String {
     match event {
+        CallbackEvent::Start { id, attempt } => {
+            format!("Start id={id} attempt={attempt}")
+        }
         CallbackEvent::Heartbeat { id, info } => {
             format!("Heartbeat id={id} info_len={}", info.len())
         }
@@ -175,9 +191,9 @@ fn callback_event_summary(event: &CallbackEvent) -> String {
                 event.id, event.attempt, event.source, event.error
             )
         }
-        CallbackEvent::Complete { result } => {
+        CallbackEvent::Terminate { result } => {
             format!(
-                "Complete id={} attempt={} status={:?} error={:?} output_len={}",
+                "Terminate id={} attempt={} status={:?} error={:?} output_len={}",
                 result.id,
                 result.attempt,
                 result.status,
@@ -530,6 +546,22 @@ impl TaskQueuePlugin {
             return;
         }
 
+        // on-start 走与 on-terminate 相同的独立回调路径：任务每次 attempt 开始
+        // 执行时通知 producer 的 observer，不搭载在 heartbeat 上。
+        if let Some(producer_id) = self.find_producer_component(&handles.config.name).await
+            && let Err(err) = self
+                .observe(
+                    &producer_id,
+                    CallbackEvent::Start {
+                        id: task_id.clone(),
+                        attempt,
+                    },
+                )
+                .await
+        {
+            warn!(task_id = %task_id, err = %err, "failed to queue start callback");
+        }
+
         let component_id = self.find_worker_component(&handles.config.name).await;
         let started = now_ms();
         let (result, output) = match (
@@ -752,7 +784,7 @@ impl TaskQueuePlugin {
             && let Err(err) = self
                 .observe(
                     &component_id,
-                    CallbackEvent::Complete {
+                    CallbackEvent::Terminate {
                         result: guest_task_result(result),
                     },
                 )
@@ -871,6 +903,7 @@ impl TaskQueuePlugin {
 /// 解析原生 worker 发布的 `{queue}.events` JSON 事件为插件内部的 `CallbackEvent`。
 /// 约定负载：
 /// ```json
+/// { "type": "start", "id": "<queue-task-id>", "attempt": 1 }
 /// { "type": "complete", "id": "<queue-task-id>", "attempt": 1,
 ///   "status": "succeeded|failed|execution-timeout|...", "output": "<base64>", "error": "..." }
 /// { "type": "attempt_failed", "id": "...", "attempt": 1, "source": "guest|system", "error": "..." }
@@ -880,7 +913,15 @@ fn parse_control_event(payload: &[u8]) -> Option<CallbackEvent> {
     let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
     let id = value.get("id")?.as_str()?.to_string();
     let event_type = value.get("type").and_then(serde_json::Value::as_str)?;
+
     match event_type {
+        "start" => {
+            let attempt = value
+                .get("attempt")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(1) as u32;
+            Some(CallbackEvent::Start { id, attempt })
+        }
         "complete" => {
             let status = match value
                 .get("status")
@@ -906,7 +947,7 @@ fn parse_control_event(payload: &[u8]) -> Option<CallbackEvent> {
                 .get("error")
                 .and_then(serde_json::Value::as_str)
                 .map(ToString::to_string);
-            Some(CallbackEvent::Complete {
+            Some(CallbackEvent::Terminate {
                 result: TaskResult {
                     id,
                     status,
@@ -1004,6 +1045,11 @@ async fn dispatch_observer(
     let observer = proxy.custom_task_queue_observer();
     let call_result = store
         .run_concurrent(async move |accessor| match event {
+            CallbackEvent::Start { id, attempt } => {
+                let res = observer.call_on_start(accessor, id, attempt).await;
+                debug!(component_id = %component_id, "dispatch_observer: on_start called, ok={}", res.is_ok());
+                res
+            }
             CallbackEvent::Heartbeat { id, info } => {
                 let res = observer.call_on_heartbeat(accessor, id, info).await;
                 debug!(component_id = %component_id, "dispatch_observer: on_heartbeat called, ok={}", res.is_ok());
@@ -1016,11 +1062,11 @@ async fn dispatch_observer(
                 debug!(component_id = %component_id, "dispatch_observer: on_attempt_failed called, ok={}", res.is_ok());
                 res
             }
-            CallbackEvent::Complete { result } => {
+            CallbackEvent::Terminate { result } => {
                 let res = observer
-                    .call_on_complete(accessor, to_observer_task_result(result))
+                    .call_on_terminate(accessor, to_observer_task_result(result))
                     .await;
-                debug!(component_id = %component_id, "dispatch_observer: on_complete called, ok={}", res.is_ok());
+                debug!(component_id = %component_id, "dispatch_observer: on_terminate called, ok={}", res.is_ok());
                 res
             }
         })
@@ -1258,7 +1304,7 @@ impl HostPlugin for TaskQueuePlugin {
         }
     }
 
-    /// 支持同名接口的多命名实例（`import agentq: custom:task-queue/producer@0.1.0;`
+    /// 支持同名接口的多命名实例（`import agentq: custom:task-queue/producer@0.2.0;`
     /// 等），按 import 名路由到各自 `queue` 配置的队列。
     fn supports_named_instances(&self) -> bool {
         true
@@ -1623,5 +1669,46 @@ mod tests {
         };
         assert!(data.serves_queue("agent-task"));
         assert!(!data.serves_queue("other-task"));
+    }
+
+    /// external worker 发布的 `start` 事件应解析为 `CallbackEvent::Start`。
+    #[test]
+    fn parse_control_event_maps_start() {
+        let event = parse_control_event(br#"{"type":"start","id":"t1","attempt":2}"#)
+            .expect("start event should parse");
+        match event {
+            CallbackEvent::Start { id, attempt } => {
+                assert_eq!(id, "t1");
+                assert_eq!(attempt, 2);
+            }
+            other => panic!("expected Start, got {other:?}"),
+        }
+    }
+
+    /// external worker 发布的 `complete` 事件应解析为 `CallbackEvent::Terminate`。
+    #[test]
+    fn parse_control_event_maps_complete_to_terminate() {
+        let event = parse_control_event(
+            br#"{"type":"complete","id":"t1","attempt":1,"status":"succeeded"}"#,
+        )
+        .expect("complete event should parse");
+        match event {
+            CallbackEvent::Terminate { result } => {
+                assert_eq!(result.id, "t1");
+                assert!(matches!(result.status, TaskStatus::Succeeded));
+            }
+            other => panic!("expected Terminate, got {other:?}"),
+        }
+    }
+
+    /// 缺少 attempt 的 `start` 事件回落为 1。
+    #[test]
+    fn parse_control_event_start_defaults_attempt() {
+        let event = parse_control_event(br#"{"type":"start","id":"t2"}"#)
+            .expect("start event should parse");
+        match event {
+            CallbackEvent::Start { attempt, .. } => assert_eq!(attempt, 1),
+            other => panic!("expected Start, got {other:?}"),
+        }
     }
 }

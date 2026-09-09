@@ -294,6 +294,10 @@ impl WorkerRunner {
             }
         });
 
+        // Notify the producer's observer that this attempt is starting, via
+        // the same `{queue}.events` path as attempt_failed (fire-and-forget).
+        self.publish_start(&task_id, attempt).await;
+
         // Progress must continue even when the business heartbeat fails.
         let _started_at_ms = now_ms();
         let result = self.worker.handle_task(context).await;
@@ -362,6 +366,29 @@ impl WorkerRunner {
                 err = %err,
                 "failed to publish attempt_failed event"
             );
+        }
+    }
+
+    /// Reports that a delivery is starting execution via `{queue}.events`,
+    /// mirroring the host plugin's `on-start` callback. Publishing is
+    /// advisory (core NATS, fire-and-forget) and must never block execution.
+    async fn publish_start(&self, task_id: &str, attempt: u32) {
+        let subject = ControlEvent::subject(&self.handles.config.name);
+        let payload = serde_json::json!({
+            "type": "start",
+            "id": task_id,
+            "attempt": attempt,
+        })
+        .to_string()
+        .into_bytes();
+        if let Err(err) = self
+            .handles
+            .jetstream
+            .client()
+            .publish(subject, payload.into())
+            .await
+        {
+            tracing::warn!(task_id = %task_id, err = %err, "failed to publish start event");
         }
     }
 }

@@ -8,7 +8,7 @@
 2. **解析阶段**：组件 workload 解析成功后，插件为队列懒创建 JetStream 资源，并启动 durable pull consumer 的消费循环。
 3. **生产阶段**：生产者调用 `submit()`，插件生成 UUIDv7 task id，写入 META KV，再发布 TASKS 消息。调用方还可以使用 `query-status()` 和 `cancel-task()`。
 4. **执行阶段**：消费者调用 `handle-task()` 处理任务。宿主每 10 秒发送一次 JetStream lease 续期；失败时 `Err` 会触发重试，最终次数耗尽后产生终态。
-5. **回调阶段**：任务过程中的 heartbeat、attempt failure 和 complete 事件通过 host-local channel 分发给生产者导出的 `observer`。
+5. **回调阶段**：任务开始执行（`on-start`）、heartbeat、attempt failure 和终态（`on-terminate`）事件通过 host-local channel 分发给生产者导出的 `observer`。
 6. **归档阶段**：终态结果默认写入 `<queue>-results`，便于即使生产者暂时不可用也能审计或恢复结果。
 
 ## WIT 接口
@@ -36,9 +36,10 @@ interface task-control {
 
 ```wit
 interface observer {
+  on-start: async func(task-id: string, attempt: u32) -> result<_, string>;
   on-heartbeat: async func(task-id: string, info: string) -> result<_, string>;
   on-attempt-failed: async func(event: attempt-failure) -> result<_, string>;
-  on-complete: async func(outcome: task-result) -> result<_, string>;
+  on-terminate: async func(outcome: task-result) -> result<_, string>;
 }
 
 interface worker {
@@ -53,6 +54,23 @@ interface worker {
 - **两者兼具**：同时导入 `producer` 与 `task-control`，并导出 `observer` 与 `worker`。
 
 插件按各组件实际导出的接口分别绑定 `observer` / `worker`，因此上述三类组件均可正常接收回调或执行任务。
+
+## 生命周期回调
+
+observer 导出四个回调，均为独立事件、互不搭载：
+
+| 回调 | 触发时机 | 说明 |
+|---|---|---|
+| `on-start` | 任务每次 attempt 派发到 worker 开始执行时 | 重试会再次触发，`attempt` 用于区分 |
+| `on-heartbeat` | worker 主动调用 `send-heartbeat` 时 | `info` 原样透传，插件不解析 |
+| `on-attempt-failed` | 每次尝试失败时（guest 错误或系统错误） | 任务仍会重试，终态另见 `on-terminate` |
+| `on-terminate` | 任务到达终态（成功或最终失败） | 即原 `on-complete`；`status` 为 `succeeded/failed/dispatch-timeout/execution-timeout/cancelled/max-retries-exceeded` |
+
+回调有两条等价路径，事件语义一致：
+
+- **wasm worker**：插件派发任务后经进程内 channel 直接回调 observer；
+- **external-worker（原生 worker）**：原生 worker 往 `{queue}.events` 发布 JSON 事件
+  （`{"type":"start"|"complete"|"attempt_failed"|"heartbeat","id":...}`），插件订阅后转发给 observer。
 
 ## 配置
 
@@ -87,14 +105,14 @@ Heartbeat 的 `info` 字符串最大为 8 KiB，同一 task 的两次 heartbeat 
 hostInterfaces:
   - namespace: custom
     package: task-queue
-    version: "0.1.0"
+    version: "0.2.0"
     interfaces:
       - producer
     config:
       queue: agent-task
   - namespace: custom
     package: task-queue
-    version: "0.1.0"
+    version: "0.2.0"
     interfaces:
       - task-control
     config:
@@ -117,9 +135,9 @@ Wasm 组件需要同时绑定对应的 WIT import 和 export：
 
 ```wit
 world agent {
-  import custom:task-queue/producer@0.1.0;         // 无名：走主队列
-  import agentq: custom:task-queue/producer@0.1.0;  // label = agentq
-  import reportq: custom:task-queue/producer@0.1.0; // label = reportq
+  import custom:task-queue/producer@0.2.0;         // 无名：走主队列
+  import agentq: custom:task-queue/producer@0.2.0;  // label = agentq
+  import reportq: custom:task-queue/producer@0.2.0; // label = reportq
 }
 ```
 
@@ -130,7 +148,7 @@ world agent {
 hostInterfaces:
   - namespace: custom
     package: task-queue
-    version: "0.1.0"
+    version: "0.2.0"
     interfaces:
       - producer
     config:
@@ -138,7 +156,7 @@ hostInterfaces:
   - namespace: custom
     package: task-queue
     name: agentq                       # 对应 import agentq
-    version: "0.1.0"
+    version: "0.2.0"
     interfaces:
       - producer
     config:
@@ -147,7 +165,7 @@ hostInterfaces:
   - namespace: custom
     package: task-queue
     name: reportq                      # 对应 import reportq
-    version: "0.1.0"
+    version: "0.2.0"
     interfaces:
       - producer
     config:
