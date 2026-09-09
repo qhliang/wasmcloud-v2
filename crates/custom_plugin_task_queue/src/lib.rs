@@ -190,10 +190,19 @@ fn callback_event_summary(event: &CallbackEvent) -> String {
 
 pub struct ComponentData {
     /// 组件主队列（无名 producer / task-control 的默认队列）。
-    queue: String,
+    /// 组件只声明 named producer import 时为 `None`——此时没有无名接口需要
+    /// 默认目标队列，主队列不再是必需项。
+    queue: Option<String>,
     /// named producer import 的路由表：import 名（如 `workflowq`）→ 队列名。
     /// 由 `on_workload_item_bind` 从命名 hostInterfaces 条目构建。
     named_queues: HashMap<String, String>,
+    /// 队列名 → 该队列的完整配置（主队列 + 各 named 队列，同名只存一份）。
+    ///
+    /// 由 `on_workload_item_bind` 按各自 hostInterfaces 条目解析（条目 config
+    /// 覆盖组件级 config），`on_workload_resolved` 建 JetStream 资源时使用。
+    /// 此前建队列一律用 `QueueConfig::new(name)`，导致清单里的 `ack-wait-ms` /
+    /// `retry-backoff-ms` / `max-deliver` / `results-archive` 等全部不生效。
+    queue_configs: HashMap<String, QueueConfig>,
     workload: Option<ResolvedWorkload>,
     cancel_token: CancellationToken,
     /// 外部/原生 worker 模式：队列由独立的原生 worker（如 agent-manager）消费，
@@ -207,8 +216,58 @@ pub struct ComponentData {
 impl ComponentData {
     /// 该组件是否绑定了指定队列（主队列或任一 named 队列）。
     fn serves_queue(&self, queue: &str) -> bool {
-        self.queue == queue || self.named_queues.values().any(|q| q == queue)
+        self.queue.as_deref() == Some(queue) || self.named_queues.values().any(|q| q == queue)
     }
+}
+
+/// 解析组件的 task-queue hostInterfaces 条目，得到主队列名与各队列的完整配置。
+///
+/// 返回 `(主队列名, 队列名 → 配置)`：
+///
+/// - 主队列取自**无名**条目；组件只声明 named producer import 时返回 `None`。
+///   无名条目不是必需的：此时没有无名接口需要默认目标队列（无名 producer 的
+///   linker 只在存在无名条目时才注册，`task-control` 同理走主队列），因此不再
+///   强制要求必须存在无名条目。
+/// - 每个条目独立解析，以组件级 `base_config` 为默认值、条目自身 config 覆盖，
+///   因此不同 named 队列可以有各自的 `ack-wait-ms` / `retry-backoff-ms` /
+///   `max-deliver` / `external-worker`。此前建队列一律用 `QueueConfig::new(name)`，
+///   清单里配置的这些参数全部不生效。
+/// - 多个 label 指向同一队列名时保留先解析到的配置，与 `ensure_queue` 的缓存
+///   语义一致（同名队列只建一次）。
+/// - named 条目漏配 `queue` 时跳过（运行时该 label 解析失败），不阻断绑定。
+fn resolve_queue_configs(
+    base_config: &HashMap<String, String>,
+    entries: &[WitInterface],
+) -> anyhow::Result<(Option<String>, HashMap<String, QueueConfig>)> {
+    let mut primary: Option<String> = None;
+    let mut configs: HashMap<String, QueueConfig> = HashMap::new();
+    for entry in entries {
+        let mut entry_config = base_config.clone();
+        entry_config.extend(entry.config.clone());
+        let config = match &entry.name {
+            None => {
+                if primary.is_some() {
+                    continue;
+                }
+                let config = QueueConfig::from_config(&entry_config)?;
+                primary = Some(config.name.clone());
+                config
+            }
+            Some(name) => {
+                if !entry.config.contains_key("queue") {
+                    warn!(
+                        import = %name,
+                        "task-queue: named hostInterfaces entry has no 'queue' config, \
+                         the named import will fail to resolve at runtime"
+                    );
+                    continue;
+                }
+                QueueConfig::from_config(&entry_config)?
+            }
+        };
+        configs.entry(config.name.clone()).or_insert(config);
+    }
+    Ok((primary, configs))
 }
 
 #[derive(Default)]
@@ -414,7 +473,7 @@ impl TaskQueuePlugin {
         let tracker = self.tracker.read().await;
         tracker
             .get_component_data(component_id)
-            .map(|data| data.queue.clone())
+            .and_then(|data| data.queue.clone())
     }
 
     async fn worker_component(
@@ -1108,6 +1167,11 @@ impl<'a> bindings::custom::task_queue::task_control::Host for ActiveCtx<'a> {
             };
             data.queue.clone()
         };
+        // task-control 是无名接口，只能作用于主队列；组件若只声明了 named
+        // producer import 就没有主队列，此时心跳无目标可发。
+        let Some(queue) = queue else {
+            return Ok(Err("no primary queue configured".into()));
+        };
         if info.len() > HEARTBEAT_MAX_INFO_BYTES {
             return Ok(Err(format!(
                 "info exceeds {HEARTBEAT_MAX_INFO_BYTES} bytes"
@@ -1159,6 +1223,9 @@ impl<'a> bindings::custom::task_queue::task_control::Host for ActiveCtx<'a> {
                 return Ok(false);
             };
             data.queue.clone()
+        };
+        let Some(queue) = queue else {
+            return Ok(false);
         };
         let handles = {
             let queues = plugin.queues.read().await;
@@ -1266,45 +1333,32 @@ impl HostPlugin for TaskQueuePlugin {
             return Ok(());
         };
         let component_id = component.id().to_string();
-        // 主队列取自无名条目（与既有行为一致）；named 条目各自独立成队列。
-        let primary = tq_entries.iter().find(|i| i.name.is_none());
-        let Some(primary) = primary else {
-            anyhow::bail!("task-queue requires an unnamed hostInterfaces entry")
-        };
-        let mut config = component.local_resources().config.clone();
-        config.extend(primary.config.clone());
-        let queue_config = QueueConfig::from_config(&config)?;
+        // 组件级 config（local_resources）作为每个队列条目的默认值来源，条目
+        // 自身的 config 覆盖之。
+        let base_config = component.local_resources().config.clone();
 
-        let mut external_queues = HashSet::new();
-        if config
-            .get("external-worker")
-            .and_then(|value| value.parse::<bool>().ok())
-            .unwrap_or(false)
-        {
-            external_queues.insert(queue_config.name.clone());
-        }
-        for iface in &tq_entries {
-            let Some(name) = &iface.name else { continue };
-            let external = iface
-                .config
-                .get("external-worker")
-                .and_then(|value| value.parse::<bool>().ok())
-                .unwrap_or(false);
-            if external && let Some(q) = named_queues.get(name) {
-                external_queues.insert(q.clone());
-            }
-        }
+        // 主队列取自无名条目（与既有行为一致）；named 条目各自独立成队列，因此
+        // 不同 named 队列可以有各自的 ack-wait / 重试策略。
+        let (primary_queue, queue_configs) = resolve_queue_configs(&base_config, &tq_entries)?;
+
+        // external-worker 是队列级配置，按队列各自解析的结果汇总即可。
+        let external_queues: HashSet<String> = queue_configs
+            .iter()
+            .filter(|(_, config)| config.external_worker)
+            .map(|(name, _)| name.clone())
+            .collect();
 
         debug!(
-            component_id = %component_id, queue = %queue_config.name,
-            named = ?named_queues, external = ?external_queues,
+            component_id = %component_id,
+            queue = ?primary_queue, named = ?named_queues, external = ?external_queues,
             "task-queue: component bound"
         );
         self.tracker.write().await.add_component(
             component,
             ComponentData {
-                queue: queue_config.name.clone(),
+                queue: primary_queue,
                 named_queues,
+                queue_configs,
                 workload: None,
                 cancel_token: CancellationToken::new(),
                 external_queues,
@@ -1319,7 +1373,7 @@ impl HostPlugin for TaskQueuePlugin {
         component_id: &str,
     ) -> anyhow::Result<()> {
         debug!(component_id = %component_id, "task-queue: workload resolved, setting observer workload");
-        let (queue, named_queues, external_queues, cancel_token) = {
+        let (queue_configs, external_queues, cancel_token) = {
             let mut tracker = self.tracker.write().await;
             let Some(data) = tracker.get_component_data_mut(component_id) else {
                 debug!(component_id = %component_id, "task-queue: workload resolved but component not tracked, skipping");
@@ -1331,21 +1385,20 @@ impl HostPlugin for TaskQueuePlugin {
             // 启动的队列/事件循环。此前误用 plugin 级 callback_cancel，导致解绑后
             // 循环永不停止（僵尸队列循环持续消费 agent-task 并调用 call_worker）。
             (
-                data.queue.clone(),
-                data.named_queues.values().cloned().collect::<Vec<_>>(),
+                data.queue_configs.clone(),
                 data.external_queues.clone(),
                 data.cancel_token.child_token(),
             )
         };
-        // 主队列 + 各 named 队列（去重，named 可能与主队列同名）。
-        let mut targets = vec![queue.clone()];
-        targets.extend(named_queues);
-        targets.sort();
-        targets.dedup();
-        debug!(component_id = %component_id, queues = ?targets, "task-queue: workload resolved, starting loops");
-        for target in targets {
+        // 主队列 + 各 named 队列（按队列名排序，保证多队列的启动顺序确定）。
+        let mut targets: Vec<(String, QueueConfig)> = queue_configs.into_iter().collect();
+        targets.sort_by(|a, b| a.0.cmp(&b.0));
+        debug!(component_id = %component_id, queues = ?targets.iter().map(|(name, _)| name).collect::<Vec<_>>(), "task-queue: workload resolved, starting loops");
+        for (target, config) in targets {
             let external = external_queues.contains(&target);
-            let config = QueueConfig::new(target.clone());
+            // 使用 bind 阶段解析出的完整配置建队列。此前此处用
+            // `QueueConfig::new(target)`，队列参数全部回落到默认值，清单里配的
+            // ack-wait-ms / retry-backoff-ms / max-deliver / results-archive 不生效。
             let handles = self.ensure_queue(config).await?;
             // 外部/原生 worker 模式下，队列由独立原生 worker（agent-manager /
             // workflow-manager）消费，插件不启动 JetStream dispatcher，避免与
@@ -1475,5 +1528,100 @@ mod tests {
             status_variant(&TaskState::Cancelled),
             CoreTaskStatus::Cancelled
         ));
+    }
+
+    /// 构造一个 `custom:task-queue` 的 hostInterfaces 条目用于解析测试。
+    fn tq_entry(name: Option<&str>, config: &[(&str, &str)]) -> WitInterface {
+        WitInterface {
+            namespace: "custom".to_string(),
+            package: "task-queue".to_string(),
+            interfaces: ["producer".to_string()].into_iter().collect(),
+            version: None,
+            config: config
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            name: name.map(str::to_string),
+        }
+    }
+
+    /// 只用 named producer import 的组件没有主队列——无名条目不再强制要求。
+    #[test]
+    fn named_only_component_has_no_primary_queue() {
+        let (primary, configs) = resolve_queue_configs(
+            &HashMap::new(),
+            &[tq_entry(Some("agentq"), &[("queue", "agent-task")])],
+        )
+        .expect("named-only component should bind");
+        assert_eq!(primary, None);
+        assert!(configs.contains_key("agent-task"));
+    }
+
+    /// 每个条目独立解析配置，因此 named 队列可以有与主队列不同的队列参数。
+    #[test]
+    fn named_queues_resolve_their_own_config() {
+        let (primary, configs) = resolve_queue_configs(
+            &HashMap::new(),
+            &[
+                tq_entry(None, &[("queue", "main"), ("ack-wait-ms", "30000")]),
+                tq_entry(
+                    Some("heavy"),
+                    &[("queue", "heavy-task"), ("ack-wait-ms", "120000")],
+                ),
+            ],
+        )
+        .expect("valid entries");
+        assert_eq!(primary.as_deref(), Some("main"));
+        assert_eq!(configs["main"].ack_wait, Duration::from_millis(30_000));
+        assert_eq!(
+            configs["heavy-task"].ack_wait,
+            Duration::from_millis(120_000)
+        );
+    }
+
+    /// named 条目漏配 `queue` 时跳过，不阻断其余条目的解析。
+    #[test]
+    fn named_entry_without_queue_is_skipped() {
+        let (primary, configs) = resolve_queue_configs(
+            &HashMap::new(),
+            &[
+                tq_entry(None, &[("queue", "main")]),
+                tq_entry(Some("orphan"), &[("ack-wait-ms", "120000")]),
+            ],
+        )
+        .expect("valid entries");
+        assert_eq!(primary.as_deref(), Some("main"));
+        assert_eq!(configs.len(), 1, "orphan entry must not create a queue");
+    }
+
+    /// 多个 label 指向同一队列时只保留一份配置（与 ensure_queue 缓存语义一致）。
+    #[test]
+    fn duplicate_queue_names_keep_one_config() {
+        let (_, configs) = resolve_queue_configs(
+            &HashMap::new(),
+            &[
+                tq_entry(Some("first"), &[("queue", "shared")]),
+                tq_entry(Some("second"), &[("queue", "shared")]),
+            ],
+        )
+        .expect("valid entries");
+        assert_eq!(configs.len(), 1);
+    }
+
+    /// 没有主队列时，组件仍应通过 named 队列被识别为该队列的观察者/生产者。
+    #[test]
+    fn serves_queue_matches_named_queue_without_primary() {
+        let data = ComponentData {
+            queue: None,
+            named_queues: [("agentq".to_string(), "agent-task".to_string())]
+                .into_iter()
+                .collect(),
+            queue_configs: HashMap::new(),
+            workload: None,
+            cancel_token: CancellationToken::new(),
+            external_queues: HashSet::new(),
+        };
+        assert!(data.serves_queue("agent-task"));
+        assert!(!data.serves_queue("other-task"));
     }
 }

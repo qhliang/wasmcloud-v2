@@ -4,7 +4,7 @@
 
 ## 核心流程
 
-1. **绑定阶段**：组件声明导入 `custom:task-queue/producer` 或 `custom:task-queue/task-control`。插件读取 host-interface 配置，解析并校验队列配置。
+1. **绑定阶段**：组件声明导入 `custom:task-queue/producer` 或 `custom:task-queue/task-control`（`producer` 支持 named 多实例，见「named producer 多队列」）。插件读取 host-interface 配置，解析并校验队列配置。
 2. **解析阶段**：组件 workload 解析成功后，插件为队列懒创建 JetStream 资源，并启动 durable pull consumer 的消费循环。
 3. **生产阶段**：生产者调用 `submit()`，插件生成 UUIDv7 task id，写入 META KV，再发布 TASKS 消息。调用方还可以使用 `query-status()` 和 `cancel-task()`。
 4. **执行阶段**：消费者调用 `handle-task()` 处理任务。宿主每 10 秒发送一次 JetStream lease 续期；失败时 `Err` 会触发重试，最终次数耗尽后产生终态。
@@ -85,10 +85,18 @@ Heartbeat 的 `info` 字符串最大为 8 KiB，同一 task 的两次 heartbeat 
 
 ```yaml
 hostInterfaces:
-  - name: custom:task-queue/producer
+  - namespace: custom
+    package: task-queue
+    version: "0.1.0"
+    interfaces:
+      - producer
     config:
       queue: agent-task
-  - name: custom:task-queue/task-control
+  - namespace: custom
+    package: task-queue
+    version: "0.1.0"
+    interfaces:
+      - task-control
     config:
       queue: agent-task
       retry-backoff-ms: "1000,5000,15000,60000"
@@ -98,6 +106,68 @@ Wasm 组件需要同时绑定对应的 WIT import 和 export：
 
 - 生产者：import `custom:task-queue/producer`，export `custom:task-queue/observer`
 - 消费者：import `custom:task-queue/task-control`，export `custom:task-queue/worker`
+
+同一队列的多个绑定必须使用一致配置：插件按队列名缓存 JetStream 句柄，同名队列只按
+先解析到的配置创建一次。
+
+## named producer 多队列
+
+一个组件可以多次导入同一个 `producer` 接口，用不同的 import 名（即 `(implements ..)`
+的 label）分别路由到不同的 JetStream 队列：
+
+```wit
+world agent {
+  import custom:task-queue/producer@0.1.0;         // 无名：走主队列
+  import agentq: custom:task-queue/producer@0.1.0;  // label = agentq
+  import reportq: custom:task-queue/producer@0.1.0; // label = reportq
+}
+```
+
+清单里为每条 label 声明一个 `name` 相同的 hostInterfaces 条目，其 `config.queue`
+即该 import 的目标队列：
+
+```yaml
+hostInterfaces:
+  - namespace: custom
+    package: task-queue
+    version: "0.1.0"
+    interfaces:
+      - producer
+    config:
+      queue: agent-task                # 无名条目 → 主队列
+  - namespace: custom
+    package: task-queue
+    name: agentq                       # 对应 import agentq
+    version: "0.1.0"
+    interfaces:
+      - producer
+    config:
+      queue: agent-task-heavy
+      ack-wait-ms: "120000"            # 可与主队列不同
+  - namespace: custom
+    package: task-queue
+    name: reportq                      # 对应 import reportq
+    version: "0.1.0"
+    interfaces:
+      - producer
+    config:
+      queue: report-task
+      external-worker: "true"          # 该队列交给原生 worker 消费
+```
+
+要点：
+
+- 只有 `producer` 支持 named 多实例。`task-control`、`observer`、`worker` 目前不支持
+  —— 心跳、取消与 observer 回调始终作用于主队列。
+- 无名条目**可选**：组件若只导入 named producer、也不使用 `task-control`，可以省略它。
+  一旦省略，主队列为空，`task-control` 的 `send-heartbeat` 会返回
+  `no primary queue configured`、`is-cancelled` 恒为 `false`。
+- 每个条目（含 named 条目）独立解析配置，且都继承组件的 `localResources` config 作为
+  默认值；未配置的键回落默认值。因此不同队列可以有各自的 `ack-wait-ms`、
+  `retry-backoff-ms`、`max-deliver`、`results-archive`、`external-worker`。
+- 多个 label 指向同一队列名时，该队列按先解析到的配置只创建一次。
+- 若某条 named 条目漏配 `queue`，插件在绑定阶段跳过它并打印 warn；运行时该 label 的
+  调用会报 `no queue configured for named task-queue import '<name>'`。
 
 ## 宿主集成
 
