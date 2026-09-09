@@ -316,11 +316,6 @@ impl CliCommand for DevCommand {
             host_builder.with_plugin(Arc::new(custom_plugin_event_monitor::EventMonitor::new()))?;
         debug!("Event monitor plugin enabled");
 
-        // Enable workflow plugin
-        host_builder =
-            host_builder.with_plugin(Arc::new(custom_plugin_workflow::WorkflowPlugin::new()))?;
-        debug!("Workflow plugin enabled");
-
         // Enable durable task queue plugin. Unlike other data-plane plugins,
         // it requires JetStream and must not silently fall back to memory.
         if let Some(client) = &data_nats_client {

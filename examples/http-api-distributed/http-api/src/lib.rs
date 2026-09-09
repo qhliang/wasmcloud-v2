@@ -25,7 +25,6 @@ mod task;
 mod telegram;
 mod templates;
 mod wechat;
-mod workflow;
 
 use bindings::wasi::logging::logging::{Level, log};
 use wstd::http::{Body, Request, Response, StatusCode};
@@ -169,64 +168,6 @@ impl bindings::exports::custom::event_monitor::handler::Guest for CustomHandler 
     }
 }
 
-impl bindings::exports::custom::workflow::handler::Guest for CustomHandler {
-    async fn on_start(exec_id: String, pid: String) -> Result<(), String> {
-        log(
-            Level::Info,
-            LOG_CTX,
-            &format!("WF ON_START: exec_id={}, pid={}", exec_id, pid),
-        );
-        Ok(())
-    }
-
-    async fn on_message(
-        exec_id: String,
-        pid: String,
-        message: Vec<bindings::custom::workflow::types::VarPair>,
-    ) -> Result<(), String> {
-        log(
-            Level::Info,
-            LOG_CTX,
-            &format!(
-                "WF ON_MSG: exec_id={}, pid={}, vars={}",
-                exec_id,
-                pid,
-                message.len()
-            ),
-        );
-        Ok(())
-    }
-
-    async fn on_complete(
-        exec_id: String,
-        pid: String,
-        outputs: Vec<bindings::custom::workflow::types::VarPair>,
-    ) -> Result<(), String> {
-        log(
-            Level::Info,
-            LOG_CTX,
-            &format!(
-                "WF ON_COMPLETE: exec_id={}, pid={}, outputs={}",
-                exec_id,
-                pid,
-                outputs.len()
-            ),
-        );
-        Ok(())
-    }
-
-    async fn on_error(exec_id: String, pid: String, error: String) -> Result<(), String> {
-        log(
-            Level::Info,
-            LOG_CTX,
-            &format!(
-                "WF ON_ERROR: exec_id={}, pid={}, error={}",
-                exec_id, pid, error
-            ),
-        );
-        Ok(())
-    }
-}
 #[wstd::http_server]
 async fn main(req: Request<Body>) -> anyhow::Result<Response<Body>> {
     let path = req.uri().path();
@@ -346,10 +287,6 @@ async fn main(req: Request<Body>) -> anyhow::Result<Response<Body>> {
         "/event-monitor/unwatch" => event_monitor::unwatch_resources(req).await,
         "/event-monitor/log/clear" => event_monitor::clear_log(req).await,
         "/event-monitor/log" => event_monitor::get_log(req).await,
-        "/workflow" | "/workflow/" => workflow::home(req).await,
-        "/workflow/start" => workflow::start(req).await,
-        "/workflow/list" => workflow::list(req).await,
-        "/workflow/status" => workflow::status(req).await,
         _ => {
             log(Level::Debug, LOG_CTX, &format!("Not found: {}", path));
 

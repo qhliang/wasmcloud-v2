@@ -15,7 +15,6 @@ members = [
     "crates/custom_plugin_wechat",
     "crates/custom_plugin_telegram",
     "crates/custom_plugin_event_monitor",
-    "crates/custom_plugin_workflow",
     "crates/custom_plugin_task_queue",
     "crates/task_queue_core",
     "crates/task_queue_worker",

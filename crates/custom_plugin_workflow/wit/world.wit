@@ -1,6 +1,0 @@
-package my:workflow;
-
-world workflow {
-    import custom:workflow/manager@0.3.0;
-    export custom:workflow/handler@0.3.0;
-}

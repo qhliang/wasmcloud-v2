@@ -5,7 +5,6 @@ use clap::Args;
 use custom_plugin_cf_d1::CloudflareD1;
 use custom_plugin_event_monitor::EventMonitor;
 use custom_plugin_llm_gateway_provider::LlmGateway;
-use custom_plugin_workflow::WorkflowPlugin;
 use tracing::info;
 use wash_runtime::{
     engine::{Engine, WasmProposal},
@@ -568,10 +567,6 @@ impl CliCommand for HostCommand {
         // Enable event monitor plugin
         cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(EventMonitor::new()))?;
         tracing::info!("Event monitor plugin enabled");
-
-        // Enable workflow plugin
-        cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(WorkflowPlugin::new()))?;
-        tracing::info!("Workflow plugin enabled");
 
         // Enable durable task queue plugin
         cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(
