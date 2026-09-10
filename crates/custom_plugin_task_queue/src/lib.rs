@@ -1159,7 +1159,7 @@ impl<'a> bindings::custom::task_queue::producer::Host for ActiveCtx<'a> {
     }
 }
 
-/// named producer 实例（`import <name>: custom:task-queue/producer@0.1.0;`）。
+/// named producer 实例（`import <name>: custom:task-queue/producer@0.2.0;`）。
 /// 目标队列由 [`QueueId`] 携带（bind 阶段按 import 名从清单配置解析），
 /// 因此调用方无法误投到其他队列。
 impl<'a> bindings::named_imports::custom::task_queue::producer::Host for ActiveCtx<'a> {
@@ -1298,10 +1298,10 @@ impl HostPlugin for TaskQueuePlugin {
     fn world(&self) -> WitWorld {
         WitWorld {
             imports: HashSet::from([WitInterface::from(
-                "custom:task-queue/producer,task-control,types@0.1.0",
+                "custom:task-queue/producer,task-control,types@0.2.0",
             )]),
             exports: HashSet::from([WitInterface::from(
-                "custom:task-queue/observer,worker@0.1.0",
+                "custom:task-queue/observer,worker@0.2.0",
             )]),
         }
     }
