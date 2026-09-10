@@ -82,14 +82,16 @@ runner.run(shutdown).await?;
 
 业务代码实现 `Worker::handle_task`，并在长任务检查点先调用 `is_cancelled()`，再发送 heartbeat 和执行下一分片。返回 `Some(output)` 表示成功；`TaskError::guest` 表示可恢复业务失败，会按 backoff 重试；`TaskError::system` 表示系统/deadline 失败。heartbeat 与 JetStream `Progress` 租约续期互不替代。
 
-除业务 heartbeat 外，`WorkerRunner` 还会向 `{queue}.events` 发布生命周期事件（fire-and-forget，不阻塞执行与 ack）：
+`WorkerRunner` 与业务代码会向 `{queue}.events` 发布事件（fire-and-forget，不阻塞执行与 ack）：
 
 | 事件 | 时机 | 负载 |
 |---|---|---|
 | `start` | 每次投递开始执行 `handle_task` 前 | `{"type":"start","id":...,"attempt":N}` |
-| `attempt_failed` | 每次失败（guest/system）及任何 Term 终止前 | `{"type":"attempt_failed","id":...,"attempt":N,"source":"guest|system","error":...}` |
+| `attempt_failed` | 每次失败前（含重试 Nak 与任何 Term 终止前） | `{"type":"attempt_failed","id":...,"attempt":N,"source":"guest|system","error":...}` |
+| `heartbeat` | 业务代码在检查点调用 `send_heartbeat()` | `{"type":"heartbeat","id":...,"info":"..."}` |
+| `complete` | 任务终态：成功 ack 前、重试耗尽、system 失败或 pre-decode 失败 | `{"type":"complete","id":...,"attempt":N,"status":"succeeded|failed|execution-timeout|max-retries-exceeded","output":"<base64>","error":...}` |
 
-宿主插件订阅 `{queue}.events` 后把它们转发给生产者 observer 的 `on-start` / `on-attempt-failed` 回调；终态结果（成功或最终失败）由宿主在取消/重试耗尽后发布，对应 `on-terminate`。
+宿主插件订阅 `{queue}.events` 后把它们转发给生产者 observer 的 `on-start` / `on-attempt-failed` / `on-heartbeat` / `on-terminate` 回调。runner 保证 `complete`（对应 `on-terminate`）**一定在 ack 之前发布**：worker 可通过 `TaskContext::publish_terminate` 上报自定义终态（status/output/error），未手动上报时 runner 在 ack 路径按结果自动补发（`Ok` → `succeeded`；重试耗尽 → `max-retries-exceeded`；system 失败超过 execution deadline → `execution-timeout`，否则 `failed`），且每条投递恰好发布一次。
 
 示例中的 `LongRunningWorker` 展示了长任务骨架：
 

@@ -39,6 +39,10 @@ pub struct TaskContext {
     heartbeat: async_nats::Client,
     subject: String,
     cancellation: tokio_util::sync::CancellationToken,
+    /// Set once the terminal `complete` event has been published. Shared
+    /// across clones so a worker that spawns the context into background
+    /// tasks still deduplicates against the runner's ack-path fallback.
+    terminate_published: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TaskContext {
@@ -60,6 +64,7 @@ impl TaskContext {
             heartbeat,
             subject,
             cancellation,
+            terminate_published: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -67,6 +72,67 @@ impl TaskContext {
         Task {
             payload: self.payload.clone(),
         }
+    }
+
+    /// Whether the terminal `complete` control event has been published.
+    ///
+    /// Deliberately private: the exactly-once guarantee is enforced inside
+    /// [`Self::publish_terminate`], so callers never need to poll this flag.
+    /// Exposing it would only invite business code to build their own
+    /// terminate state machines on top of the runner's.
+    fn terminate_published(&self) -> bool {
+        self.terminate_published
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Publishes the terminal `complete` control event on `{queue}.events`.
+    ///
+    /// Exactly-once per delivery: the first *successful* publish wins and
+    /// later calls are no-ops. A failed publish clears the flag again so a
+    /// caller (typically the runner's ack-path fallback) can retry, keeping
+    /// the runner's "terminate before ack" guarantee reachable.
+    ///
+    /// `status` serializes with the kebab-case spelling the host plugin's
+    /// `parse_control_event` expects (`succeeded`, `max-retries-exceeded`,
+    /// ...). `output`, when present, is base64-encoded into the event.
+    pub async fn publish_terminate(
+        &self,
+        status: crate::types::TaskStatus,
+        output: Option<Vec<u8>>,
+        error: Option<String>,
+    ) -> Result<(), TaskError> {
+        if self.terminate_published() {
+            return Ok(());
+        }
+        crate::events::publish_control_event(
+            &self.heartbeat,
+            self.subject.clone(),
+            crate::events::complete_event(
+                &self.task_id,
+                self.attempt,
+                status,
+                output.as_deref(),
+                error.as_deref(),
+            ),
+        )
+        .await?;
+        self.terminate_published
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Publishes an `attempt_failed` control event on `{queue}.events`.
+    ///
+    /// `source` is `"guest"` for recoverable business failures and
+    /// `"system"` for infrastructure/deadline failures, mirroring the host
+    /// plugin's `AttemptErrorSource` mapping.
+    pub async fn publish_attempt_failed(&self, source: &str, error: &str) -> Result<(), TaskError> {
+        crate::events::publish_control_event(
+            &self.heartbeat,
+            self.subject.clone(),
+            crate::events::attempt_failed_event(&self.task_id, self.attempt, source, error),
+        )
+        .await
     }
 }
 
@@ -77,19 +143,14 @@ impl HeartbeatSink for TaskContext {
         if info.len() > crate::config::HEARTBEAT_MAX_INFO_BYTES {
             return Err(TaskError::guest("heartbeat exceeds maximum size"));
         }
-        let event = HeartbeatEvent {
-            task_id: self.task_id.clone(),
-            attempt: self.attempt,
-            timestamp_ms: crate::nats::now_ms(),
-            info,
-            producer: None,
-        };
-        let raw = serde_json::to_vec(&event)
-            .map_err(|err| TaskError::system(format!("failed to encode heartbeat: {err}")))?;
-        self.heartbeat
-            .publish(self.subject.clone(), raw.into())
-            .await
-            .map_err(|err| TaskError::system(format!("failed to publish heartbeat: {err}")))
+        // The payload follows the `{queue}.events` control-event contract so
+        // the host plugin can forward it to the observer's `on-heartbeat`.
+        crate::events::publish_control_event(
+            &self.heartbeat,
+            self.subject.clone(),
+            crate::events::heartbeat_event(&self.task_id, &info),
+        )
+        .await
     }
 }
 

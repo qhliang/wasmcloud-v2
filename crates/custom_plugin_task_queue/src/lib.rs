@@ -26,7 +26,9 @@ use wash_runtime::wit::WitInterface;
 use task_queue_core::config::{
     HEARTBEAT_MAX_INFO_BYTES, HEARTBEAT_MIN_INTERVAL_MS, PAYLOAD_MAX_BYTES,
 };
-use task_queue_core::events::{SCHEMA_VERSION as EVENT_SCHEMA_VERSION, TaskResultEvent};
+use task_queue_core::events::{
+    ControlEvent, SCHEMA_VERSION as EVENT_SCHEMA_VERSION, TaskResultEvent,
+};
 use task_queue_core::nats::{AckAction, QueueHandles, now_ms};
 use task_queue_core::queue::{TaskProducer, status_variant};
 use task_queue_core::types::base64_encode;
@@ -40,7 +42,7 @@ mod bindings {
         imports: { default: async | trappable | tracing },
         exports: { default: async | trappable | tracing },
         // `custom:task-queue/producer` 支持 named 多实例：一个组件可多次 import
-        // 同一接口（`import agentq: custom:task-queue/producer@0.1.0;` 等），
+        // 同一接口（`import agentq: custom:task-queue/producer@0.2.0;` 等），
         // 每个命名实例经清单中对应 hostInterfaces 条目的 `queue` 配置路由到
         // 各自的 JetStream 队列。运行时按 import 名解析出 [`QueueId`] 注入
         // Host 方法；无名 import 走组件主队列，行为不变。
@@ -854,7 +856,7 @@ impl TaskQueuePlugin {
         queue: &str,
         cancel: CancellationToken,
     ) {
-        let subject = format!("{queue}.events");
+        let subject = ControlEvent::subject(queue);
         let queue = queue.to_string();
         let client = (*self.client).clone();
         let plugin = self.clone();

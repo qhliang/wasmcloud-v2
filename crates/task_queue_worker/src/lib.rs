@@ -13,7 +13,7 @@ use futures::StreamExt as _;
 use task_queue_core::config::QueueConfig;
 use task_queue_core::events::ControlEvent;
 use task_queue_core::nats::{AckAction, QueueHandles, now_ms};
-use task_queue_core::types::{TaskEnvelope, TaskError, TaskErrorSource};
+use task_queue_core::types::{TaskEnvelope, TaskError, TaskErrorSource, TaskStatus};
 use task_queue_core::worker::{SharedWorker, TaskContext, Worker};
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
@@ -243,7 +243,10 @@ impl WorkerRunner {
                 // A delivery that is terminated without success must still be
                 // reported, otherwise the producer's observer never learns the
                 // task is gone and any execution it tracks stays pending.
-                self.publish_attempt_failed(&task_id, attempt, "system", &err.to_string())
+                let error = err.to_string();
+                self.publish_attempt_failed(&task_id, attempt, "system", &error)
+                    .await;
+                self.publish_pre_context_terminate(&task_id, attempt, &error)
                     .await;
                 let _ = AckAction::Term.apply(&acker).await;
                 return;
@@ -254,7 +257,10 @@ impl WorkerRunner {
             Ok(payload) => payload,
             Err(err) => {
                 tracing::warn!(task_id = %task_id, err = %err, "invalid task payload");
-                self.publish_attempt_failed(&task_id, attempt, "system", &err.to_string())
+                let error = err.to_string();
+                self.publish_attempt_failed(&task_id, attempt, "system", &error)
+                    .await;
+                self.publish_pre_context_terminate(&task_id, attempt, &error)
                     .await;
                 let _ = AckAction::Term.apply(&acker).await;
                 return;
@@ -270,7 +276,7 @@ impl WorkerRunner {
             envelope.execution_deadline_ms(),
             task_queue_core::types::Task { payload },
             self.handles.jetstream.client().clone(),
-            heartbeat_subject(&self.handles.config.name),
+            ControlEvent::subject(&self.handles.config.name),
             cancellation,
         );
         let renew_acker = acker.clone();
@@ -300,21 +306,54 @@ impl WorkerRunner {
 
         // Progress must continue even when the business heartbeat fails.
         let _started_at_ms = now_ms();
+        // The runner keeps a shared clone so the ack path can enforce the
+        // "terminate before ack" guarantee after `handle_task` returns: every
+        // branch below calls `publish_terminate` (idempotent) before applying
+        // its ack action.
+        let ack_context = context.clone();
         let result = self.worker.handle_task(context).await;
         renew_cancel.cancel();
         let _ = renewer.await;
 
         let action = match result {
             // Completed side effects and output are considered accepted.
-            Ok(_) => AckAction::Ack,
+            Ok(output) => {
+                // publish_terminate is idempotent: a worker that already
+                // reported its own terminal state is never overwritten.
+                if let Err(err) = ack_context
+                    .publish_terminate(TaskStatus::Succeeded, output, None)
+                    .await
+                {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        err = %err,
+                        "failed to publish success terminate"
+                    );
+                }
+                AckAction::Ack
+            }
             // Guest errors are recoverable until the delivery budget is spent.
             Err(TaskError {
                 source: TaskErrorSource::Guest,
                 message,
             }) => {
+                ack_context
+                    .publish_attempt_failed("guest", &message)
+                    .await
+                    .unwrap_or_else(|err| {
+                        tracing::warn!(task_id = %task_id, err = %err, "failed to publish guest attempt_failed");
+                    });
                 if attempt >= self.handles.config.max_deliver.max(1) as u32 {
-                    self.publish_attempt_failed(&task_id, attempt, "guest", &message)
-                        .await;
+                    if let Err(err) = ack_context
+                        .publish_terminate(TaskStatus::MaxRetriesExceeded, None, Some(message))
+                        .await
+                    {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            err = %err,
+                            "failed to publish max-retries terminate"
+                        );
+                    }
                     AckAction::Term
                 } else {
                     AckAction::Nak(Some(self.handles.config.backoff_for_attempt(attempt)))
@@ -323,8 +362,30 @@ impl WorkerRunner {
             // Deadlines and infrastructure failures should not spin on retries.
             Err(err) => {
                 tracing::warn!(task_id = %task_id, err = %err, "worker system failure");
-                self.publish_attempt_failed(&task_id, attempt, "system", &err.to_string())
-                    .await;
+                let message = err.to_string();
+                ack_context
+                    .publish_attempt_failed("system", &message)
+                    .await
+                    .unwrap_or_else(|publish_err| {
+                        tracing::warn!(task_id = %task_id, err = %publish_err, "failed to publish system attempt_failed");
+                    });
+                // A system failure past the execution deadline is reported
+                // as an execution timeout; anything else is a plain failure.
+                let status = if now_ms() > ack_context.execution_deadline_ms {
+                    TaskStatus::ExecutionTimeout
+                } else {
+                    TaskStatus::Failed
+                };
+                if let Err(publish_err) = ack_context
+                    .publish_terminate(status, None, Some(message))
+                    .await
+                {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        err = %publish_err,
+                        "failed to publish system terminate"
+                    );
+                }
                 AckAction::Term
             }
         };
@@ -345,21 +406,13 @@ impl WorkerRunner {
     /// advisory (core NATS, fire-and-forget) and must never block the ack.
     async fn publish_attempt_failed(&self, task_id: &str, attempt: u32, source: &str, error: &str) {
         let subject = ControlEvent::subject(&self.handles.config.name);
-        let payload = serde_json::json!({
-            "type": "attempt_failed",
-            "id": task_id,
-            "attempt": attempt,
-            "source": source,
-            "error": error,
-        })
-        .to_string()
-        .into_bytes();
-        if let Err(err) = self
-            .handles
-            .jetstream
-            .client()
-            .publish(subject, payload.into())
-            .await
+        let value = task_queue_core::events::attempt_failed_event(task_id, attempt, source, error);
+        if let Err(err) = task_queue_core::events::publish_control_event(
+            &self.handles.jetstream.client(),
+            subject,
+            value,
+        )
+        .await
         {
             tracing::warn!(
                 task_id = %task_id,
@@ -369,24 +422,47 @@ impl WorkerRunner {
         }
     }
 
+    /// Publishes the terminal `complete` event for failures that happen
+    /// before a [`TaskContext`] exists (malformed envelope or payload), where
+    /// the context-level [`TaskContext::publish_terminate`] is unavailable.
+    /// Keeps the runner invariant that every Term path reports a terminal
+    /// result; publishing is advisory (core NATS, fire-and-forget).
+    async fn publish_pre_context_terminate(&self, task_id: &str, attempt: u32, error: &str) {
+        let subject = ControlEvent::subject(&self.handles.config.name);
+        let value = task_queue_core::events::complete_event(
+            task_id,
+            attempt,
+            TaskStatus::Failed,
+            None,
+            Some(error),
+        );
+        if let Err(err) = task_queue_core::events::publish_control_event(
+            &self.handles.jetstream.client(),
+            subject,
+            value,
+        )
+        .await
+        {
+            tracing::warn!(
+                task_id = %task_id,
+                err = %err,
+                "failed to publish pre-context terminate event"
+            );
+        }
+    }
+
     /// Reports that a delivery is starting execution via `{queue}.events`,
     /// mirroring the host plugin's `on-start` callback. Publishing is
     /// advisory (core NATS, fire-and-forget) and must never block execution.
     async fn publish_start(&self, task_id: &str, attempt: u32) {
         let subject = ControlEvent::subject(&self.handles.config.name);
-        let payload = serde_json::json!({
-            "type": "start",
-            "id": task_id,
-            "attempt": attempt,
-        })
-        .to_string()
-        .into_bytes();
-        if let Err(err) = self
-            .handles
-            .jetstream
-            .client()
-            .publish(subject, payload.into())
-            .await
+        let value = task_queue_core::events::start_event(task_id, attempt);
+        if let Err(err) = task_queue_core::events::publish_control_event(
+            &self.handles.jetstream.client(),
+            subject,
+            value,
+        )
+        .await
         {
             tracing::warn!(task_id = %task_id, err = %err, "failed to publish start event");
         }
@@ -415,10 +491,6 @@ async fn drain(in_flight: &mut JoinSet<()>) {
         in_flight.abort_all();
         while in_flight.join_next().await.is_some() {}
     }
-}
-
-pub fn heartbeat_subject(queue: &str) -> String {
-    format!("{queue}.heartbeat")
 }
 
 pub fn task_context(worker: impl Worker + 'static) -> SharedWorker {

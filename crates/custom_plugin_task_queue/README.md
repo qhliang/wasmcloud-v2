@@ -71,6 +71,8 @@ observer 导出四个回调，均为独立事件、互不搭载：
 - **wasm worker**：插件派发任务后经进程内 channel 直接回调 observer；
 - **external-worker（原生 worker）**：原生 worker 往 `{queue}.events` 发布 JSON 事件
   （`{"type":"start"|"complete"|"attempt_failed"|"heartbeat","id":...}`），插件订阅后转发给 observer。
+  参考实现 `task_queue_worker` crate 覆盖全部四类事件，并保证 `complete` 在 ack 之前发布；
+  自研 worker 应遵循同一契约。
 
 ## 配置
 
