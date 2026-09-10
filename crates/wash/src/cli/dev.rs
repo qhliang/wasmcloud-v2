@@ -275,12 +275,6 @@ impl CliCommand for DevCommand {
             host_builder.with_plugin(Arc::new(custom_plugin_cf_d1::CloudflareD1::new()))?;
         debug!("Cloudflare D1 plugin enabled");
 
-        // Enable LLM gateway plugin
-        host_builder = host_builder.with_plugin(Arc::new(
-            custom_plugin_llm_gateway_provider::LlmGateway::new(),
-        ))?;
-        debug!("LLM gateway plugin enabled");
-
         // Enable crontab plugin
         host_builder = host_builder.with_plugin(Arc::new(custom_plugin_crontab::Crontab::new()))?;
         debug!("Crontab plugin enabled");
@@ -293,10 +287,6 @@ impl CliCommand for DevCommand {
         // Enable feishu plugin
         host_builder = host_builder.with_plugin(Arc::new(custom_plugin_feishu::Feishu::new()))?;
         debug!("Feishu plugin enabled");
-
-        // Enable codex plugin
-        host_builder = host_builder.with_plugin(Arc::new(custom_plugin_codex::Codex::new()))?;
-        debug!("Codex plugin enabled");
 
         // Enable wechat plugin
         host_builder = host_builder.with_plugin(Arc::new(custom_plugin_wechat::Wechat::new()))?;

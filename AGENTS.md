@@ -29,7 +29,7 @@ cargo xtask build-fixtures                 # 生成 wash-runtime 集成测试所
   - `engine/` — 引擎和组件实例化 (`ctx.rs`, `workload.rs`)
 - `crates/custom_plugin_*` — 宿主端插件，编译进宿主二进制：
   - 存储/基础设施：`kv`, `blobstore`, `cf_d1`, `nats_utils`, `event_monitor`
-  - LLM/通信：`llm_gateway_provider`, `mail`, `codex`
+  - 通信：`mail`
   - 调度：`crontab`, `task_queue`
   - IM：`dingtalk_stream`, `feishu`, `wechat`, `telegram`
 - `crates/task_queue_core/` — task queue 共享核心库：协议类型、`QueueConfig`、JetStream 资源命名、META KV 读写、任务提交/取消、结果 schema 与重试退避；宿主插件与 native worker 共用，避免协议漂移

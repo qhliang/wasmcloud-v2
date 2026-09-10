@@ -10,7 +10,6 @@ mod bindings {
     export!(CustomHandler);
 }
 
-mod codex;
 mod crontab;
 mod d1;
 mod dingtalk;
@@ -18,7 +17,6 @@ mod event_monitor;
 mod feishu;
 mod helpers;
 mod kv;
-mod llm;
 mod mail;
 mod r2;
 mod task;
@@ -102,31 +100,23 @@ impl bindings::exports::custom::wechat::handler::Guest for CustomHandler {
 
         let prompt = msg.text_content.as_deref().unwrap_or("");
         if prompt.is_empty() {
-            log(
-                Level::Warn,
-                LOG_CTX,
-                "WECHAT: empty message, skipping codex",
-            );
+            log(Level::Warn, LOG_CTX, "WECHAT: empty message, skipping reply");
             return Ok(());
         }
 
-        let reply = match codex::execute_for_chat(&msg.sender, prompt) {
-            Ok(text) => text,
-            Err(e) => {
-                log(Level::Error, LOG_CTX, &format!("WECHAT CODEX ERROR: {e}"));
-                format!("处理消息时出错: {e}")
-            }
-        };
+        // The codex / LLM gateway host plugins were removed from this fork, so
+        // the demo acknowledges the message instead of running an agent.
+        let reply = format!("收到: {prompt}");
 
         match client.send_text(&msg.sender, &reply) {
             Ok(()) => {
-                log(Level::Info, LOG_CTX, "WECHAT CODEX REPLY sent");
+                log(Level::Info, LOG_CTX, "WECHAT REPLY sent");
             }
             Err(e) => {
                 log(
                     Level::Error,
                     LOG_CTX,
-                    &format!("WECHAT CODEX REPLY failed: {:?}", e),
+                    &format!("WECHAT REPLY failed: {:?}", e),
                 );
             }
         }
@@ -196,8 +186,6 @@ async fn main(req: Request<Body>) -> anyhow::Result<Response<Body>> {
         "/r2/object/get" => r2::object_get(req).await,
         "/r2/object/put" => r2::object_put(req).await,
         "/r2/object/delete" => r2::object_delete(req).await,
-        "/llm" | "/llm/" => llm::home(req).await,
-        "/llm/chat" => llm::chat(req).await,
         "/crontab" | "/crontab/" => crontab::home(req).await,
         "/crontab/schedule" => crontab::schedule(req).await,
         "/crontab/schedule-delay" => crontab::schedule_delay(req).await,
@@ -262,16 +250,6 @@ async fn main(req: Request<Body>) -> anyhow::Result<Response<Body>> {
         "/mail/send" => mail::send_mail(req).await,
         "/mail/list" => mail::list_mails(req).await,
         "/mail/get" => mail::get_mail(req).await,
-        "/codex" | "/codex/" => codex::home(req).await,
-        "/codex/execute" => codex::execute(req).await,
-        "/codex/usage" => codex::get_usage(req).await,
-        "/codex/resume" => codex::resume(req).await,
-        "/codex/new" => codex::new_session(req).await,
-        "/codex/change" => codex::change_session(req).await,
-        "/codex/delete" => codex::delete_session(req).await,
-        "/codex/list" => codex::list_sessions(req).await,
-        "/codex/set-auto-approve" => codex::set_auto_approve(req).await,
-        "/codex/approve" => codex::approve(req).await,
         "/wechat" | "/wechat/" => wechat::home(req).await,
         "/wechat/send-text" => wechat::send_text(req).await,
         "/wechat/send-media" => wechat::send_media(req).await,

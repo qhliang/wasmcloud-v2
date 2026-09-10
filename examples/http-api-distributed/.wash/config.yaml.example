@@ -10,13 +10,6 @@ dev:
   components:
     - name: task-leet
       file: target/wasm32-wasip2/release/task_leet.wasm
-    # llm-gateway-messaging-proxy: replaces local provider with NATS-based remote proxy
-    # Build: cd crates/llm-gateway-messaging-proxy && cargo build --target wasm32-wasip2 --release
-    - name: llm-gateway-messaging-proxy
-      file: ../../../crates/llm-gateway-messaging-proxy/target/wasm32-wasip2/release/llm_gateway_messaging_proxy.wasm
-      config:
-        llm_request_subject: "llm-gateway.chat"
-        llm_request_timeout_ms: "30000"
   host_interfaces:
     - namespace: wasi
       package: keyvalue
@@ -102,15 +95,6 @@ dev:
         username: YOUR_SMTP_USERNAME
         password: YOUR_SMTP_PASSWORD
         default-from: YOUR_SENDER_EMAIL
-    - namespace: custom
-      package: codex
-      interfaces:
-        - executor
-        - session
-      config:
-        api_token: YOUR_CODEX_API_TOKEN
-        model: glm-5.1
-        codex_binary_path: "/usr/local/bin/codex"
     - namespace: custom
       package: wechat
       interfaces:

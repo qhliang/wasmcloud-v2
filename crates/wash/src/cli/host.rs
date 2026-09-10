@@ -4,7 +4,6 @@ use anyhow::Context as _;
 use clap::Args;
 use custom_plugin_cf_d1::CloudflareD1;
 use custom_plugin_event_monitor::EventMonitor;
-use custom_plugin_llm_gateway_provider::LlmGateway;
 use tracing::info;
 use wash_runtime::{
     engine::{Engine, WasmProposal},
@@ -525,10 +524,6 @@ impl CliCommand for HostCommand {
         cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(CloudflareD1::new()))?;
         tracing::info!("Cloudflare D1 plugin enabled");
 
-        // Enable LLM gateway plugin
-        cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(LlmGateway::new()))?;
-        tracing::info!("LLM gateway plugin enabled");
-
         // Enable crontab plugin
         cluster_host_builder =
             cluster_host_builder.with_plugin(Arc::new(custom_plugin_crontab::Crontab::new()))?;
@@ -548,11 +543,6 @@ impl CliCommand for HostCommand {
         cluster_host_builder =
             cluster_host_builder.with_plugin(Arc::new(custom_plugin_mail::Mail::new()))?;
         tracing::info!("Mail plugin enabled");
-
-        // Enable codex plugin
-        cluster_host_builder =
-            cluster_host_builder.with_plugin(Arc::new(custom_plugin_codex::Codex::new()))?;
-        tracing::info!("Codex plugin enabled");
 
         // Enable wechat plugin
         cluster_host_builder =

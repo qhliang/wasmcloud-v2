@@ -1,6 +1,0 @@
-package my:llm-gateway;
-
-world llm-gateway {
-    import custom:llm-gateway/chat@0.1.0;
-    import custom:llm-gateway/chat-streaming@0.1.0;
-}
