@@ -2,12 +2,16 @@
 //!
 //! The runner decodes the shared task envelope, renews the JetStream lease,
 //! invokes the application worker, and maps success/failure to ack semantics.
+//! When the queue stream or its durable consumer disappears (a NATS rebuild
+//! backed by an ephemeral JetStream volume, for example), the runner rebuilds
+//! the consumer and re-subscribes instead of exiting — see
+//! [`WorkerRunner::run`].
 
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use async_nats::jetstream::Context as JetStreamContext;
 use futures::StreamExt as _;
 use task_queue_core::config::QueueConfig;
@@ -29,6 +33,26 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// while runners are parked; without a periodic re-check they would stay parked
 /// until some unrelated release happened to wake them.
 const LIMIT_RECHECK: Duration = Duration::from_secs(1);
+
+/// How long to wait before rebuilding the task consumer after a subscription
+/// failure.
+///
+/// The stream and its durable consumer are externally deletable state: a NATS
+/// rebuild backed by an ephemeral JetStream volume wipes them both, after which
+/// the pull subscription only ever reports "no responders". A runner that
+/// fetched its consumer once at startup therefore stayed stuck forever with
+/// every task parked in the queue. Instead of exiting, `run` rebuilds the
+/// consumer — and the stream, when the producer has not recreated it yet —
+/// after this delay.
+const RECONNECT_DELAY: Duration = Duration::from_secs(60);
+
+/// Waits for `delay`, returning `false` as soon as `shutdown` is cancelled.
+async fn sleep_or_cancel(shutdown: &CancellationToken, delay: Duration) -> bool {
+    tokio::select! {
+        _ = shutdown.cancelled() => false,
+        _ = tokio::time::sleep(delay) => true,
+    }
+}
 
 /// Supplies the number of deliveries that may be processed concurrently.
 ///
@@ -167,56 +191,124 @@ impl WorkerRunner {
     ///
     /// Process shutdown stops accepting new messages but waits (bounded by
     /// [`DRAIN_TIMEOUT`]) for deliveries already in progress to ack.
+    ///
+    /// # Consumer self-healing
+    ///
+    /// The stream and its durable consumer are externally deletable state: a
+    /// NATS rebuild backed by an ephemeral JetStream volume wipes both, after
+    /// which the pull subscription only ever reports "no responders". The
+    /// runner therefore never exits on a subscription failure — it re-runs
+    /// [`QueueHandles::ensure_worker`] (a get_or_create) and re-subscribes
+    /// after [`RECONNECT_DELAY`]. A consumer that still exists keeps its ack
+    /// state, so a reconnect never re-delivers acknowledged tasks; one that
+    /// was deleted is rebuilt and re-delivers whatever is still queued.
+    /// In-flight deliveries are unaffected: they keep running across the
+    /// reconnect and ack through their own acker.
     pub async fn run(&self, shutdown: CancellationToken) -> Result<()> {
-        let consumer = self.handles.ensure_worker().await?;
-        // Keep the client-side prefetch window at a single message. The runner
-        // must never buffer more deliveries than it has slots for, otherwise
-        // buffered messages sit idle burning their `ack_wait` lease while
-        // waiting for a free slot.
-        let mut messages = consumer
-            .stream()
-            .max_messages_per_batch(1)
-            .messages()
-            .await
-            .context("failed to subscribe to task consumer")?;
         let gate = Arc::new(Gate::new(self.limit.clone()));
         let mut in_flight = JoinSet::new();
-        tracing::info!("task queue worker running");
-        loop {
-            // Reap finished deliveries so the set does not grow unbounded.
-            while in_flight.try_join_next().is_some() {}
-            // Acquiring the permit before fetching is the backpressure point.
-            let permit = tokio::select! {
-                _ = shutdown.cancelled() => break,
-                acquired = gate.acquire(&shutdown) => match acquired {
-                    Some(permit) => permit,
-                    None => break,
-                },
-            };
-            let next = tokio::select! {
-                _ = shutdown.cancelled() => None,
-                next = messages.next() => next,
-            };
-            let Some(next) = next else {
-                drop(permit);
+        let mut established = false;
+
+        'connect: loop {
+            if shutdown.is_cancelled() {
                 break;
-            };
-            match next {
-                Ok(message) => {
-                    let runner = self.clone();
-                    in_flight.spawn(async move {
-                        runner.handle_message(message).await;
-                        // Released only after the terminal ack, so the number of
-                        // in-flight deliveries never exceeds the configured limit.
-                        drop(permit);
-                    });
-                }
+            }
+            let consumer = match self.handles.ensure_worker().await {
+                Ok(consumer) => consumer,
                 Err(err) => {
-                    tracing::warn!(err = %err, "task consumer stream error");
+                    tracing::warn!(
+                        err = %err,
+                        delay = ?RECONNECT_DELAY,
+                        "task consumer unavailable; will retry"
+                    );
+                    if !sleep_or_cancel(&shutdown, RECONNECT_DELAY).await {
+                        break;
+                    }
+                    continue 'connect;
+                }
+            };
+            // Keep the client-side prefetch window at a single message. The runner
+            // must never buffer more deliveries than it has slots for, otherwise
+            // buffered messages sit idle burning their `ack_wait` lease while
+            // waiting for a free slot.
+            let mut messages = match consumer.stream().max_messages_per_batch(1).messages().await {
+                Ok(messages) => messages,
+                Err(err) => {
+                    tracing::warn!(
+                        err = %err,
+                        delay = ?RECONNECT_DELAY,
+                        "failed to subscribe to task consumer; will retry"
+                    );
+                    if !sleep_or_cancel(&shutdown, RECONNECT_DELAY).await {
+                        break;
+                    }
+                    continue 'connect;
+                }
+            };
+            if established {
+                tracing::info!("task queue worker re-connected");
+            } else {
+                tracing::info!("task queue worker running");
+                established = true;
+            }
+
+            'consume: loop {
+                // Reap finished deliveries so the set does not grow unbounded.
+                while in_flight.try_join_next().is_some() {}
+                // Acquiring the permit before fetching is the backpressure point.
+                let permit = tokio::select! {
+                    _ = shutdown.cancelled() => break 'connect,
+                    acquired = gate.acquire(&shutdown) => match acquired {
+                        Some(permit) => permit,
+                        None => break 'connect,
+                    },
+                };
+                let next = tokio::select! {
+                    _ = shutdown.cancelled() => break 'consume,
+                    next = messages.next() => next,
+                };
+                let Some(next) = next else {
+                    // The subscription ended without reporting an error. Treat it
+                    // like any other broken consumer and rebuild instead of
+                    // letting the runner exit and silently stop consuming.
                     drop(permit);
+                    tracing::warn!(
+                        delay = ?RECONNECT_DELAY,
+                        "task consumer subscription ended; re-establishing"
+                    );
+                    if !sleep_or_cancel(&shutdown, RECONNECT_DELAY).await {
+                        break 'connect;
+                    }
+                    continue 'connect;
+                };
+                match next {
+                    Ok(message) => {
+                        let runner = self.clone();
+                        in_flight.spawn(async move {
+                            runner.handle_message(message).await;
+                            // Released only after the terminal ack, so the number of
+                            // in-flight deliveries never exceeds the configured limit.
+                            drop(permit);
+                        });
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            err = %err,
+                            delay = ?RECONNECT_DELAY,
+                            "task consumer stream error; re-establishing consumer"
+                        );
+                        drop(permit);
+                        // Back off before rebuilding, so a persistently broken
+                        // stream cannot turn into a hot reconnect loop.
+                        if !sleep_or_cancel(&shutdown, RECONNECT_DELAY).await {
+                            break 'connect;
+                        }
+                        continue 'connect;
+                    }
                 }
             }
         }
+
         drain(&mut in_flight).await;
         Ok(())
     }
@@ -516,5 +608,18 @@ mod tests {
         let mut in_flight = JoinSet::new();
         drain(&mut in_flight).await;
         assert!(in_flight.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sleep_or_cancel_returns_false_when_shutdown_is_cancelled() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        assert!(!sleep_or_cancel(&shutdown, Duration::from_secs(60)).await);
+    }
+
+    #[tokio::test]
+    async fn sleep_or_cancel_returns_true_after_the_delay() {
+        let shutdown = CancellationToken::new();
+        assert!(sleep_or_cancel(&shutdown, Duration::from_millis(5)).await);
     }
 }
