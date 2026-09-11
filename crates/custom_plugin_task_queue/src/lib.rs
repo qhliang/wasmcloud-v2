@@ -16,7 +16,7 @@ use bytes::Bytes;
 use futures::StreamExt as _;
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use wash_runtime::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use wash_runtime::engine::workload::{ResolvedWorkload, WorkloadItem};
@@ -341,13 +341,7 @@ impl TaskQueuePlugin {
                             };
                             if let Some(workload) = workload {
                                 debug!(component_id = %component_id, "callback dispatcher: dispatching to observer");
-                                if let Err(err) =
-                                    dispatch_observer(&workload, &component_id, event).await
-                                {
-                                    warn!(component_id = %component_id, err = %err, "failed to dispatch observer callback");
-                                } else {
-                                    debug!(component_id = %component_id, "callback dispatcher: observer callback dispatched ok");
-                                }
+                                dispatch_with_retry(&workload, &component_id, &event, &cancel).await;
                             } else {
                                 warn!(component_id = %component_id, "observer component not ready");
                             }
@@ -1020,6 +1014,58 @@ impl std::fmt::Debug for TaskQueuePlugin {
 pub struct CallbackDispatcher {
     #[allow(dead_code)]
     receiver: tokio::sync::mpsc::UnboundedReceiver<(String, CallbackEvent)>,
+}
+
+/// 回调分发失败后的重试退避（毫秒），数组长度即最大重试次数。
+///
+/// **为什么在分发循环内重试（而不是重新入队）**：同一任务的生命周期事件
+/// （Start → Heartbeat → Terminate）必须保持顺序——重新入队到队尾会让迟到的
+/// Start 追在 Terminate 之后，把已终态的执行行又刷回 running。原地重试有界
+/// （最长约 22s），代价是极端情况下会阻塞后续事件，属可接受折中。
+const CALLBACK_RETRY_BACKOFF_MS: [u64; 3] = [2_000, 5_000, 15_000];
+
+/// 带重试地分发一次 observer 回调；重试期间若插件取消则立即放弃。
+async fn dispatch_with_retry(
+    workload: &ResolvedWorkload,
+    component_id: &str,
+    event: &CallbackEvent,
+    cancel: &CancellationToken,
+) {
+    let summary = callback_event_summary(event);
+    let mut retries = 0usize;
+    loop {
+        match dispatch_observer(workload, component_id, event.clone()).await {
+            Ok(()) => {
+                debug!(component_id = %component_id, "callback dispatcher: observer callback dispatched ok");
+                return;
+            }
+            Err(err) => {
+                let Some(&delay_ms) = CALLBACK_RETRY_BACKOFF_MS.get(retries) else {
+                    error!(
+                        component_id = %component_id,
+                        event = %summary,
+                        err = %err,
+                        "observer callback dropped after retries exhausted"
+                    );
+                    return;
+                };
+                let delay = Duration::from_millis(delay_ms);
+                retries += 1;
+                warn!(
+                    component_id = %component_id,
+                    event = %summary,
+                    retry = retries,
+                    delay_ms,
+                    err = %err,
+                    "observer callback failed, retrying"
+                );
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
+        }
+    }
 }
 
 async fn dispatch_observer(

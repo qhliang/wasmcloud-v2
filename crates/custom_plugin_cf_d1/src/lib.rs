@@ -5,14 +5,16 @@
 //! 2. Static interface config (fallback from wasmcloud config)
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use indexmap::IndexMap;
 use opentelemetry::metrics::Counter;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error};
 use wasmtime::component::Resource;
 
@@ -39,6 +41,16 @@ use bindings::custom::cf_d1::types::{
 };
 
 const PLUGIN_ID: &str = "cf-d1";
+
+/// HTTP 客户端缓存键：`account_id|database_id|<token 的哈希>`。
+///
+/// 只存哈希不存明文 token（避免在内存里留下额外副本），同时保证 token
+/// 轮换后自然 miss、重建客户端。
+fn client_cache_key(account_id: &str, database_id: &str, api_token: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    api_token.hash(&mut hasher);
+    format!("{account_id}|{database_id}|{:016x}", hasher.finish())
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -91,6 +103,17 @@ impl CloudflareD1Metrics {
 pub struct CloudflareD1 {
     tracker: Arc<RwLock<WorkloadTracker<(), ComponentData>>>,
     metrics: Arc<CloudflareD1Metrics>,
+    /// 按 `account_id|database_id|token` 缓存已构建的 HTTP 客户端。
+    ///
+    /// **为什么必须缓存**：宿主对组件的每次导出调用都可能重新实例化 guest，
+    /// guest 侧 `OnceLock` 静态量随之失效，于是每个 `d1-client` 构造函数都会
+    /// 跑一遍；若不缓存，就是「每次查询新建一个 reqwest Client → 重新 TLS
+    /// 握手」，在 NATS/网络抖动时每次查询都会各自挂到超时，且平白放大延迟
+    /// （2026-09-11 生产排查实测：日志中每次查询都有 `Created D1 client` +
+    /// `starting new connection`）。reqwest Client 内部自带连接池，clone 廉价
+    /// （Arc），因此缓存后同一个 (account,database,token) 复用一条连接池。
+    /// key 含 token，token 轮换自然失效。
+    clients: Arc<Mutex<HashMap<String, Client>>>,
 }
 
 impl Default for CloudflareD1 {
@@ -105,6 +128,7 @@ impl CloudflareD1 {
         Self {
             tracker: Arc::new(RwLock::new(WorkloadTracker::default())),
             metrics: Arc::new(CloudflareD1Metrics::new()),
+            clients: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -321,24 +345,44 @@ impl<'a> bindings::custom::cf_d1::query::HostD1Client for ActiveCtx<'a> {
 
         drop(lock);
 
-        // Build HTTP client with auth
-        let client = Client::builder()
-            .default_headers({
-                let mut headers = reqwest::header::HeaderMap::new();
-                headers.insert(
-                    reqwest::header::AUTHORIZATION,
-                    format!("Bearer {api_token}").parse()?,
-                );
-                headers.insert(reqwest::header::CONTENT_TYPE, "application/json".parse()?);
-                headers
-            })
-            .build()
-            .map_err(|e| wasmtime::Error::msg(format!("failed to create HTTP client: {e}")))?;
+        // Build (or reuse) the HTTP client with auth.
+        //
+        // 超时是必须的：此前无任何超时配置，网络抖动时请求会一直挂到 TCP/TLS
+        // 层自己放弃（实测挂 40~52s 才报错），期间会堵住宿主串行的回调分发器。
+        // 5s 连接 / 30s 整体超时把失败变成快速失败，交给上层重试。
+        let cache_key = client_cache_key(&account_id, &database_id, &api_token);
+        let client = {
+            let mut cache = plugin.clients.lock().await;
+            match cache.get(&cache_key) {
+                Some(client) => client.clone(),
+                None => {
+                    let client = Client::builder()
+                        .connect_timeout(Duration::from_secs(5))
+                        .timeout(Duration::from_secs(30))
+                        .default_headers({
+                            let mut headers = reqwest::header::HeaderMap::new();
+                            headers.insert(
+                                reqwest::header::AUTHORIZATION,
+                                format!("Bearer {api_token}").parse()?,
+                            );
+                            headers
+                                .insert(reqwest::header::CONTENT_TYPE, "application/json".parse()?);
+                            headers
+                        })
+                        .build()
+                        .map_err(|e| {
+                            wasmtime::Error::msg(format!("failed to create HTTP client: {e}"))
+                        })?;
+                    cache.insert(cache_key, client.clone());
+                    client
+                }
+            }
+        };
 
         debug!(
             account_id = %account_id,
             database_id = %database_id,
-            "Created D1 client"
+            "D1 client ready"
         );
 
         let handle = D1ClientHandle {
@@ -783,7 +827,9 @@ mod tests {
             ColumnValue::Integer(42)
         ));
         assert!(matches!(
-            json_value_to_column_value(serde_json::json!(3.14)),
+            // 用 3.125（二进制可精确表示）而非 3.14 —— 后者会被新版 clippy 的
+            // `approx_constant`（近似 PI）判为错误。
+            json_value_to_column_value(serde_json::json!(3.125)),
             ColumnValue::Real(_)
         ));
         assert!(matches!(
