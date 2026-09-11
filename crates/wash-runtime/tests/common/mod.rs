@@ -13,23 +13,76 @@ pub mod tls;
 #[cfg(feature = "wasmcloud-postgres")]
 pub mod postgres;
 
+pub mod streaming;
+
 use anyhow::{Context, Result};
-use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
+use std::{collections::HashMap, time::Duration};
+#[cfg(all(
+    feature = "wasi-blobstore",
+    feature = "wasi-config",
+    feature = "wasi-keyvalue",
+    feature = "wasi-logging"
+))]
+use std::{path::Path, sync::Arc};
 use tokio::time::timeout;
 
-#[cfg(feature = "host-component-plugins")]
+#[cfg(all(
+    feature = "host-component-plugins",
+    feature = "wasi-blobstore",
+    feature = "wasi-config",
+    feature = "wasi-keyvalue",
+    feature = "wasi-logging"
+))]
 use wash_runtime::plugin::component_host::ComponentHostPlugin;
+#[cfg(all(
+    feature = "wasi-blobstore",
+    feature = "wasi-config",
+    feature = "wasi-keyvalue",
+    feature = "wasi-logging"
+))]
+use wash_runtime::plugin::wasi_blobstore::InMemoryBlobstore;
+#[cfg(all(
+    feature = "wasi-blobstore",
+    feature = "wasi-config",
+    feature = "wasi-keyvalue",
+    feature = "wasi-logging"
+))]
+use wash_runtime::plugin::wasi_config::DynamicConfig;
+#[cfg(all(
+    feature = "wasi-blobstore",
+    feature = "wasi-config",
+    feature = "wasi-keyvalue",
+    feature = "wasi-logging"
+))]
+use wash_runtime::plugin::wasi_keyvalue::InMemoryKeyValue;
+#[cfg(all(
+    feature = "wasi-blobstore",
+    feature = "wasi-config",
+    feature = "wasi-keyvalue",
+    feature = "wasi-logging"
+))]
+use wash_runtime::plugin::wasi_logging::TracingLogger;
+#[cfg(all(
+    feature = "wasi-blobstore",
+    feature = "wasi-config",
+    feature = "wasi-keyvalue",
+    feature = "wasi-logging"
+))]
+use wash_runtime::plugin::wasmcloud_secrets::WasmcloudSecrets;
+#[cfg(all(
+    feature = "wasi-blobstore",
+    feature = "wasi-config",
+    feature = "wasi-keyvalue",
+    feature = "wasi-logging"
+))]
 use wash_runtime::{
     engine::Engine,
     host::{
         HostApi, HostBuilder,
         http::{DevRouter, DynamicRouter, Ingress, TlsConfig},
     },
-    plugin::{
-        wasi_blobstore::InMemoryBlobstore, wasi_config::DynamicConfig,
-        wasi_keyvalue::InMemoryKeyValue, wasi_logging::TracingLogger,
-        wasmcloud_secrets::WasmcloudSecrets,
-    },
+};
+use wash_runtime::{
     types::{Component, LocalResources, Workload, WorkloadStartRequest},
     wit::WitInterface,
 };
@@ -169,6 +222,26 @@ pub fn kv_plugin_caller_host_interfaces_with_config(
     ]
 }
 
+/// Interfaces for the `kv-plugin-implements-caller` workload: HTTP ingress plus
+/// three `acme:kv` entries — the plain one and one per `(implements ..)` label
+/// the component imports. One entry per binding, which is what the operator's
+/// declaration is matched against.
+#[cfg(feature = "host-component-plugins")]
+pub fn kv_plugin_implements_caller_host_interfaces(host_header: &str) -> Vec<WitInterface> {
+    vec![
+        http_incoming_handler_interface(host_header, None),
+        acme_kv_interface(),
+        WitInterface {
+            name: Some("tenant-a".to_string()),
+            ..acme_kv_interface()
+        },
+        WitInterface {
+            name: Some("tenant-b".to_string()),
+            ..acme_kv_interface()
+        },
+    ]
+}
+
 /// The `wasmcloud:secrets` capability (store + reveal), served by the native
 /// `wasmcloud-secrets` plugin.
 pub fn secrets_interface(config: HashMap<String, String>) -> WitInterface {
@@ -227,6 +300,7 @@ pub fn component_workload_request(
                 pool_size: 1,
                 max_invocations: 100,
                 max_concurrency: 1,
+                ..Default::default()
             }],
             host_interfaces,
             volumes: vec![],
@@ -252,6 +326,12 @@ pub fn default_counter_resources() -> LocalResources {
 
 /// Attach the standard suite of plugins used by http-counter tests:
 /// in-memory blobstore + keyvalue, tracing logger, dynamic config.
+#[cfg(all(
+    feature = "wasi-blobstore",
+    feature = "wasi-config",
+    feature = "wasi-keyvalue",
+    feature = "wasi-logging"
+))]
 fn with_standard_plugins(
     builder: wash_runtime::host::HostBuilder,
 ) -> Result<wash_runtime::host::HostBuilder> {
@@ -265,6 +345,12 @@ fn with_standard_plugins(
 
 /// Start a host with a "DevRouter" backed HTTP server and the standard plugin
 /// set. Returns the bound address and a started `HostApi` ref.
+#[cfg(all(
+    feature = "wasi-blobstore",
+    feature = "wasi-config",
+    feature = "wasi-keyvalue",
+    feature = "wasi-logging"
+))]
 pub async fn start_host_with_dev_router(
     addr: &str,
 ) -> Result<(std::net::SocketAddr, impl HostApi)> {
@@ -283,6 +369,12 @@ pub async fn start_host_with_dev_router(
 
 /// Start a host with a "DynamicRouter" backed HTTP server and the standard
 /// plugin set.
+#[cfg(all(
+    feature = "wasi-blobstore",
+    feature = "wasi-config",
+    feature = "wasi-keyvalue",
+    feature = "wasi-logging"
+))]
 pub async fn start_host_with_dynamic_router(
     addr: &str,
 ) -> Result<(std::net::SocketAddr, impl HostApi)> {
@@ -302,6 +394,12 @@ pub async fn start_host_with_dynamic_router(
 /// Start a host with a TLS-enabled `DevRouter`-backed HTTP server and the
 /// standard plugin set. Certificate and key are read from disk at the given
 /// paths.
+#[cfg(all(
+    feature = "wasi-blobstore",
+    feature = "wasi-config",
+    feature = "wasi-keyvalue",
+    feature = "wasi-logging"
+))]
 pub async fn start_host_with_tls(
     cert_path: &Path,
     key_path: &Path,
@@ -326,6 +424,12 @@ pub async fn start_host_with_tls(
 
 /// Start a host with `wasip3` enabled on the engine, a `DevRouter` backed
 /// HTTP server, and the standard plugin set.
+#[cfg(all(
+    feature = "wasi-blobstore",
+    feature = "wasi-config",
+    feature = "wasi-keyvalue",
+    feature = "wasi-logging"
+))]
 pub async fn start_host_with_p3_http_handler(
     addr: &str,
 ) -> Result<(std::net::SocketAddr, impl HostApi)> {
@@ -346,13 +450,20 @@ pub async fn start_host_with_p3_http_handler(
 /// built from `plugin_wasm`, routed by `router`, with `max_restarts` overriding
 /// the plugin's supervision budget when given. The named wrappers below cover
 /// the common shapes.
-#[cfg(feature = "host-component-plugins")]
+#[cfg(all(
+    feature = "host-component-plugins",
+    feature = "wasi-blobstore",
+    feature = "wasi-config",
+    feature = "wasi-keyvalue",
+    feature = "wasi-logging"
+))]
 async fn start_host_with_component_plugin_router(
     addr: &str,
     router: impl wash_runtime::host::http::Router,
     plugin_id: &'static str,
     plugin_wasm: &'static [u8],
     max_restarts: Option<u32>,
+    plugin_bindings: wash_runtime::plugin::PluginBindings,
 ) -> Result<(std::net::SocketAddr, impl HostApi)> {
     let engine = Engine::builder().build()?;
     let ingress = Ingress::new(router, addr.parse()?).await?;
@@ -369,22 +480,51 @@ async fn start_host_with_component_plugin_router(
         .wasm(plugin_wasm)
         .engine(engine.clone())
         .native_plugins(native_plugins)
-        .maybe_http_handler(http_handler)
+        .maybe_http_handler(http_handler.as_ref().map(Arc::downgrade))
         .build()
         .await
         .context("failed to build host component plugin")?;
     if let Some(max_restarts) = max_restarts {
         plugin = plugin.with_max_restarts(max_restarts);
     }
-    let host = builder.with_plugin(Arc::new(plugin))?.build()?;
+    let host = builder
+        .with_plugin(Arc::new(plugin))?
+        .with_plugin_bindings(plugin_bindings)
+        .build()?;
     let host = host.start().await.context("Failed to start host")?;
     Ok((bound_addr, host))
+}
+
+/// Start a p3 host with a component plugin whose `host.plugins` entry declares
+/// `bindings`, the way an operator turns label routing on for one.
+#[cfg(feature = "host-component-plugins")]
+pub async fn start_host_with_component_plugin_bindings(
+    addr: &str,
+    plugin_id: &'static str,
+    plugin_wasm: &'static [u8],
+    plugin_bindings: wash_runtime::plugin::PluginBindings,
+) -> Result<(std::net::SocketAddr, impl HostApi)> {
+    start_host_with_component_plugin_router(
+        addr,
+        DevRouter::default(),
+        plugin_id,
+        plugin_wasm,
+        None,
+        plugin_bindings,
+    )
+    .await
 }
 
 /// Start a p3 host with the standard plugin set plus a [`ComponentHostPlugin`]
 /// built from `plugin_wasm` (a host component plugin exporting a capability).
 /// Used to test workloads that import a component-provided host capability.
-#[cfg(feature = "host-component-plugins")]
+#[cfg(all(
+    feature = "host-component-plugins",
+    feature = "wasi-blobstore",
+    feature = "wasi-config",
+    feature = "wasi-keyvalue",
+    feature = "wasi-logging"
+))]
 pub async fn start_host_with_component_plugin(
     addr: &str,
     plugin_id: &'static str,
@@ -396,6 +536,7 @@ pub async fn start_host_with_component_plugin(
         plugin_id,
         plugin_wasm,
         None,
+        wash_runtime::plugin::PluginBindings::new(),
     )
     .await
 }
@@ -404,7 +545,13 @@ pub async fn start_host_with_component_plugin(
 /// routes by `Host` header — so distinct workloads are reachable individually
 /// (the `DevRouter` sends every request to the last-resolved workload). Needed
 /// to test per-caller behavior across genuinely separate workloads.
-#[cfg(feature = "host-component-plugins")]
+#[cfg(all(
+    feature = "host-component-plugins",
+    feature = "wasi-blobstore",
+    feature = "wasi-config",
+    feature = "wasi-keyvalue",
+    feature = "wasi-logging"
+))]
 pub async fn start_host_with_component_plugin_by_host(
     addr: &str,
     plugin_id: &'static str,
@@ -416,13 +563,20 @@ pub async fn start_host_with_component_plugin_by_host(
         plugin_id,
         plugin_wasm,
         None,
+        wash_runtime::plugin::PluginBindings::new(),
     )
     .await
 }
 
 /// Like [`start_host_with_component_plugin`] but overriding the plugin's
 /// supervision restart budget — for tests that exhaust it.
-#[cfg(feature = "host-component-plugins")]
+#[cfg(all(
+    feature = "host-component-plugins",
+    feature = "wasi-blobstore",
+    feature = "wasi-config",
+    feature = "wasi-keyvalue",
+    feature = "wasi-logging"
+))]
 pub async fn start_host_with_component_plugin_max_restarts(
     addr: &str,
     plugin_id: &'static str,
@@ -435,6 +589,7 @@ pub async fn start_host_with_component_plugin_max_restarts(
         plugin_id,
         plugin_wasm,
         Some(max_restarts),
+        wash_runtime::plugin::PluginBindings::new(),
     )
     .await
 }
@@ -442,6 +597,12 @@ pub async fn start_host_with_component_plugin_max_restarts(
 /// Like [`start_host_with_p3_http_handler`] but also returns the [`Ingress`], so a test can
 /// drive host-side ingress hooks directly (e.g. deliver a message to a trigger service's
 /// messaging handler via `deliver_trigger_service_message`).
+#[cfg(all(
+    feature = "wasi-blobstore",
+    feature = "wasi-config",
+    feature = "wasi-keyvalue",
+    feature = "wasi-logging"
+))]
 pub async fn start_host_with_p3_handler(
     addr: &str,
 ) -> Result<(std::net::SocketAddr, impl HostApi, Arc<Ingress<DevRouter>>)> {

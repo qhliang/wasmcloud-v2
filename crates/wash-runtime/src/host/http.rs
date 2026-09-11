@@ -18,6 +18,7 @@
 //! 4. Managing the request/response lifecycle through WASI-HTTP
 //! ```
 
+use std::sync::atomic::AtomicBool;
 use std::{
     collections::{BTreeSet, HashMap},
     net::SocketAddr,
@@ -28,10 +29,14 @@ use std::{
 
 use arc_swap::ArcSwap;
 
+use crate::engine::abandon::{AbandonFlag, AbandonOnDrop, DispatchedCall};
 use crate::host::allowed_hosts::AllowedHost;
 use crate::host::trigger_service::{BrokerMessage, MessagingJob};
-use crate::{engine::ctx::SharedCtx, observability::Meters};
-use crate::{engine::workload::ResolvedWorkload, observability::FuelConsumptionMeter};
+use crate::{
+    engine::ctx::SharedCtx,
+    observability::{MeterKind, Meters},
+};
+use crate::{engine::workload::ResolvedWorkload, observability::GuestMeter};
 use anyhow::{Context, ensure};
 use http_body_util::BodyExt;
 use hyper::client::conn::http2;
@@ -39,10 +44,11 @@ use hyper_util::{
     rt::{TokioExecutor, TokioTimer},
     server::conn::auto,
 };
-use opentelemetry::{KeyValue, context::FutureExt};
+use opentelemetry::KeyValue;
+use opentelemetry::context::FutureExt;
 use opentelemetry_semantic_conventions::attribute::{
-    HTTP_REQUEST_METHOD, HTTP_RESPONSE_BODY_SIZE, HTTP_RESPONSE_STATUS_CODE, OTEL_STATUS_CODE,
-    RPC_GRPC_STATUS_CODE, SERVER_ADDRESS, SERVER_PORT, URL_FULL, URL_PATH,
+    ERROR_TYPE, HTTP_REQUEST_METHOD, HTTP_RESPONSE_BODY_SIZE, HTTP_RESPONSE_STATUS_CODE,
+    OTEL_STATUS_CODE, RPC_GRPC_STATUS_CODE, SERVER_ADDRESS, SERVER_PORT, URL_FULL, URL_PATH,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -62,7 +68,7 @@ use wasmtime_wasi_http::{
 
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, Semaphore, mpsc};
 use tokio_rustls::TlsAcceptor;
 
 /// Validates a hostname according to RFC 1123.
@@ -795,6 +801,27 @@ impl Router for DevRouter {
     }
 }
 
+/// Take a live handle on a handler that something the handler owns holds
+/// weakly, and the one error they all report when it is gone.
+///
+/// An ingress keeps every routable workload so an inbound request can find one,
+/// so anything reachable from a workload holds the handler back weakly or the
+/// two pin each other: the workload itself, an ephemeral linked call (which
+/// lives in a linker closure, hence in the `InstancePre` the ingress keeps), a
+/// service's store recipe, a store's egress hooks, and a bound host component
+/// plugin. Strong handles exist for the length of one call and are taken here.
+///
+/// Callers split two ways, deliberately. A path that cannot proceed without a
+/// handler propagates this error; a teardown path asks the `Weak` directly and
+/// skips, because a handler that is already gone has nothing left to unbind.
+pub(crate) fn live_handler(
+    handler: &std::sync::Weak<dyn HostHandler>,
+) -> anyhow::Result<Arc<dyn HostHandler>> {
+    handler
+        .upgrade()
+        .ok_or_else(|| anyhow::anyhow!("host HTTP handler is no longer available"))
+}
+
 /// Trait defining the behavior of a Host HTTP Extension
 /// Allows for custom handling of incoming and outgoing HTTP requests
 /// Use this trait to implement custom HTTP server transport
@@ -806,6 +833,22 @@ pub trait HostHandler: Send + Sync + 'static {
     async fn start(&self) -> anyhow::Result<()>;
     /// Stop the HTTP server
     async fn stop(&self) -> anyhow::Result<()>;
+
+    /// Resolves once this handler's accept loop has stopped and will not run
+    /// again — whether it returned an error, returned cleanly, or panicked.
+    ///
+    /// The loop is spawned detached, so without this its exit is one log line:
+    /// the host keeps every workload it was given, keeps answering its control
+    /// plane, and serves no HTTP for as long as it runs. Whoever owns the host
+    /// watches this so the failure is acted on rather than only recorded; see
+    /// [`crate::washlet::ClusterHost`], which ends the host on it.
+    ///
+    /// Default: pending forever, which is right for a handler with no accept
+    /// loop to lose ([`NullServer`]).
+    async fn stopped(&self) {
+        std::future::pending().await
+    }
+
     /// Get the port on which the HTTP server is listening
     fn port(&self) -> u16;
 
@@ -864,11 +907,14 @@ pub trait HostHandler: Send + Sync + 'static {
         Ok(())
     }
     /// Deliver a message to a workload's registered messaging trigger service, returning
-    /// the handler's `result<_, string>`. Default: no messaging support.
+    /// the handler's `result<_, string>`. `attributes` is what the delivery is
+    /// measured under, built by the backend — the layer that knows which
+    /// messaging plugin drove it. Default: no messaging support.
     async fn deliver_trigger_service_message(
         &self,
         _workload_id: &str,
         _msg: BrokerMessage,
+        _attributes: std::sync::Arc<[opentelemetry::KeyValue]>,
     ) -> anyhow::Result<Result<(), String>> {
         anyhow::bail!("this host does not support trigger service messaging delivery")
     }
@@ -986,16 +1032,178 @@ impl HostHandler for NullServer {
     }
 }
 
-/// A map from host header to resolved workload handles and their associated component id
-pub type WorkloadHandles =
-    Arc<RwLock<HashMap<String, (ResolvedWorkload, InstancePre<SharedCtx>, String)>>>;
+/// An HTTP response body that keeps its dispatched call condemned-on-drop while
+/// it streams: dropped mid-stream (the client disconnected), the wrapped
+/// [`AbandonOnDrop`] abandons the call; ended cleanly, it disarms. Extends the
+/// deadline enforcement of [`DispatchedCall::await_head`] across the body phase,
+/// so a guest that produces a response head and then wedges mid-body is still
+/// reachable.
+struct WatchedBody<B> {
+    inner: B,
+    /// `None` once end-of-stream disarmed it.
+    watch: Option<AbandonOnDrop>,
+}
+
+impl<B: hyper::body::Body + Unpin> hyper::body::Body for WatchedBody<B> {
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        let poll = std::pin::Pin::new(&mut this.inner).poll_frame(cx);
+        // Clean end of stream: the response was delivered whole, so nothing is
+        // abandoned. An *error* frame deliberately does not disarm — the
+        // exchange broke off, and if the guest is wedged behind it, the armed
+        // flag is what ends it (a completed call deregisters, so arming a
+        // healthy one is harmless).
+        // `is_end_stream` too, since hyper stops polling once a declared
+        // `content-length` is written and never delivers that final `None`.
+        let ended = matches!(poll, std::task::Poll::Ready(None)) || this.inner.is_end_stream();
+        if ended && let Some(watch) = this.watch.take() {
+            watch.disarm();
+        }
+        poll
+    }
+
+    // Forwarded, not defaulted: hyper frames the response from these, so
+    // defaulting them sends a fixed-length body chunked and close-delimits a
+    // HEAD or 204/304 that would otherwise keep its connection alive.
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// Wrap `resp`'s body so the dispatched call behind it stays condemned-on-drop
+/// until the body finishes streaming.
+///
+/// An already-complete body is left unwrapped and disarmed: hyper never polls
+/// one, so a wrapper would be dropped un-disarmed and arm the flag on a
+/// response that was delivered whole.
+fn watch_body(
+    resp: hyper::Response<HyperOutgoingBody>,
+    watch: AbandonOnDrop,
+) -> hyper::Response<HyperOutgoingBody> {
+    if hyper::body::Body::is_end_stream(resp.body()) {
+        watch.disarm();
+        return resp;
+    }
+    resp.map(|inner| {
+        HyperOutgoingBody::new(
+            WatchedBody {
+                inner,
+                watch: Some(watch),
+            }
+            .boxed_unsync(),
+        )
+    })
+}
+
+/// A map from host header to resolved workload handles, their associated
+/// component id, and the identity that component's calls are measured under.
+pub type WorkloadHandles = Arc<
+    RwLock<
+        HashMap<
+            String,
+            (
+                ResolvedWorkload,
+                InstancePre<SharedCtx>,
+                String,
+                crate::observability::WorkloadIdentity,
+            ),
+        >,
+    >,
+>;
 
 /// An inbound HTTP request routed to a long-lived service instance, paired with
-/// a oneshot for its response.
-pub type ServiceHttpJob = (
-    hyper::Request<hyper::body::Incoming>,
-    tokio::sync::oneshot::Sender<anyhow::Result<hyper::Response<HyperOutgoingBody>>>,
-);
+/// a oneshot for its response and the abandonment flag of the [`DispatchedCall`]
+/// enforcing its deadline (see [`crate::engine::abandon`]).
+pub struct ServiceHttpJob {
+    pub req: hyper::Request<hyper::body::Incoming>,
+    pub resp_tx: tokio::sync::oneshot::Sender<anyhow::Result<hyper::Response<HyperOutgoingBody>>>,
+    pub abandoned: Arc<AbandonFlag>,
+}
+
+/// The attribute set an inbound HTTP call is measured under: the shared scheme
+/// plus the request method, which is bounded by the HTTP spec. The URI and Host
+/// header are deliberately absent — a caller invents those, and a label a
+/// caller can invent mints a permanent time series per distinct value.
+pub(crate) fn http_attributes(
+    identity: &crate::observability::WorkloadIdentity,
+    method: &hyper::Method,
+    operation: &'static str,
+) -> Arc<[opentelemetry::KeyValue]> {
+    identity.attributes_with(
+        "wasi-http",
+        operation,
+        opentelemetry::KeyValue::new(HTTP_REQUEST_METHOD, known_method(method)),
+    )
+}
+
+/// What a call on an already-built store is measured under, taken from the
+/// store rather than from whoever dispatched to it.
+///
+/// A service's HTTP ingress has no workload handle to resolve an identity from
+/// — `workload_handles` holds only components that export `wasi:http` — and it
+/// does not need one: the store it runs on was stamped when it was built.
+///
+/// Empty when nothing is measuring this store, which is one lookup: the store
+/// is stamped only by a host that meters, so an absent stamp answers both
+/// "whose is this" and "is anyone recording it". Building it regardless would
+/// cost a `Vec`, an `Arc` and four `String`s per request for a value that is
+/// dropped.
+pub(crate) fn stored_http_attributes(
+    executed: &crate::engine::abandon::GuestExecution,
+    method: &hyper::Method,
+) -> Arc<[opentelemetry::KeyValue]> {
+    let Some(identity) = executed.identity() else {
+        return Arc::from([]);
+    };
+    identity.attributes_with(
+        "wasi-http",
+        HTTP_OPERATION_P3,
+        opentelemetry::KeyValue::new(HTTP_REQUEST_METHOD, known_method(method)),
+    )
+}
+
+/// The request method, or `_OTHER` for anything outside the registered set.
+///
+/// `hyper::Method` accepts an arbitrary extension token, so the method a client
+/// sends is caller-invented like the URI is. Folding the unregistered ones into
+/// one bucket is what keeps it usable as an attribute; the exact token stays on
+/// the span. This is the treatment the OTel HTTP semconv prescribes, and it is
+/// recorded under the semconv's own key — the same `http.request.method` the
+/// spans here carry, so a histogram and a trace join on it without a relabel,
+/// and so `_OTHER` means what a reader of that convention expects.
+fn known_method(method: &hyper::Method) -> &'static str {
+    match *method {
+        hyper::Method::GET => "GET",
+        hyper::Method::HEAD => "HEAD",
+        hyper::Method::POST => "POST",
+        hyper::Method::PUT => "PUT",
+        hyper::Method::DELETE => "DELETE",
+        hyper::Method::CONNECT => "CONNECT",
+        hyper::Method::OPTIONS => "OPTIONS",
+        hyper::Method::TRACE => "TRACE",
+        hyper::Method::PATCH => "PATCH",
+        _ => "_OTHER",
+    }
+}
+
+/// The WIT exports an inbound request can invoke, and what its measurements
+/// are grouped by. Bounded by the interface, unlike the request's URI.
+///
+/// Two of them, because the p2 per-request path and the p3 pooled path call
+/// different exports; merging them would group calls under an export one of the
+/// two never invokes.
+pub(crate) const HTTP_OPERATION_P2: &str = "wasi:http/incoming-handler#handle";
+pub(crate) const HTTP_OPERATION_P3: &str = "wasi:http/handler#handle";
 
 /// A map from workload id to the channel of its HTTP-serving service instance.
 /// Empty unless a workload's service opts into HTTP ingress (a p3 feature).
@@ -1039,6 +1247,11 @@ pub struct Ingress<T: Router, O: OutgoingHandler = DefaultOutgoingHandler> {
     shutdown_tx: Arc<RwLock<Option<mpsc::Sender<()>>>>,
     tls_acceptor: Option<TlsAcceptor>,
     listener: Arc<tokio::sync::Mutex<Option<TcpListener>>>,
+    /// Ceiling on the TCP connections this ingress holds at once, and the
+    /// permits enforcing it. Sized from the process's descriptor budget unless
+    /// the operator names a number: see
+    /// [`crate::host::quota::default_max_http_ingress_connections`].
+    connections: ConnectionLimit,
     meters: RwLock<Meters>,
     /// Per-workload opt-in to skipping TLS certificate verification for
     /// outbound HTTP(S) requests (`workload_id -> allow`). Populated from the
@@ -1117,6 +1330,7 @@ pub struct IngressBuilder<T: Router, O: OutgoingHandler = DefaultOutgoingHandler
     addr: SocketAddr,
     tls: Option<TlsConfig>,
     allow_insecure: bool,
+    max_connections: Option<usize>,
 }
 
 impl<T: Router> IngressBuilder<T, DefaultOutgoingHandler> {
@@ -1127,6 +1341,7 @@ impl<T: Router> IngressBuilder<T, DefaultOutgoingHandler> {
             addr,
             tls: None,
             allow_insecure: false,
+            max_connections: None,
         }
     }
 
@@ -1148,12 +1363,20 @@ impl<T: Router, O: OutgoingHandler> IngressBuilder<T, O> {
             addr: self.addr,
             tls: self.tls,
             allow_insecure: self.allow_insecure,
+            max_connections: self.max_connections,
         }
     }
 
     /// Enable TLS using the given [`TlsConfig`].
     pub fn tls(mut self, tls: TlsConfig) -> Self {
         self.tls = Some(tls);
+        self
+    }
+
+    /// Cap the TCP connections this ingress holds at once, in place of the
+    /// ceiling derived from the process's descriptor budget.
+    pub fn max_connections(mut self, max: usize) -> Self {
+        self.max_connections = Some(max.clamp(1, Semaphore::MAX_PERMITS));
         self
     }
 
@@ -1171,6 +1394,9 @@ impl<T: Router, O: OutgoingHandler> IngressBuilder<T, O> {
 
         let listener = TcpListener::bind(self.addr).await?;
         let addr = listener.local_addr()?;
+        let max_connections = self
+            .max_connections
+            .unwrap_or_else(crate::host::quota::default_max_http_ingress_connections);
 
         Ok(Ingress {
             router: Arc::new(self.router),
@@ -1182,7 +1408,8 @@ impl<T: Router, O: OutgoingHandler> IngressBuilder<T, O> {
             shutdown_tx: Arc::new(RwLock::new(None)),
             tls_acceptor,
             listener: Arc::new(tokio::sync::Mutex::new(Some(listener))),
-            meters: Default::default(),
+            connections: ConnectionLimit::new(max_connections),
+            meters: RwLock::new(Meters::new(MeterKind::Off)),
             outbound_http_insecure: Arc::new(std::sync::RwLock::new(HashMap::new())),
             grpc_tls: OnceLock::new(),
             allow_insecure: self.allow_insecure,
@@ -1212,6 +1439,12 @@ impl<T: Router, O: OutgoingHandler> Ingress<T, O> {
     /// Returns the actual bound address (useful when binding to port 0).
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// This ingress's connection ceiling, to register with the probe listener
+    /// as a reason the host may be not-ready.
+    pub fn connection_limit(&self) -> ConnectionLimit {
+        self.connections.clone()
     }
 
     /// The h2 (ALPN) variant of the outgoing handler's client TLS
@@ -1270,7 +1503,9 @@ impl<T: Router, O: OutgoingHandler> HostHandler for Ingress<T, O> {
         // Start the HTTP server, any incoming requests call Host::handle and then it's routed
         // to the workload based on host header.
         let handler = self.router.clone();
-        let fuel_meter = self.meters.read().await.fuel_consumption.clone();
+        let guest_meter = self.meters.read().await.guest();
+        let connections = self.connections.clone();
+        let stopped = AcceptingGuard(connections.clone());
         tokio::spawn(async move {
             if let Err(e) = run_http_server(
                 listener,
@@ -1279,12 +1514,14 @@ impl<T: Router, O: OutgoingHandler> HostHandler for Ingress<T, O> {
                 service_handlers,
                 &mut shutdown_rx,
                 tls_acceptor,
-                fuel_meter,
+                guest_meter,
+                connections,
             )
             .await
             {
                 error!(err = ?e, addr = ?addr, "HTTP server error");
             }
+            drop(stopped);
         });
         Ok(())
     }
@@ -1295,7 +1532,20 @@ impl<T: Router, O: OutgoingHandler> HostHandler for Ingress<T, O> {
         if let Some(tx) = shutdown_guard.take() {
             let _ = tx.send(()).await;
         }
+        // Let go of what the routing tables hold. A stopped ingress serves
+        // nothing, so keeping them would pin every routed workload's
+        // `InstancePre` — its compiled components, and the engine behind them —
+        // for as long as anything still holds the ingress itself. A workload
+        // stopped after this finds nothing to unbind, which is the right
+        // answer.
+        self.workload_handles.write().await.clear();
+        self.service_handlers.write().await.clear();
+        self.messaging_handlers.write().await.clear();
         Ok(())
+    }
+
+    async fn stopped(&self) {
+        self.connections.stopped().await;
     }
 
     fn port(&self) -> u16 {
@@ -1324,12 +1574,17 @@ impl<T: Router, O: OutgoingHandler> HostHandler for Ingress<T, O> {
         // Only components that export wasi:http are routable HTTP entrypoints.
         // Anything else stays unregistered and routes to a 404.
         if crate::engine::exports_wasi_http(instance_pre.component()) {
+            // Resolved before the write lock is taken: it awaits a read of the
+            // component map, and holding the handles' writer across that stalls
+            // every inbound request, which reads the same lock to route.
+            let identity = resolved_handle.component_identity(component_id).await;
             self.workload_handles.write().await.insert(
                 resolved_handle.id().to_string(),
                 (
                     resolved_handle.clone(),
                     instance_pre,
                     component_id.to_string(),
+                    identity,
                 ),
             );
         }
@@ -1421,6 +1676,7 @@ impl<T: Router, O: OutgoingHandler> HostHandler for Ingress<T, O> {
         &self,
         workload_id: &str,
         msg: BrokerMessage,
+        attributes: std::sync::Arc<[opentelemetry::KeyValue]>,
     ) -> anyhow::Result<Result<(), String>> {
         let sender = self
             .messaging_handlers
@@ -1434,11 +1690,21 @@ impl<T: Router, O: OutgoingHandler> HostHandler for Ingress<T, O> {
                 )
             })?;
         let (tx, rx) = tokio::sync::oneshot::channel();
+        // Deadline enforced here, outside the service's store, where a
+        // non-yielding guest cannot block it (see `crate::engine::abandon`).
+        let call = DispatchedCall::new("messaging (service)", crate::timeouts::messaging_deliver());
         sender
-            .send((msg, tx))
+            .send(MessagingJob {
+                msg,
+                result_tx: tx,
+                abandoned: call.flag(),
+                attributes,
+            })
             .await
             .map_err(|_| anyhow::anyhow!("trigger service messaging instance is not running"))?;
-        rx.await
+        call.await_reply(rx)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("trigger service produced no message response in time"))?
             .map_err(|_| anyhow::anyhow!("trigger service dropped the message response"))
     }
 
@@ -1562,6 +1828,201 @@ impl<T: Router, O: OutgoingHandler> HostHandler for Ingress<T, O> {
     }
 }
 
+/// How often a saturated ingress says so. Reporting each shed connection would
+/// make the log the load problem.
+const SHED_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How long a peer has to finish a TLS handshake before its connection slot is
+/// taken back.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long an accepted connection has to produce its first request.
+///
+/// Generous, because it also covers a client that connects ahead of the traffic
+/// it is about to send. What it is not is unbounded, which is what deciding a
+/// connection's protocol otherwise is.
+const FIRST_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Free connections a saturated host has to get back before it claims capacity
+/// again, as a percentage of its ceiling.
+///
+/// Only the recovery side is a chosen number. What takes a host out of the
+/// Service is having no room at all, which needs no threshold and cannot fire
+/// on a host that is merely busy. This decides how much room is enough to stop
+/// it returning into the same wall, so getting it wrong costs a saturated host
+/// a little longer out of rotation and nothing else.
+const READY_RECOVER_PERCENT: usize = 10;
+
+/// The ingress connection ceiling, the permits enforcing it, and the counter
+/// reporting it.
+///
+/// Together rather than separately because a refusal has to be counted where it
+/// is decided: the accept loop is the only place that knows a connection was
+/// offered and turned away.
+#[derive(Clone)]
+pub struct ConnectionLimit {
+    max: usize,
+    permits: Arc<Semaphore>,
+    /// Set when the accept loop returns. A ceiling with every permit free is
+    /// indistinguishable from a listener that stopped accepting, and the second
+    /// is the more urgent of the two.
+    ///
+    /// A watch rather than a flag because both questions get asked: `/readyz`
+    /// polls it per probe, and [`Self::stopped`] waits on it so the host can
+    /// act on an accept loop that ended without being asked to.
+    stopped: Arc<tokio::sync::watch::Sender<bool>>,
+    /// Which side of the hysteresis below readiness is currently on. Shared,
+    /// because the probe handler and the accept loop hold separate clones of
+    /// the same limit.
+    has_headroom: Arc<AtomicBool>,
+    offered: opentelemetry::metrics::Counter<u64>,
+    /// Built once. `error.type` marks the refusals inside the one series, so a
+    /// shed rate is a filter on it rather than a second counter to keep in step.
+    shed: Arc<[KeyValue]>,
+}
+
+impl ConnectionLimit {
+    pub fn new(max: usize) -> Self {
+        Self {
+            max,
+            permits: Arc::new(Semaphore::new(max)),
+            stopped: Arc::new(tokio::sync::watch::Sender::new(false)),
+            has_headroom: Arc::new(AtomicBool::new(true)),
+            offered: opentelemetry::global::meter("wash-runtime")
+                .u64_counter("http.ingress.connections")
+                .with_description(
+                    "Connections offered to the host's HTTP ingress, whether held or shed",
+                )
+                .build(),
+            shed: Arc::from(vec![KeyValue::new(ERROR_TYPE, "no_capacity")]),
+        }
+    }
+
+    /// Record that the accept loop is no longer running.
+    fn stopped_accepting(&self) {
+        self.stopped.send_replace(true);
+    }
+
+    /// Whether the accept loop is still running.
+    ///
+    /// An embedder that runs no probe listener reads this — or waits on
+    /// [`Self::stopped`] — to learn what the host otherwise only logs.
+    pub fn accepting(&self) -> bool {
+        !*self.stopped.borrow()
+    }
+
+    /// Resolves once the accept loop has stopped, immediately if it already
+    /// has.
+    ///
+    /// The loop is spawned detached and nothing restarts it, so this resolving
+    /// means the host will serve no more HTTP for as long as it runs. See
+    /// [`crate::host::http::HostHandler::stopped`], which is how that reaches
+    /// the host.
+    pub async fn stopped(&self) {
+        let mut stopped = self.stopped.subscribe();
+        // `Err` is the sender dropped, which cannot happen through a `&self`
+        // holding it — and would mean the same thing if it could.
+        let _ = stopped.wait_for(|stopped| *stopped).await;
+    }
+
+    /// Take a slot for an accepted connection, or `None` at the ceiling.
+    ///
+    /// Counted either way, with no attribute naming who was refused: a
+    /// connection is turned away before its first request names a workload.
+    fn take(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        match Arc::clone(&self.permits).try_acquire_owned() {
+            Ok(permit) => {
+                self.offered.add(1, &[]);
+                Some(permit)
+            }
+            Err(_) => {
+                self.offered.add(1, &self.shed);
+                None
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for ConnectionLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionLimit")
+            .field("max", &self.max)
+            .field("available", &self.permits.available_permits())
+            .finish()
+    }
+}
+
+/// A full ingress is a reason to stop being sent work, and not a reason to be
+/// restarted.
+///
+/// Shedding keeps the host reachable, which means it keeps passing a TCP probe
+/// — so without this its endpoint stays in the Service and traffic keeps
+/// arriving for it to refuse. Readiness is what moves that traffic to a replica
+/// with capacity.
+impl crate::host::probes::ReadinessCheck for ConnectionLimit {
+    fn name(&self) -> &'static str {
+        if self.accepting() {
+            "http_ingress_saturated"
+        } else {
+            "http_ingress_stopped"
+        }
+    }
+
+    /// Not-ready means this host has no room, not that it is busy.
+    ///
+    /// A threshold on utilisation would take a healthy host out of the Service:
+    /// a ceiling of 256 and a tenth-free mark pulls it at 231 connections while
+    /// it is still serving every one of them, and replicas at similar load
+    /// cross it together. So the departure is absolute — no permits left, which
+    /// is the host actually turning connections away.
+    ///
+    /// Recovery is the part that needs a margin. Returning on a single freed
+    /// permit puts a saturated host back a probe before it is full again, so it
+    /// waits for [`READY_RECOVER_PERCENT`] of its ceiling to come back.
+    fn ready(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.accepting() {
+            return false;
+        }
+        // Never above the ceiling, so a host too small for the percentage still
+        // has a reachable recovery mark.
+        let recover = (self.max * READY_RECOVER_PERCENT / 100)
+            .max(1)
+            .min(self.max);
+        let free = self.permits.available_permits();
+        let ready = if self.has_headroom.load(Relaxed) {
+            free > 0
+        } else {
+            free >= recover
+        };
+        self.has_headroom.store(ready, Relaxed);
+        ready
+    }
+
+    /// Saturation passes; an accept loop that has ended does not.
+    ///
+    /// Nothing brings the loop back without a restart, and readiness alone does
+    /// not remove this host from anything that places work: the scheduler reads
+    /// the Host CR's heartbeat-driven condition, which a host with a dead
+    /// listener goes on satisfying. Left to readiness, it keeps being given
+    /// workloads that report Ready and are unreachable.
+    fn unrecoverable(&self) -> bool {
+        !self.accepting()
+    }
+}
+
+/// Marks [`ConnectionLimit`] stopped however the accept loop ends.
+///
+/// A guard rather than a statement after the await: a panicking task unwinds
+/// past the statement, leaving readiness reporting a healthy idle host.
+struct AcceptingGuard(ConnectionLimit);
+
+impl Drop for AcceptingGuard {
+    fn drop(&mut self) {
+        self.0.stopped_accepting();
+    }
+}
+
 /// Configure a freshly accepted connection before it is served.
 ///
 /// Disables Nagle's algorithm. Responses are written as a head segment followed
@@ -1576,6 +2037,7 @@ fn prepare_accepted_conn(stream: &TcpStream) {
 }
 
 /// HTTP server implementation that routes to workload components
+#[allow(clippy::too_many_arguments)]
 async fn run_http_server<T: Router>(
     listener: TcpListener,
     handler: Arc<T>,
@@ -1583,9 +2045,16 @@ async fn run_http_server<T: Router>(
     service_handlers: ServiceHandlers,
     shutdown_rx: &mut mpsc::Receiver<()>,
     tls_acceptor: Option<TlsAcceptor>,
-    fuel_meter: FuelConsumptionMeter,
+    guest_meter: GuestMeter,
+    connections: ConnectionLimit,
 ) -> anyhow::Result<()> {
+    let mut backoff = crate::host::accept::AcceptBackoff::default();
+    let mut shed = 0u64;
+    let mut shed_reported: Option<std::time::Instant> = None;
     loop {
+        // Taken before the select rather than inside it, so the pause races the
+        // shutdown branch instead of needing a second copy of it.
+        let pause = backoff.pause();
         tokio::select! {
             // Handle shutdown signal
             _ = shutdown_rx.recv() => {
@@ -1593,9 +2062,33 @@ async fn run_http_server<T: Router>(
                 break;
             }
             // Accept new connections
-            result = listener.accept() => {
+            result = async {
+                if let Some(pause) = pause {
+                    tokio::time::sleep(pause).await;
+                }
+                listener.accept().await
+            } => {
                 match result {
                     Ok((client, client_addr)) => {
+                        // A connection there is no descriptor budget to hold is
+                        // closed now, while closing it is cheap. Holding it
+                        // instead is what exhausts the process's descriptors,
+                        // and a host that cannot accept is a host nothing can
+                        // reach — including its own liveness probe.
+                        let Some(slot) = connections.take() else {
+                            shed += 1;
+                            if shed_reported.is_none_or(|at| at.elapsed() >= SHED_LOG_INTERVAL) {
+                                warn!(
+                                    max_connections = connections.max, shed,
+                                    "HTTP ingress is at its connection ceiling; shedding new connections"
+                                );
+                                shed_reported = Some(std::time::Instant::now());
+                                shed = 0;
+                            }
+                            drop(client);
+                            continue;
+                        };
+
                         debug!(addr = ?client_addr, "new HTTP client connection");
 
                         prepare_accepted_conn(&client);
@@ -1604,42 +2097,64 @@ async fn run_http_server<T: Router>(
                         let service_handlers_clone = service_handlers.clone();
                         let tls_acceptor_clone = tls_acceptor.clone();
                         let handler_clone = handler.clone();
-                        let fuel_meter = fuel_meter.clone();
+                        let guest_meter = guest_meter.clone();
                         tokio::spawn(async move {
+                            // Held for the connection's life: its descriptor is
+                            // only given back once hyper is done with it.
+                            let _slot = slot;
+                            let requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                            let first_request = Arc::clone(&requested);
                             let service = hyper::service::service_fn(move |req| {
+                                first_request.store(true, std::sync::atomic::Ordering::Relaxed);
                                 let handles = handles_clone.clone();
                                 let service_handlers = service_handlers_clone.clone();
                                 let handler = handler_clone.clone();
-                                let fuel_meter = fuel_meter.clone();
+                                let guest_meter = guest_meter.clone();
                                 async move {
                                     let extractor = opentelemetry_http::HeaderExtractor(req.headers());
                                     let remote_context =
                                         opentelemetry::global::get_text_map_propagator(|propagator| propagator.extract(&extractor));
 
-                                    handle_http_request(handler, req, handles, service_handlers, fuel_meter).with_context(remote_context).await
+                                    handle_http_request(handler, req, handles, service_handlers, guest_meter).with_context(remote_context).await
                                 }
                             });
 
                             let mut builder = auto::Builder::new(TokioExecutor::new());
+                            // Arms hyper's own header-read timeout, which
+                            // bounds a peer dribbling headers once its protocol
+                            // is known. Deciding that protocol is bounded
+                            // separately, below.
                             builder
                                 .http1()
+                                .timer(TokioTimer::new())
                                 .keep_alive(true);
                             builder
                                 .http2()
                                 .timer(TokioTimer::new())
                                 .keep_alive_interval(Some(Duration::from_secs(20)));
 
-                            let result = if let Some(acceptor) = tls_acceptor_clone {
-                                // Handle HTTPS connection
-                                match acceptor.accept(client).await {
-                                    Ok(tls_stream) => {
+                            let serve = async {
+                            if let Some(acceptor) = tls_acceptor_clone {
+                                // Handle HTTPS connection. Bounded, because a
+                                // handshake nobody finishes holds a connection
+                                // slot that no request will ever release.
+                                let handshake = tokio::time::timeout(
+                                    TLS_HANDSHAKE_TIMEOUT,
+                                    acceptor.accept(client),
+                                );
+                                match handshake.await {
+                                    Err(_) => {
+                                        warn!(addr = ?client_addr, "TLS handshake timed out");
+                                        Ok(())
+                                    }
+                                    Ok(Ok(tls_stream)) => {
                                         builder
                                             .serve_connection_with_upgrades(TokioIo::new(tls_stream), service)
                                             .await
                                     }
-                                    Err(e) => {
+                                    Ok(Err(e)) => {
                                         error!(addr = ?client_addr, err = ?e, "TLS handshake failed");
-                                        return;
+                                        Ok(())
                                     }
                                 }
                             } else {
@@ -1647,15 +2162,64 @@ async fn run_http_server<T: Router>(
                                 builder
                                     .serve_connection_with_upgrades(TokioIo::new(client), service)
                                     .await
+                            }
+                            };
+
+                            // A connection earns its slot by asking for
+                            // something: sniffing its protocol is bounded by
+                            // nothing, so a peer sending half an HTTP/2 preface
+                            // would hold one forever.
+                            let mut serve = std::pin::pin!(serve);
+                            let mut deadline = std::pin::pin!(tokio::time::sleep(FIRST_REQUEST_TIMEOUT));
+                            let mut expired = false;
+                            let result = loop {
+                                tokio::select! {
+                                    // Biased, so the connection is always polled
+                                    // before the deadline is acted on. `requested`
+                                    // is set from inside the service, which only
+                                    // runs while `serve` is being polled — with
+                                    // the arms chosen at random, a request that
+                                    // arrived in the same instant the deadline
+                                    // fired had not been seen yet, and the
+                                    // connection was dropped with that request
+                                    // unanswered and unread. Polling first is what
+                                    // makes "sent no request" mean it.
+                                    biased;
+                                    result = &mut serve => break result,
+                                    () = &mut deadline, if !expired => {
+                                        expired = true;
+                                        if !requested.load(std::sync::atomic::Ordering::Relaxed) {
+                                            debug!(addr = ?client_addr, "closing a connection that sent no request");
+                                            return;
+                                        }
+                                    }
+                                }
                             };
 
                             if let Err(e) = result {
-                                error!(addr = ?client_addr, err = ?e, "error serving HTTP client");
+                                // A timeout is the peer not sending, which is
+                                // what the deadline above closes connections
+                                // for. Both bound that same condition, so
+                                // whichever fires first decides nothing about
+                                // what happened — and `ERROR` here would put a
+                                // probe, a port scan or a forwarded port whose
+                                // far end went away beside real serving
+                                // failures, in the one place an operator looks
+                                // for them.
+                                if ended_in_timeout(&*e) {
+                                    debug!(addr = ?client_addr, err = ?e, "closing a connection that sent no request");
+                                } else {
+                                    error!(addr = ?client_addr, err = ?e, "error serving HTTP client");
+                                }
                             }
                         });
                     }
                     Err(e) => {
-                        error!(err = ?e, "failed to accept HTTP connection");
+                        if backoff.failed(&e) {
+                            error!(err = ?e, failures = backoff.failures(), "HTTP ingress cannot accept connections");
+                        } else {
+                            debug!(err = ?e, "failed to accept HTTP connection");
+                        }
                     }
                 }
             }
@@ -1663,6 +2227,17 @@ async fn run_http_server<T: Router>(
     }
 
     Ok(())
+}
+
+/// Whether a served connection ended because the peer stopped sending.
+///
+/// The connection future is boxed by the protocol-detecting builder, so the
+/// hyper error carrying that answer can be at any depth of the chain.
+fn ended_in_timeout(e: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(hyper) = e.downcast_ref::<hyper::Error>() {
+        return hyper.is_timeout();
+    }
+    e.source().is_some_and(ended_in_timeout)
 }
 
 /// Build an error response with the given status code.
@@ -1709,7 +2284,7 @@ async fn handle_http_request<T: Router>(
     req: hyper::Request<hyper::body::Incoming>,
     workload_handles: WorkloadHandles,
     service_handlers: ServiceHandlers,
-    fuel_meter: FuelConsumptionMeter,
+    guest_meter: GuestMeter,
 ) -> Result<hyper::Response<HyperOutgoingBody>, hyper::Error> {
     let method = req.method().clone();
     let uri = req.uri().clone();
@@ -1742,18 +2317,31 @@ async fn handle_http_request<T: Router>(
     let service_sender = service_handlers.read().await.get(&workload_id).cloned();
     if let Some(sender) = service_sender {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-        let response = if sender.send((req, resp_tx)).await.is_err() {
+        // The deadline is enforced here, outside the service's store: a guest
+        // that never yields blocks every host future on its own store, so only
+        // a waiter out here can abandon the call (see `crate::engine::abandon`).
+        let call = DispatchedCall::new("HTTP (service)", crate::timeouts::http_response());
+        let job = ServiceHttpJob {
+            req,
+            resp_tx,
+            abandoned: call.flag(),
+        };
+        let response = if sender.send(job).await.is_err() {
             error!(host = %workload_id, "service HTTP instance is not running");
             error_response(503)
         } else {
-            match resp_rx.await {
-                Ok(Ok(resp)) => resp,
-                Ok(Err(e)) => {
+            match call.await_head(resp_rx).await {
+                Some((Ok(Ok(resp)), watch)) => watch_body(resp, watch),
+                Some((Ok(Err(e)), _)) => {
                     error!(err = ?e, "service HTTP handler failed");
                     error_response(500)
                 }
-                Err(_) => {
+                Some((Err(_), _)) => {
                     error!("service HTTP instance dropped the response");
+                    error_response(500)
+                }
+                None => {
+                    error!("service HTTP instance produced no response");
                     error_response(500)
                 }
             }
@@ -1772,7 +2360,7 @@ async fn handle_http_request<T: Router>(
     };
 
     let response = match workload_handle {
-        Some((handle, instance_pre, component_id)) => {
+        Some((handle, instance_pre, component_id, identity)) => {
             let req_span = tracing::span!(
                 tracing::Level::INFO,
                 "invoke_component_handler",
@@ -1780,9 +2368,16 @@ async fn handle_http_request<T: Router>(
                 workload.namespace = handle.namespace(),
                 workload.id = handle.id(),
             );
-            match invoke_component_handler(handle, instance_pre, &component_id, req, fuel_meter)
-                .instrument(req_span)
-                .await
+            match invoke_component_handler(
+                handle,
+                instance_pre,
+                &component_id,
+                req,
+                guest_meter,
+                &identity,
+            )
+            .instrument(req_span)
+            .await
             {
                 Ok(resp) => resp,
                 Err(e) => {
@@ -1994,7 +2589,9 @@ async fn invoke_component_handler(
     instance_pre: InstancePre<SharedCtx>,
     component_id: &str,
     req: hyper::Request<hyper::body::Incoming>,
-    fuel_meter: FuelConsumptionMeter,
+    guest_meter: GuestMeter,
+    // Resolved once when the route was registered: this runs per request.
+    identity: &crate::observability::WorkloadIdentity,
 ) -> anyhow::Result<hyper::Response<HyperOutgoingBody>> {
     if crate::engine::targets_wasip3_http(instance_pre.component()) {
         let pool = workload_handle
@@ -2005,50 +2602,76 @@ async fn invoke_component_handler(
         // alongside whatever else that instance already has in flight. Only
         // when every warm instance is full and the pool is at `pool_size` does
         // the request fall through to a store of its own.
+        let mut reclaimed = None;
         let req = if let Some(pool) = pool.as_ref() {
             use crate::engine::instance_driver::InstanceJob;
-            use crate::engine::instance_pool::Dispatch;
+            use crate::engine::instance_pool::Declined;
             let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-            let outcome = match pool.offer(InstanceJob::Http(Box::new((req, resp_tx)))) {
-                Dispatch::Sent => Ok(()),
-                // The pool has room. Build and instantiate the store out here,
-                // where awaiting is allowed and where a component that fails
-                // to instantiate reports that failure to this request rather
-                // than only to the log.
-                Dispatch::NeedsInstance(job) => {
-                    let mut store = workload_handle.new_store(component_id).await?;
-                    let instance = instance_pre.instantiate_async(&mut store).await?;
-                    pool.install(
-                        crate::engine::instance_pool::ComponentInstance { store, instance },
-                        job,
-                    )
-                }
-                Dispatch::Saturated(job) => Err(job),
-            };
+            let call = DispatchedCall::new("HTTP (pooled)", crate::timeouts::http_response());
+            let job = InstanceJob::Http(Box::new(ServiceHttpJob {
+                req,
+                resp_tx,
+                abandoned: call.flag(),
+            }));
+            let outcome =
+                crate::engine::instance_pool::offer_or_install(pool, &instance_pre, job, || {
+                    workload_handle.new_store(component_id)
+                })
+                .await?;
             match outcome {
                 Ok(()) => {
-                    return resp_rx
+                    let (resp, watch) = call
+                        .await_head(resp_rx)
                         .await
-                        .map_err(|_| anyhow::anyhow!("pooled instance dropped the request"))?;
+                        .ok_or_else(|| anyhow::anyhow!("pooled instance produced no response"))?;
+                    let resp =
+                        resp.map_err(|_| anyhow::anyhow!("pooled instance dropped the request"))??;
+                    return Ok(watch_body(resp, watch));
                 }
                 // Every warm instance was busy; serve it cold below.
-                Err(InstanceJob::Http(job)) => job.0,
+                Err(Declined {
+                    job: InstanceJob::Http(job),
+                    instance,
+                }) => {
+                    reclaimed = instance;
+                    job.req
+                }
                 // A job comes back as the variant it went in as, so this is
                 // unreachable — but not worth a panic on a request path.
-                Err(InstanceJob::Linked(_)) => {
-                    debug_assert!(false, "an HTTP job cannot come back as a linked one");
-                    anyhow::bail!("instance pool returned a linked job for an HTTP request");
+                Err(Declined { job: other, .. }) => {
+                    debug_assert!(false, "an HTTP job cannot come back as another kind");
+                    anyhow::bail!(
+                        "instance pool returned a {} job for an HTTP request",
+                        match other {
+                            InstanceJob::Linked(_) => "linked",
+                            InstanceJob::Messaging(_) => "messaging",
+                            InstanceJob::Guest(_) => "dispatched",
+                            InstanceJob::Http(_) => "http",
+                        }
+                    );
                 }
             }
         } else {
             req
         };
 
-        let mut store = workload_handle.new_store(component_id).await?;
-        let instance = instance_pre.instantiate_async(&mut store).await?;
-        let cold = crate::engine::instance_pool::ComponentInstance { store, instance };
-        let resp = crate::host::http_p3::handle_component_request_p3(cold, req, fuel_meter).await?;
-        let (parts, body) = resp.into_parts();
+        let cold = match reclaimed {
+            Some(built) => built,
+            None => {
+                let mut store = workload_handle.new_store(component_id).await?;
+                let instance = instance_pre.instantiate_async(&mut store).await?;
+                crate::engine::instance_pool::ComponentInstance { store, instance }
+            }
+        };
+        let call = DispatchedCall::new("HTTP (cold store)", crate::timeouts::http_response());
+        let flag = call.flag();
+        let (resp, watch) = call
+            .await_head(crate::host::http_p3::handle_component_request_p3(
+                cold, req, flag,
+            ))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("cold instance produced no response"))?;
+        let (parts, body) = resp?.into_parts();
         let body = HyperOutgoingBody::new(
             body.map_err(|e| {
                 wasmtime_wasi_http::p2::bindings::http::types::ErrorCode::InternalError(Some(
@@ -2057,14 +2680,14 @@ async fn invoke_component_handler(
             })
             .boxed_unsync(),
         );
-        return Ok(hyper::Response::from_parts(parts, body));
+        return Ok(watch_body(hyper::Response::from_parts(parts, body), watch));
     }
 
     // The p2 path still builds and instantiates per request: its store is
     // owned by a detached task that outlives the response head, so recovering
     // it for reuse needs a restructure the p3 path did not.
     let store = workload_handle.new_store(component_id).await?;
-    handle_component_request(store, instance_pre, req, fuel_meter).await
+    handle_component_request(store, instance_pre, req, guest_meter, identity).await
 }
 
 /// Handle a component request using WASI HTTP (copied from wash/crates/src/cli/dev.rs)
@@ -2072,7 +2695,8 @@ pub async fn handle_component_request(
     mut store: Store<SharedCtx>,
     pre: InstancePre<SharedCtx>,
     req: hyper::Request<hyper::body::Incoming>,
-    fuel_meter: FuelConsumptionMeter,
+    guest_meter: GuestMeter,
+    identity: &crate::observability::WorkloadIdentity,
 ) -> anyhow::Result<hyper::Response<HyperOutgoingBody>> {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let scheme = match req.uri().scheme() {
@@ -2083,14 +2707,7 @@ pub async fn handle_component_request(
         None => Scheme::Http,
     };
 
-    let method = req.method().to_string();
-    let host_header = req
-        .headers()
-        .get(hyper::header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .map(|h| h.to_string())
-        .unwrap_or_default();
-    let uri = req.uri().to_string();
+    let attributes = http_attributes(identity, req.method(), HTTP_OPERATION_P2);
 
     let req = store.data_mut().http().new_incoming_request(scheme, req)?;
     let out = store.data_mut().http().new_response_outparam(sender)?;
@@ -2098,32 +2715,30 @@ pub async fn handle_component_request(
         .map_err(anyhow::Error::from)
         .context("failed to instantiate proxy pre")?;
 
+    // The deadline is enforced below, outside the store, where a non-yielding
+    // guest cannot block it (see `crate::engine::abandon`).
+    let call = DispatchedCall::new("HTTP (p2 cold store)", crate::timeouts::http_response());
+    let watch_guard = store.data().abandoned.watch(call.flag());
+
     // Run the http request itself in a separate task so the task can
     // optionally continue to execute beyond after the initial
     // headers/response code are sent.
     let task: JoinHandle<anyhow::Result<()>> = tokio::task::spawn(
         async move {
+            // Watched for as long as the store runs guest code.
+            let _abandoned = watch_guard;
             // Run the http request itself by instantiating and calling the component
             let proxy = pre.instantiate_async(&mut store).await?;
 
-            fuel_meter
-                .observe(
-                    &[
-                        KeyValue::new("plugin", "wasi-http"),
-                        KeyValue::new("method", method),
-                        KeyValue::new("host", host_header),
-                        KeyValue::new("uri", uri),
-                    ],
-                    &mut store,
-                    async move |store| {
-                        proxy
-                            .wasi_http_incoming_handler()
-                            .call_handle(store, req, out)
-                            .await?;
+            guest_meter
+                .observe(&attributes, &mut store, async move |store| {
+                    proxy
+                        .wasi_http_incoming_handler()
+                        .call_handle(store, req, out)
+                        .await?;
 
-                        Ok(())
-                    },
-                )
+                    Ok(())
+                })
                 .await?;
 
             Ok(())
@@ -2131,15 +2746,15 @@ pub async fn handle_component_request(
         .in_current_span(),
     );
 
-    match receiver.await {
+    match call.await_head(receiver).await {
         // If the client calls `response-outparam::set` then one of these
         // methods will be called.
-        Ok(Ok(resp)) => Ok(resp),
-        Ok(Err(e)) => Err(e.into()),
+        Some((Ok(Ok(resp)), watch)) => Ok(watch_body(resp, watch)),
+        Some((Ok(Err(e)), _)) => Err(e.into()),
 
         // Otherwise the `sender` will get dropped along with the `Store`
         // meaning that the oneshot will get disconnected
-        Err(e) => {
+        Some((Err(e), _)) => {
             if let Err(task_error) = task.await {
                 error!(err = ?task_error, "error receiving http response");
                 Err(anyhow::anyhow!(
@@ -2152,6 +2767,10 @@ pub async fn handle_component_request(
                 ))
             }
         }
+
+        // No response within the deadline; the call is abandoned, and the
+        // store's epoch callback ends the guest work behind it.
+        None => Err(anyhow::anyhow!("component produced no response in time")),
     }
 }
 
@@ -2917,6 +3536,249 @@ mod tests {
             server.nodelay().unwrap(),
             "run_http_server must set TCP_NODELAY on accepted connections"
         );
+    }
+
+    /// However the accept loop ends, it has to be findable. It is spawned
+    /// detached and nothing restarts it, so a host that only logged the exit
+    /// holds every workload it was given, keeps answering its control plane,
+    /// and serves no HTTP for the rest of its life.
+    #[tokio::test]
+    async fn a_stopped_accept_loop_is_observable_and_unrecoverable() {
+        use crate::host::probes::ReadinessCheck as _;
+
+        let ingress = Ingress::builder(DevRouter::default(), "127.0.0.1:0".parse().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let limit = ingress.connection_limit();
+
+        assert!(limit.accepting());
+        assert!(limit.ready(), "a fresh ingress has room");
+        assert!(!limit.unrecoverable());
+
+        ingress.start().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), ingress.stopped())
+                .await
+                .is_err(),
+            "a running accept loop must not report itself stopped"
+        );
+
+        ingress.stop().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), ingress.stopped())
+            .await
+            .expect("the accept loop's exit has to reach whoever is watching for it");
+
+        assert!(!limit.accepting());
+        assert!(!limit.ready());
+        assert_eq!(limit.name(), "http_ingress_stopped");
+        // The distinction from saturation: a full ingress empties, this does
+        // not — so it is a reason to be replaced, not only to leave the Service.
+        assert!(limit.unrecoverable());
+    }
+
+    /// A host at its ingress ceiling has to keep accepting and close what it
+    /// cannot serve. Leaving the connections queued instead fills the listen
+    /// backlog, and once that is full the kernel drops new handshakes — so a TCP
+    /// liveness probe times out and a running host is killed as unreachable.
+    #[tokio::test]
+    async fn a_saturated_ingress_keeps_accepting() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+
+        let server = tokio::spawn(async move {
+            run_http_server(
+                listener,
+                Arc::new(DevRouter::default()),
+                WorkloadHandles::default(),
+                ServiceHandlers::default(),
+                &mut shutdown_rx,
+                None,
+                Meters::default().guest(),
+                ConnectionLimit::new(1),
+            )
+            .await
+        });
+
+        // Takes the only permit and holds it: nothing reads or writes, so the
+        // server keeps the connection open.
+        let _held = TcpStream::connect(addr).await.unwrap();
+
+        // A real client has its request in flight by the time the ceiling is
+        // checked, so the shed path has to survive unread bytes.
+        let mut shed = TcpStream::connect(addr).await.unwrap();
+        let _ = shed.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        let closed = tokio::time::timeout(Duration::from_secs(5), shed.read(&mut [0u8; 64])).await;
+        match closed.expect("a connection past the ceiling must be closed, not left hanging") {
+            Ok(0) => {}
+            // The kernel answers unread bytes with an RST rather than a FIN.
+            // Windows reports that as `ConnectionAborted` (WSAECONNABORTED).
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) => {}
+            Ok(n) => {
+                panic!("the ceiling was not enforced: the shed connection was served {n} bytes")
+            }
+            Err(e) => panic!("expected the server to close the shed connection, got {e:?}"),
+        }
+
+        let _ = shutdown_tx.send(()).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
+    }
+
+    /// Wait for the ingress to reach `want` free permits, or fail saying what it
+    /// reached instead. Bounded well past `FIRST_REQUEST_TIMEOUT` so a paused
+    /// clock advances through the deadline under test.
+    async fn await_permits(limit: &ConnectionLimit, want: usize, why: &str) {
+        for _ in 0..2_000 {
+            if limit.permits.available_permits() == want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!(
+            "{why}: permits stayed at {}",
+            limit.permits.available_permits()
+        );
+    }
+
+    /// A busy host is not an unready one. The mark that takes it out of the
+    /// Service is having nothing left to give, so a host serving every
+    /// connection it holds stays in rotation however close to the ceiling it
+    /// is — otherwise replicas at similar load leave together and the Service
+    /// empties while every one of them is healthy.
+    #[test]
+    fn a_host_with_room_stays_ready_however_busy() {
+        use crate::host::probes::ReadinessCheck as _;
+
+        let limit = ConnectionLimit::new(100);
+        let mut held = Vec::new();
+        while limit.permits.available_permits() > 1 {
+            held.push(limit.permits.clone().try_acquire_owned().unwrap());
+        }
+        assert!(
+            limit.ready(),
+            "99 of 100 connections in use is busy, not full"
+        );
+
+        held.push(limit.permits.clone().try_acquire_owned().unwrap());
+        assert!(!limit.ready(), "no permits left is the host refusing work");
+    }
+
+    /// Recovery waits for real room. One freed permit would put a saturated
+    /// host back into rotation a probe before it is full again.
+    #[test]
+    fn a_saturated_host_waits_for_room_before_returning() {
+        use crate::host::probes::ReadinessCheck as _;
+
+        let limit = ConnectionLimit::new(100);
+        let mut held = Vec::new();
+        while limit.permits.available_permits() > 0 {
+            held.push(limit.permits.clone().try_acquire_owned().unwrap());
+        }
+        assert!(!limit.ready());
+
+        held.truncate(held.len() - 9);
+        assert!(!limit.ready(), "9 free of 100 is not yet the recovery mark");
+        held.truncate(held.len() - 1);
+        assert!(limit.ready(), "10 free of 100 clears it");
+    }
+
+    /// The smallest ceiling there is. Its recovery mark has to be reachable, or
+    /// a host started with one connection never returns after its first.
+    #[test]
+    fn a_ceiling_of_one_recovers() {
+        use crate::host::probes::ReadinessCheck as _;
+
+        let limit = ConnectionLimit::new(1);
+        assert!(limit.ready(), "idle with its one connection free");
+        let only = limit.permits.clone().try_acquire_owned().unwrap();
+        assert!(!limit.ready(), "its one connection is in use");
+        drop(only);
+        assert!(limit.ready(), "and free again");
+    }
+
+    /// The connection future is boxed, and a real serving failure has to stay
+    /// an `ERROR` however deep the chain gets. Only the hyper error at the
+    /// bottom of it decides, and a chain that has none is not a timeout.
+    #[test]
+    fn a_served_error_that_is_not_a_timeout_stays_an_error() {
+        #[derive(Debug)]
+        struct Wrapped(std::io::Error);
+        impl std::fmt::Display for Wrapped {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "wrapped")
+            }
+        }
+        impl std::error::Error for Wrapped {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let reset = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        assert!(!ended_in_timeout(&reset), "a reset is not a timeout");
+        assert!(
+            !ended_in_timeout(&Wrapped(std::io::Error::from(
+                std::io::ErrorKind::ConnectionReset
+            ))),
+            "and neither is one behind a wrapper"
+        );
+        // A chain with no hyper error in it must terminate rather than recurse
+        // on itself.
+        assert!(!ended_in_timeout(&Wrapped(std::io::Error::other("x"))));
+    }
+
+    /// A connection that never asks for anything must give its slot back.
+    ///
+    /// hyper decides h1 vs h2 by reading up to 24 preface bytes, and that read
+    /// has no timeout of its own — a peer sending nothing, or half a preface,
+    /// parks there. Holding a ceiling slot the whole time turns a handful of
+    /// silent peers into a host that reports itself full, which the readiness
+    /// check then reports to Kubernetes as a reason to take it out of service.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_that_never_speaks_gives_its_slot_back() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+        let limit = ConnectionLimit::new(1);
+
+        let served = limit.clone();
+        tokio::spawn(async move {
+            run_http_server(
+                listener,
+                Arc::new(DevRouter::default()),
+                WorkloadHandles::default(),
+                ServiceHandlers::default(),
+                &mut shutdown_rx,
+                None,
+                Meters::default().guest(),
+                served,
+            )
+            .await
+        });
+
+        // Half an HTTP/2 preface: enough that the connection is not idle, not
+        // enough for hyper to decide what it is.
+        let mut silent = TcpStream::connect(addr).await.unwrap();
+        silent.write_all(b"PRI * HTTP/2.0").await.unwrap();
+
+        // Polled rather than slept on: the paused clock advances the moment this
+        // task idles, which can be before the OS has delivered accept readiness.
+        await_permits(&limit, 0, "the silent connection should hold the only slot").await;
+        await_permits(
+            &limit,
+            1,
+            "a connection that sent no request must not hold its slot forever",
+        )
+        .await;
     }
 
     // --- check_allowed_hosts tests ---

@@ -13,6 +13,7 @@ use wasmtime::component::types::Type;
 use wasmtime::component::{Accessor, AccessorTask, ComponentExportIndex, Instance, Val};
 use wasmtime::error::Context as _;
 
+use super::InFlightGuard;
 use crate::engine::ctx::{CallerIdentity, SharedCtx};
 use crate::engine::store::relocate::{self, Relocated};
 use crate::host::job_registry::{JobGuard, JobRegistry};
@@ -64,6 +65,11 @@ pub struct CapabilityCall {
     /// Carries the call's relocated results (or a trap/routing error) back to
     /// the shim.
     pub reply: tokio::sync::oneshot::Sender<wasmtime::Result<Vec<Relocated>>>,
+    /// The abandonment flag of the dispatched call enforcing this job's
+    /// deadline (see [`crate::engine::abandon`]). The plugin store is
+    /// `WarnThenTrap`, so an abandoned call here is logged at the grace and
+    /// only traps the shared store at the escalation.
+    pub abandoned: Arc<crate::engine::abandon::AbandonFlag>,
 }
 
 /// A `wasmcloud:host/workload-lifecycle` bind a fresh plugin incarnation must
@@ -207,24 +213,6 @@ pub(super) struct CapabilityTask {
     pub(super) job_guard: JobGuard,
 }
 
-/// Decrements a plugin store's in-flight capability-call counter on drop, so a
-/// slot is reclaimed whether the task completes normally or is cancelled. Backs
-/// the non-blocking admission ceiling (see [`MAX_INFLIGHT_CAPABILITY_CALLS`] for
-/// why a plain atomic rather than a [`tokio::sync::Semaphore`]).
-pub(super) struct InFlightGuard(Arc<AtomicUsize>);
-
-impl InFlightGuard {
-    pub(super) fn new(counter: Arc<AtomicUsize>) -> Self {
-        Self(counter)
-    }
-}
-
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
 /// Free every resource whose proxy a caller has dropped since the last flush,
 /// using the top-level store access `resource_drop_async` requires (unavailable
 /// inside `run_concurrent`). Runs each guest resource destructor.
@@ -274,7 +262,15 @@ impl AccessorTask<SharedCtx> for CapabilityTask {
             args,
             result_tys,
             reply,
+            abandoned,
         } = call;
+
+        // The epoch deadline measures this call's own execution, so re-arm it
+        // here. `watch_until_abandoned` below owns the registration.
+        let calls = accessor.with(|mut access| {
+            crate::engine::abandon::rearm_for_call(&mut access);
+            Arc::clone(&access.get().abandoned)
+        });
 
         // Look up the export and inject the relocated arguments — in one discrete
         // sync block, never holding the borrow across the await below.
@@ -319,7 +315,20 @@ impl AccessorTask<SharedCtx> for CapabilityTask {
             }
         };
         job_guard.set_task(task_id, caller);
-        let call_result = func_handle.finish_call_concurrent(accessor, call).await;
+        // Runs to completion however long it takes, because callers here need
+        // the result even after giving up. A `wasmcloud:host/workload-lifecycle`
+        // bind is uncancellable, and an over-budget one has its deploy failed
+        // while the host defers a rollback unbind until the hook completes, so
+        // ending the wait early would strand whatever it provisions
+        // (`test_bind_timeout_defers_rollback_unbind`). This bounds only how
+        // long the call stays visible to the epoch callback, whose trap would
+        // take the singleton every tenant shares.
+        let call_result = crate::engine::abandon::watch_until_abandoned(
+            &calls,
+            abandoned,
+            func_handle.finish_call_concurrent(accessor, call),
+        )
+        .await;
         if let Err(e) = call_result {
             let _ = reply.send(Err(
                 e.context(format!("capability call {interface}/{func} trapped"))

@@ -217,15 +217,73 @@ pub fn targets_wasip3_http(component: &Component) -> bool {
             .any(|(name, _)| name.starts_with("wasi:http") && name.contains("@0.3"))
 }
 
+pub mod abandon;
 pub mod ctx;
+pub mod dispatch;
+pub mod guest_memory;
 pub(crate) mod instance_driver;
 pub(crate) mod instance_pool;
-pub use instance_pool::InstancePolicy;
+pub use instance_pool::{InstancePolicy, ReclaimPolicy};
+pub mod host_memory;
 pub(crate) mod linked_call;
 pub(crate) mod store;
 mod value;
 mod volumes;
 pub mod workload;
+
+/// How often the engine's epoch advances.
+///
+/// This is the resolution of the deadline checks compiled into every guest, not
+/// how often any store is interrupted: what a store does when its deadline
+/// passes is [`crate::engine::abandon::arm_epoch_deadline`]'s decision. It
+/// bounds how promptly an abandoned call can be noticed.
+pub(crate) const EPOCH_TICK: Duration = Duration::from_millis(10);
+
+/// What the pooling allocator was configured with, read back from the installed
+/// [`PoolingAllocationConfig`].
+///
+/// [`host_memory::HostMemoryBudgets`] holds what was asked for. The environment
+/// moves each of these three independently, so the two can disagree.
+#[derive(Debug, Clone, Copy)]
+struct InstalledPool {
+    core_instances: u32,
+    memories: u32,
+    max_memory_size: u64,
+}
+
+impl InstalledPool {
+    /// Address space the pool reserves. Keyed on the memory count, not the
+    /// instance count.
+    fn reservation(&self) -> u64 {
+        self.max_memory_size
+            .saturating_mul(u64::from(self.memories))
+    }
+}
+
+/// Start the thread that advances `engine`'s epoch every [`EPOCH_TICK`].
+///
+/// Holds a [`wasmtime::Engine::weak`] handle rather than the engine itself, so
+/// the ticker does not keep a dropped engine alive: the next tick after the last
+/// strong reference goes away fails to upgrade and the thread ends. One ticker
+/// per engine, started at construction — an engine built with
+/// `epoch_interruption` whose epoch never advances would hang any store that
+/// armed a deadline.
+fn spawn_epoch_ticker(engine: &wasmtime::Engine) -> anyhow::Result<()> {
+    let weak = engine.weak();
+    std::thread::Builder::new()
+        .name("wasmtime-epoch-ticker".to_string())
+        .spawn(move || {
+            while let Some(engine) = weak.upgrade() {
+                engine.increment_epoch();
+                // Drop the strong reference before sleeping, so a dropped
+                // engine is not kept alive for a whole tick.
+                drop(engine);
+                std::thread::sleep(EPOCH_TICK);
+            }
+        })
+        .context("failed to spawn the epoch ticker thread")?;
+    Ok(())
+}
 
 /// The core WebAssembly engine for executing components and workloads.
 ///
@@ -237,11 +295,24 @@ pub struct Engine {
     // wasmtime engine
     pub(crate) inner: wasmtime::Engine,
     pub(crate) cache: Cache<CacheKey, CacheValue>,
+    /// Compiles that actually ran on this engine.
+    ///
+    /// Test-only, and there is no way to do without it: what the digest-keyed
+    /// cache buys is that a herd of replicas shares one compile, and from
+    /// outside, one compile and fifteen racing to insert the same key leave
+    /// exactly the same single cache entry.
+    #[cfg(test)]
+    pub(crate) compiles: Arc<std::sync::atomic::AtomicUsize>,
     /// Host-level socket policy every workload on this engine inherits:
     /// enforcement mode, address ranges, whether the host-loopback door is open,
     /// the host's port table, and the connection budget. The workload-level half
     /// (`allowedHosts`, `allowedHostLoopbackPorts`) is layered over it per component.
     pub(crate) socket_policy: Arc<crate::sockets::policy::SocketPolicy>,
+    pub(crate) host_memory: host_memory::HostMemoryBudgets,
+    /// The host-wide counter of guest linear-memory bytes that
+    /// [`host_memory::HostMemoryBudgets::max_guest_memory`] is the cap on.
+    /// Every store this engine builds carries a limiter drawing on it.
+    pub(crate) guest_memory: Arc<guest_memory::GuestMemoryBudget>,
     /// TLS provider override for `wasi:tls` client connections.
     #[cfg(feature = "wasi-tls")]
     pub(crate) tls_provider: Option<SharedTlsProvider>,
@@ -255,6 +326,16 @@ pub struct Engine {
     /// somewhere else would miss the env override (applied inside
     /// [`new_pooling_config`]) and drift the moment either side changed.
     total_core_instances: Option<u32>,
+    /// Linear memory the pooling allocator actually admits per memory, read
+    /// back from the installed [`PoolingAllocationConfig`]. `None` when
+    /// pooling is off, i.e. when no ceiling is enforced.
+    ///
+    /// Captured for the same reason as `total_core_instances`:
+    /// `--default-heap-memory` is only the *requested* size, and
+    /// `WASMTIME_POOLING_MAX_MEMORY_SIZE` or a caller-supplied pooling config
+    /// replaces it outright. Quoting the flag in a refusal that the installed
+    /// ceiling caused produces advice that cannot work.
+    installed_heap_memory: Option<u64>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -306,19 +387,82 @@ impl std::error::Error for SharedError {
     }
 }
 
+/// Turns a compile failure into something an operator can act on.
+///
+/// The pooling allocator refuses a component whose minimum linear memory
+/// exceeds `--default-heap-memory` with a message that is precise and useless:
+/// it mixes decimal and hex, names no flag, and — once it has been re-wrapped
+/// on the way up and truncated at the CRD boundary — reaches a `kubectl`-only
+/// operator as nothing at all. The refusal is correct; only the explanation is
+/// missing, and every number it needs is already here.
+fn explain_compile_failure(e: wasmtime::Error, default_heap_memory: u64) -> anyhow::Error {
+    use host_memory::render_bytes;
+
+    let text = format!("{e:#}");
+    let Some(required) = parse_pooling_minimum(&text) else {
+        return anyhow::Error::from(e);
+    };
+    // Round up to the next power of two at or above the requirement: the pool
+    // sizes slots in whole memories, so the next size that certainly fits is
+    // the useful advice, not the bare minimum.
+    let suggested = required
+        .checked_next_power_of_two()
+        .unwrap_or(required)
+        .max(4 * host_memory::MIB);
+    anyhow::Error::from(e).context(format!(
+        "the component needs {} of linear memory but --default-heap-memory is {}. \
+         Raise it to at least {} (chart: runtime.resources.defaultHeapMemory).",
+        render_bytes(required),
+        render_bytes(default_heap_memory),
+        render_bytes(suggested),
+    ))
+}
+
+/// Reads the minimum byte size out of the pooling allocator's refusal.
+///
+/// Matching on the message is unpleasant, but wasmtime offers no typed form of
+/// it and the alternative is discarding the only number that makes the failure
+/// actionable.
+fn parse_pooling_minimum(text: &str) -> Option<u64> {
+    let tail = text.split_once("minimum byte size of")?.1;
+    let digits: String = tail
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    // A zero-length run, or a leading `0`, means the size was not printed as
+    // plain decimal — wasmtime already renders the limit half of this message
+    // in hex. Fall back to the original error rather than reporting 0 bytes.
+    match digits.parse().ok()? {
+        0 => None,
+        required => Some(required),
+    }
+}
+
 impl Engine {
-    /// Core instances the pooling allocator will admit, or `None` when pooling
-    /// is off or unsupported.
+    /// host_memory has the memory budgets this engine was built with including max host
+    /// memory available, default component heap limit, and number of core instances available.
+    /// Read back rather than recomputed, so what a caller reports is what the engine actually
+    /// installed — including an embedder's `max_instances` winning over the flag-driven count.
+    pub fn host_memory(&self) -> host_memory::HostMemoryBudgets {
+        self.host_memory
+    }
+
+    /// The host-wide guest memory budget, for reporting what guests are
+    /// holding and what the budget has refused.
+    pub fn guest_memory(&self) -> &Arc<guest_memory::GuestMemoryBudget> {
+        &self.guest_memory
+    }
+
+    /// Core instances the pooling allocator was configured to admit, captured
+    /// from the [`PoolingAllocationConfig`] actually installed — so it reflects
+    /// the `WASMTIME_POOLING_TOTAL_CORE_INSTANCES` override and a
+    /// caller-supplied pooling config alike. `None` when pooling is off or
+    /// unsupported, i.e. when there is no pool budget to divide.
     ///
-    /// This is the budget every component instantiation on this engine spends
-    /// from, and the number any secondary ceiling — the messaging admission
-    /// gate, say — should size itself against, so that raising the pool raises
-    /// what depends on it instead of leaving a second cap silently binding.
-    ///
-    /// Read from the [`PoolingAllocationConfig`] actually installed, so it
-    /// accounts for `WASMTIME_POOLING_TOTAL_CORE_INSTANCES` and for a
-    /// caller-supplied pooling config, neither of which is visible from
-    /// [`EngineBuilder::with_max_instances`].
+    /// Recorded rather than recomputed: re-deriving `max_instances.unwrap_or(…)`
+    /// somewhere else would miss the env override (applied inside
+    /// [`new_pooling_config`]) and drift the moment either side changed.
     pub fn total_core_instances(&self) -> Option<u32> {
         self.total_core_instances
     }
@@ -334,6 +478,16 @@ impl Engine {
     /// Gets a reference to the inner wasmtime engine.
     pub fn inner(&self) -> &wasmtime::Engine {
         &self.inner
+    }
+
+    /// Whether this engine compiles fuel counters into its guests, and so
+    /// whether a store it builds can be metered by fuel at all.
+    ///
+    /// Read back from the config wasmtime resolved rather than from
+    /// [`EngineBuilder::with_fuel_consumption`], so a base config supplied
+    /// through [`EngineBuilder::with_config`] is answered for too.
+    pub fn consumes_fuel(&self) -> bool {
+        self.inner.get_consume_fuel()
     }
 
     /// Initializes a workload by validating and preparing all its components.
@@ -515,6 +669,7 @@ impl Engine {
             loopback,
         );
         service.metadata.socket_policy = Arc::clone(&self.socket_policy);
+        service.metadata.guest_memory = Arc::clone(&self.guest_memory);
 
         let world = service.world();
 
@@ -529,6 +684,19 @@ impl Engine {
         Ok(service)
     }
 
+    /// See [`explain_compile_failure`].
+    fn explain_compile_failure(&self, e: wasmtime::Error) -> anyhow::Error {
+        explain_compile_failure(e, self.effective_heap_memory())
+    }
+
+    /// The linear-memory ceiling a compile failure was actually measured
+    /// against: the installed pool's, falling back to the flag when there is
+    /// no pool to have overridden it.
+    fn effective_heap_memory(&self) -> u64 {
+        self.installed_heap_memory
+            .unwrap_or(self.host_memory.default_heap_memory)
+    }
+
     /// Load a WebAssembly component from raw bytes or yields a previously compiled one.
     #[instrument(name = "load_component_bytes", skip_all, fields(digest = %digest.as_ref().map(|d| d.as_ref()).unwrap_or("none")))]
     fn load_component_bytes(
@@ -540,7 +708,7 @@ impl Engine {
             None => {
                 tracing::debug!("no digest provided, compiling component without caching");
                 let compiled = Component::new(&self.inner, bytes.as_ref())
-                    .map_err(anyhow::Error::from)
+                    .map_err(|e| self.explain_compile_failure(e))
                     .context("failed to compile component from bytes")?;
                 Ok(compiled)
             }
@@ -548,11 +716,16 @@ impl Engine {
                 let key = CacheKey(digest.as_ref().to_string());
                 let inner = &self.inner;
                 let bytes_ref = bytes.as_ref();
+                let heap = self.effective_heap_memory();
 
+                #[cfg(test)]
+                let compiles = Arc::clone(&self.compiles);
                 self.cache
                     .try_get_with(key, || {
+                        #[cfg(test)]
+                        compiles.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         Component::new(inner, bytes_ref)
-                            .map_err(anyhow::Error::from)
+                            .map_err(|e| explain_compile_failure(e, heap))
                             .context("failed to compile component from bytes")
                             .map(CacheValue)
                     })
@@ -626,6 +799,7 @@ impl Engine {
             instances,
         );
         workload_component.metadata.socket_policy = Arc::clone(&self.socket_policy);
+        workload_component.metadata.guest_memory = Arc::clone(&self.guest_memory);
         Ok(workload_component)
     }
 
@@ -808,7 +982,11 @@ pub struct EngineBuilder {
     compilation_cache_size: Option<u64>,
     compilation_cache_ttl: Option<Duration>,
     fuel_consumption: Option<bool>,
+    parallel_compilation: Option<bool>,
+    native_unwind_info: Option<bool>,
     socket_policy: Option<Arc<crate::sockets::policy::SocketPolicy>>,
+    host_memory: Option<host_memory::HostMemoryBudgets>,
+    guest_memory_mode: guest_memory::GuestMemoryMode,
     /// Optional TLS provider override for wasi:tls client connections.
     #[cfg(feature = "wasi-tls")]
     tls_provider: Option<SharedTlsProvider>,
@@ -824,6 +1002,26 @@ impl EngineBuilder {
     #[must_use]
     pub fn with_socket_policy(mut self, policy: Arc<crate::sockets::policy::SocketPolicy>) -> Self {
         self.socket_policy = Some(policy);
+        self
+    }
+
+    /// Set the host's memory budget, per-memory ceiling and instance count.
+    /// Unset, the engine uses wasmtime's default memory limits.
+    pub fn with_host_memory(mut self, host_memory: host_memory::HostMemoryBudgets) -> Self {
+        self.host_memory = Some(host_memory);
+        self
+    }
+
+    /// Whether `max_guest_memory` is enforced or only accounted.
+    ///
+    /// Unset, it is [`guest_memory::GuestMemoryMode::Count`]: the budget is
+    /// charged and reported but never refuses a growth. That is deliberate —
+    /// `max_guest_memory` is derived when an operator sets nothing, so
+    /// enforcing by default would give every host a ceiling on upgrade that
+    /// nobody chose.
+    #[must_use]
+    pub fn with_guest_memory_mode(mut self, mode: guest_memory::GuestMemoryMode) -> Self {
+        self.guest_memory_mode = mode;
         self
     }
 
@@ -883,6 +1081,31 @@ impl EngineBuilder {
     /// specifies, rather than being forced off.
     pub fn with_fuel_consumption(mut self, enable: bool) -> Self {
         self.fuel_consumption = Some(enable);
+        self
+    }
+
+    /// Whether Cranelift compiles a component's functions on several threads.
+    ///
+    /// Enabled unless this or `WASMTIME_PARALLEL_COMPILATION` turns it off.
+    /// The threads come from rayon's process-wide pool, which sizes itself to
+    /// every core the process can see — not to `max_concurrent_starts`, and
+    /// not to the CPU a container is requested at. Two ways to hold a host
+    /// down: `RAYON_NUM_THREADS` caps how wide one compile goes, and this
+    /// makes it single-threaded again.
+    pub fn with_parallel_compilation(mut self, enable: bool) -> Self {
+        self.parallel_compilation = Some(enable);
+        self
+    }
+
+    /// Whether compiled code registers unwind tables with the system unwinder,
+    /// which only native debuggers and profilers that unwind by DWARF read.
+    ///
+    /// On, as in wasmtime, unless this or `WASMTIME_NATIVE_UNWIND_INFO` turns
+    /// it off. Under LLVM's libunwind (macOS; musl and zig-built Linux
+    /// binaries) every component drop scans a process-wide table of them, so
+    /// a host holding many components wants it off. Windows requires them.
+    pub fn with_native_unwind_info(mut self, enable: bool) -> Self {
+        self.native_unwind_info = Some(enable);
         self
     }
 
@@ -972,27 +1195,79 @@ impl EngineBuilder {
             .or_else(|| getenv::<bool>("WASMTIME_POOLING"))
             .unwrap_or(!has_custom_config);
 
-        // The pooling allocator can be more efficient for workloads with many short-lived instances
-        let mut total_core_instances = None;
+        // Resolved before the pooling config, which both of its knobs feed.
+        let host_memory = self.host_memory.unwrap_or_default();
+        // Reads the resolved budgets, not the installed pool: it advises on the
+        // knobs as configured.
+        if let Some(advisory) = host_memory.advisory() {
+            tracing::warn!("{advisory}");
+        }
+        // Only when the budget is a real ceiling: an over-large budget the host
+        // merely counts against costs nothing.
+        if self.guest_memory_mode == guest_memory::GuestMemoryMode::Enforce
+            && let Some(advisory) = host_memory.enforcement_advisory()
+        {
+            tracing::warn!("{advisory}");
+        }
+
+        // The pooling allocator can be more efficient for workloads with many short-lived instances.
+        // Read back from the installed pool: the environment and a
+        // caller-supplied config both override what was asked for.
+        let mut installed_pool: Option<InstalledPool> = None;
         if use_pooling_allocator && let Ok(true) = is_pooling_allocator_supported() {
             tracing::debug!("using pooling allocator by default");
-            let pooling = self
-                .pooling_config
-                .take()
-                .unwrap_or_else(|| new_pooling_config(self.max_instances.unwrap_or(1000)));
-            // Read back what was actually configured rather than what was asked
-            // for: `new_pooling_config` lets the environment override the count,
-            // and a caller-supplied config ignores `max_instances` entirely.
-            total_core_instances = Some(pooling.get_total_core_instances());
+            let pooling = self.pooling_config.take().unwrap_or_else(|| {
+                new_pooling_config(
+                    self.max_instances.unwrap_or(host_memory.core_instances),
+                    host_memory.default_heap_memory,
+                )
+            });
+            installed_pool = Some(InstalledPool {
+                core_instances: pooling.get_total_core_instances(),
+                memories: pooling.get_total_memories(),
+                max_memory_size: u64::try_from(pooling.get_max_memory_size()).unwrap_or(u64::MAX),
+            });
             config.allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(pooling));
         } else if use_pooling_allocator {
             tracing::warn!("pooling allocator requested but not supported");
+        }
+        let total_core_instances = installed_pool.map(|pool| pool.core_instances);
+        let installed_heap_memory = installed_pool.map(|pool| pool.max_memory_size);
+
+        // Reported here so every embedder says what it built. The reservation
+        // is `total_memories x max_memory_size`, not the instance count.
+        match installed_pool {
+            Some(pool) => tracing::info!(
+                max_guest_memory = %host_memory::render_bytes(host_memory.max_guest_memory),
+                guest_memory_mode = self.guest_memory_mode.as_str(),
+                default_heap_memory = %host_memory::render_bytes(pool.max_memory_size),
+                core_instances = pool.core_instances,
+                memories = pool.memories,
+                pool_reservation = %host_memory::render_bytes(pool.reservation()),
+                "host memory resolved"
+            ),
+            // No pool, so no reservation and no installed ceiling to name.
+            None => tracing::info!(
+                max_guest_memory = %host_memory::render_bytes(host_memory.max_guest_memory),
+                guest_memory_mode = self.guest_memory_mode.as_str(),
+                pooling = false,
+                "host memory resolved"
+            ),
         }
 
         // Only override fuel consumption when the caller explicitly set it, so a
         // custom base config's setting is otherwise preserved.
         if let Some(fuel) = self.fuel_consumption {
             config.consume_fuel(fuel);
+        }
+
+        // Compiling in parallel is wasmtime's own default, so this only has to
+        // carry an explicit "off" through to the config.
+        if let Some(parallel) = self
+            .parallel_compilation
+            .or_else(|| getenv::<bool>("WASMTIME_PARALLEL_COMPILATION"))
+        {
+            config.parallel_compilation(parallel);
         }
 
         // WASIP3's async ABI requires the component-model async proposal.
@@ -1011,11 +1286,35 @@ impl EngineBuilder {
         self.proposals
             .insert(WasmProposal::WasmComponentModelImplements);
 
+        // Name the collector rather than taking `Collector::Auto`. `wasm_gc` is
+        // on by default, so a guest can allocate GC objects on any build, and
+        // `Auto` resolves to whichever collector was compiled in — reaching the
+        // null one, which reclaims nothing, when it is all that is left. Naming
+        // it turns that into an `Engine::new` error naming the missing feature.
+        config.collector(wasmtime::Collector::Copying);
+
+        // Compile a deadline check into every guest's loop back-edges, so guest
+        // work that never yields can still be ended. Every store must then set a
+        // deadline of its own — see [`crate::engine::abandon::arm_epoch_deadline`],
+        // which is what decides when one is acted on.
+        config.epoch_interruption(true);
+
+        // Unwind tables are wasmtime's own default, so this only carries an
+        // explicit choice through. Windows refuses to drop them, so an "off"
+        // is ignored there instead of failing `build`.
+        if let Some(unwind) = self
+            .native_unwind_info
+            .or_else(|| getenv::<bool>("WASMTIME_NATIVE_UNWIND_INFO"))
+        {
+            config.native_unwind_info(unwind || cfg!(windows));
+        }
+
         for proposal in &self.proposals {
             proposal.apply(&mut config);
         }
 
         let inner = wasmtime::Engine::new(&config)?;
+        spawn_epoch_ticker(&inner)?;
         let cache = Cache::builder()
             .max_capacity(self.compilation_cache_size.unwrap_or(100))
             .time_to_idle(
@@ -1026,10 +1325,29 @@ impl EngineBuilder {
         Ok(Engine {
             inner,
             cache,
+            #[cfg(test)]
+            compiles: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             socket_policy: self.socket_policy.unwrap_or_default(),
+            host_memory,
+            guest_memory: {
+                let budget = guest_memory::GuestMemoryBudget::from_budgets(
+                    &host_memory,
+                    self.guest_memory_mode,
+                );
+                // The ceiling the pool actually installed, not the knob that
+                // asked for it: the budget must not charge for growth the pool
+                // is going to refuse. The same figure `explain_compile_failure`
+                // measures against, so they cannot drift apart.
+                match installed_heap_memory {
+                    Some(ceiling) => budget.with_heap_ceiling(ceiling),
+                    None => budget,
+                }
+                .into_metered()
+            },
             #[cfg(feature = "wasi-tls")]
             tls_provider: self.tls_provider,
             total_core_instances,
+            installed_heap_memory,
         })
     }
 }
@@ -1099,7 +1417,58 @@ where
     }
 }
 
-fn new_pooling_config(instances: u32) -> PoolingAllocationConfig {
+/// Reports a `WASMTIME_POOLING_*` value that overrides a resolved flag.
+///
+/// The flags are what an operator set and what every sizing rule is derived
+/// against; these envs are applied on top of them, here. Where the two differ
+/// the host runs on the env, and an operator reading back the flag they set
+/// has no way to tell — so this says which one won, once, at startup.
+///
+/// It does not say `host memory resolved` is wrong. That line is read back
+/// from the pool that was actually built ([`InstalledPool`]), so for the three
+/// knobs it names it already prints the overridden number; the other four it
+/// does not mention at all.
+///
+/// Also refuses a zero. Every one of these knobs means "this host runs
+/// nothing" at zero, which is never what an operator meant, and the flags they
+/// shadow are already rejected for exactly that.
+fn pooling_env_override<T>(key: &str, resolved: T, render: impl Fn(T) -> String) -> Option<T>
+where
+    T: FromStr + PartialEq + Default + std::fmt::Display + Copy,
+    T::Err: core::fmt::Debug,
+{
+    let value: T = getenv(key)?;
+    if value == T::default() {
+        warn!(
+            "`{key}` is 0, which would leave this host unable to instantiate anything; \
+             ignoring it and keeping {}",
+            render(resolved)
+        );
+        return None;
+    }
+    if value != resolved {
+        // Rendered, not raw: the byte-sized knobs go through `render_bytes`,
+        // and an operator cannot compare 4294967296 to 256MiB.
+        let (resolved, value) = (render(resolved), render(value));
+        warn!(
+            resolved = %resolved,
+            override_value = %value,
+            "`{key}` overrides the flag it shadows: this host runs with {value}, not the \
+             {resolved} it was configured with"
+        );
+    }
+    Some(value)
+}
+
+/// [`pooling_env_override`] for the knobs that are plain instance counts.
+///
+/// All of them default to the same resolved `--core-instances` and all of them
+/// mean "this host runs nothing" at zero, so all of them want the same guard.
+fn pooling_env_instances(key: &str, resolved: u32) -> u32 {
+    pooling_env_override(key, resolved, |v| v.to_string()).unwrap_or(resolved)
+}
+
+fn new_pooling_config(instances: u32, default_heap_memory: u64) -> PoolingAllocationConfig {
     let mut config = PoolingAllocationConfig::default();
     if let Some(v) = getenv("WASMTIME_POOLING_MAX_UNUSED_WASM_SLOTS") {
         config.max_unused_warm_slots(v);
@@ -1116,11 +1485,10 @@ fn new_pooling_config(instances: u32) -> PoolingAllocationConfig {
     if let Some(v) = getenv("WASMTIME_POOLING_TABLE_KEEP_RESIDENT") {
         config.table_keep_resident(v);
     }
-    if let Some(v) = getenv("WASMTIME_POOLING_TOTAL_COMPONENT_INSTANCES") {
-        config.total_component_instances(v);
-    } else {
-        config.total_component_instances(instances);
-    }
+    config.total_component_instances(pooling_env_instances(
+        "WASMTIME_POOLING_TOTAL_COMPONENT_INSTANCES",
+        instances,
+    ));
     if let Some(v) = getenv("WASMTIME_POOLING_MAX_COMPONENT_INSTANCE_SIZE") {
         config.max_component_instance_size(v);
     }
@@ -1133,26 +1501,24 @@ fn new_pooling_config(instances: u32) -> PoolingAllocationConfig {
     if let Some(v) = getenv("WASMTIME_POOLING_MAX_TABLES_PER_COMPONENT") {
         config.max_tables_per_component(v);
     }
-    if let Some(v) = getenv("WASMTIME_POOLING_TOTAL_MEMORIES") {
-        config.total_memories(v);
-    } else {
-        config.total_memories(instances);
-    }
-    if let Some(v) = getenv("WASMTIME_POOLING_TOTAL_TABLES") {
-        config.total_tables(v);
-    } else {
-        config.total_tables(instances);
-    }
-    if let Some(v) = getenv("WASMTIME_POOLING_TOTAL_STACKS") {
-        config.total_stacks(v);
-    } else {
-        config.total_stacks(instances);
-    }
-    if let Some(v) = getenv("WASMTIME_POOLING_TOTAL_CORE_INSTANCES") {
-        config.total_core_instances(v);
-    } else {
-        config.total_core_instances(instances);
-    }
+    config.total_memories(pooling_env_instances(
+        "WASMTIME_POOLING_TOTAL_MEMORIES",
+        instances,
+    ));
+    config.total_tables(pooling_env_instances(
+        "WASMTIME_POOLING_TOTAL_TABLES",
+        instances,
+    ));
+    config.total_stacks(pooling_env_instances(
+        "WASMTIME_POOLING_TOTAL_STACKS",
+        instances,
+    ));
+    // `--core-instances` is what `host memory resolved` reports, and this is
+    // what actually sizes the pool.
+    config.total_core_instances(pooling_env_instances(
+        "WASMTIME_POOLING_TOTAL_CORE_INSTANCES",
+        instances,
+    ));
     if let Some(v) = getenv("WASMTIME_POOLING_MAX_CORE_INSTANCE_SIZE") {
         config.max_core_instance_size(v);
     }
@@ -1165,21 +1531,119 @@ fn new_pooling_config(instances: u32) -> PoolingAllocationConfig {
     if let Some(v) = getenv("WASMTIME_POOLING_MAX_MEMORIES_PER_MODULE") {
         config.max_memories_per_module(v);
     }
-    if let Some(v) = getenv("WASMTIME_POOLING_MAX_MEMORY_SIZE") {
-        config.max_memory_size(v);
-    }
+    // Unlike every other knob in this function this one had no `else` branch,
+    // so wasmtime's default stood on every host and nothing named it. The
+    // fallback is that same default unless an operator set the flag, so this
+    // changes no behaviour by itself — it only makes the number reachable.
+    // It is also the number a component's minimum linear memory is checked
+    // against, so an env that shadows `--default-heap-memory` here is worth
+    // saying out loud.
+    let resolved_heap = usize::try_from(default_heap_memory).unwrap_or(usize::MAX);
+    config.max_memory_size(
+        pooling_env_override("WASMTIME_POOLING_MAX_MEMORY_SIZE", resolved_heap, |v| {
+            host_memory::render_bytes(u64::try_from(v).unwrap_or(u64::MAX))
+        })
+        .unwrap_or(resolved_heap),
+    );
     #[cfg(not(windows))]
-    if let Some(v) = getenv("WASMTIME_POOLING_TOTAL_GC_HEAPS") {
-        config.total_gc_heaps(v);
-    } else {
-        config.total_gc_heaps(instances);
-    }
+    config.total_gc_heaps(pooling_env_instances(
+        "WASMTIME_POOLING_TOTAL_GC_HEAPS",
+        instances,
+    ));
     config
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The refusal is correct and its text is the only place the number
+    /// appears; discarding it is what left a `kubectl`-only operator with
+    /// "ready=0 unavailable=1" and nothing else.
+    #[test]
+    fn a_heap_floor_refusal_names_the_flag_and_both_sizes() {
+        let raw = wasmtime::Error::msg(
+            "module memory does not fit in pooling allocator requirements: memory has a \
+             minimum byte size of 2424832 which exceeds the limit of 0x100000",
+        );
+        let explained = format!("{:#}", explain_compile_failure(raw, 1024 * 1024));
+        assert!(explained.contains("2.3MiB"), "{explained}");
+        assert!(
+            explained.contains("--default-heap-memory is 1MiB"),
+            "{explained}"
+        );
+        assert!(
+            explained.contains("Raise it to at least 4MiB"),
+            "{explained}"
+        );
+        // And the original text is still underneath it.
+        assert!(explained.contains("pooling allocator"), "{explained}");
+    }
+
+    /// wasmtime renders the limit half of this message in hex, and a size it
+    /// did not print as plain decimal used to parse as `0` — advising an
+    /// operator to raise the flag to 4MiB for a component needing 0 bytes.
+    #[test]
+    fn a_refusal_without_a_decimal_size_is_left_alone() {
+        for text in [
+            "memory has a minimum byte size of 0x250000 which exceeds the limit of 0x100000",
+            "memory has a minimum byte size of 0 which exceeds the limit of 0x100000",
+        ] {
+            let explained = format!(
+                "{:#}",
+                explain_compile_failure(wasmtime::Error::msg(text), 1024 * 1024,)
+            );
+            assert_eq!(explained, text, "should not have been annotated");
+        }
+    }
+
+    /// `next_power_of_two` panics under `debug_assertions` and wraps to zero in
+    /// release, so a refusal quoting a size near `u64::MAX` used to take the
+    /// host out rather than explain itself.
+    #[test]
+    fn an_unroundable_requirement_does_not_panic() {
+        let raw = wasmtime::Error::msg(format!(
+            "memory has a minimum byte size of {} which exceeds the limit of 0x100000",
+            u64::MAX
+        ));
+        let explained = format!("{:#}", explain_compile_failure(raw, 1024 * 1024));
+        assert!(explained.contains("Raise it to at least"), "{explained}");
+    }
+
+    #[test]
+    fn an_unrelated_compile_failure_is_left_alone() {
+        let raw = wasmtime::Error::msg("expected a WebAssembly component");
+        let explained = format!("{:#}", explain_compile_failure(raw, 1024 * 1024));
+        assert_eq!(explained, "expected a WebAssembly component");
+    }
+
+    // Compiling is parallel unless a host says otherwise, and saying so
+    // reaches the engine rather than being dropped on the builder.
+    #[test]
+    fn parallel_compilation_is_on_and_can_be_turned_off() {
+        let engine = Engine::builder().build().expect("default should build");
+        assert!(engine.inner().get_parallel_compilation());
+
+        let engine = Engine::builder()
+            .with_parallel_compilation(false)
+            .build()
+            .expect("serial compilation should build");
+        assert!(!engine.inner().get_parallel_compilation());
+    }
+
+    // Unwind tables are on unless a host turns them off, and turning them off
+    // reaches the engine everywhere but Windows, which requires them.
+    #[test]
+    fn native_unwind_info_is_on_and_can_be_turned_off() {
+        let engine = Engine::builder().build().expect("default should build");
+        assert_eq!(engine.inner().get_native_unwind_info(), Some(true));
+
+        let engine = Engine::builder()
+            .with_native_unwind_info(false)
+            .build()
+            .expect("turning unwind info off should build");
+        assert_eq!(engine.inner().get_native_unwind_info(), Some(cfg!(windows)));
+    }
 
     // A custom base config can now be combined with the pooling allocator and
     // instance limits, which previously errored out of `build()`.
@@ -1258,6 +1722,56 @@ mod tests {
 
         let engine = Engine::builder().build().expect("engine should build");
         Component::new(&engine.inner, &bytes).expect("map component should compile");
+    }
+
+    // A scheduler placing N replicas of one image sends N starts carrying one
+    // digest, and the herd is affordable only because they share a compile.
+    // Keying the cache on anything that differs between replicas — a workload
+    // id, a component name — would put a Cranelift compile behind every one of
+    // them, and nothing in a deployment's behaviour would say so.
+    #[test]
+    fn a_herd_of_replicas_shares_one_compiled_component() {
+        const HERD: usize = 15;
+        const DIGEST: &str = "sha256:one-image";
+
+        let bytes = wat::parse_str("(component)").expect("component should assemble");
+        let engine = Engine::builder().build().expect("engine should build");
+
+        std::thread::scope(|scope| {
+            for _ in 0..HERD {
+                scope.spawn(|| {
+                    engine
+                        .load_component_bytes(&bytes, Some(DIGEST))
+                        .map(|_| ())
+                        .expect("every member of the herd should load");
+                });
+            }
+        });
+
+        // The claim is that the herd shares a compile, not merely that it ends
+        // up with one entry: a loader that compiled per caller and let them
+        // race to insert the same key would leave one entry too, and this test
+        // would have said nothing about the cost it exists to prevent.
+        assert_eq!(
+            engine.compiles.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "{HERD} replicas of one image ran more than one compile"
+        );
+
+        engine.cache.run_pending_tasks();
+        assert_eq!(
+            engine.cache.entry_count(),
+            1,
+            "{HERD} replicas of one image left more than one cache entry"
+        );
+
+        // A hit is served without looking at the bytes, so bytes that could
+        // never compile are what prove the entry came back from the cache
+        // rather than from a compile of its own.
+        engine
+            .load_component_bytes(b"definitely not a wasm component", Some(DIGEST))
+            .map(|_| ())
+            .expect("a digest the herd already compiled should be served from the cache");
     }
 
     // A compile failure that goes through the cache reports everything the

@@ -9,13 +9,13 @@
 //! awaiting I/O is exactly the guest with that kind of state, so a pool has to
 //! be sized to peak *concurrency* to keep any of it, rather than to peak work.
 //!
-//! A driver removes that. Both an inbound HTTP request and a call from another
-//! component in the workload are [`InstanceJob`]s, so a component reached both
-//! ways shares one warm set rather than keeping two. It owns its store for good
-//! and runs one long-lived
-//! [`wasmtime::Store::run_concurrent`], taking calls off a channel and
-//! [`Accessor::spawn`]ing each as a concurrent task on the same instance. That
-//! is what the host already does for a service (see
+//! A driver removes that. An inbound HTTP request, an inbound message, a call
+//! from another component in the workload and a plugin's delivery are all
+//! [`InstanceJob`]s, so a component reached several ways shares one warm set
+//! rather than keeping one per trigger. It owns its store for good and runs one
+//! long-lived [`wasmtime::Store::run_concurrent`], taking calls off a channel
+//! and [`Accessor::spawn`]ing each as a concurrent task on the same instance.
+//! That is what the host already does for a service (see
 //! [`crate::host::trigger_service`]) — this is the same driver, one per warm
 //! instance rather than one per workload, with admission control in front.
 //!
@@ -30,7 +30,9 @@
 //!    many, after which it drains and its store drops. A call that times out
 //!    or fails in the host mid-call retires the instance the same way: the
 //!    guest work cannot be cancelled from the host, so draining and dropping
-//!    the store is what ends it.
+//!    the store is what ends it. So does the pool's idle sweep, through
+//!    [`InstanceDriver::retire`], when the component's traffic no longer
+//!    needs this many instances.
 //!
 //! A retired instance ends its own run loop as soon as its last call finishes,
 //! rather than waiting for the pool to notice. That matters for the timed-out
@@ -49,6 +51,7 @@ use wasmtime::error::Context as _;
 use wasmtime_wasi_http::p3::bindings::Service;
 
 use crate::engine::ctx::SharedCtx;
+use crate::engine::dispatch::{GuestJob, GuestTask};
 use crate::engine::instance_pool::ComponentInstance;
 use crate::host::http::ServiceHttpJob;
 use crate::host::trigger_service::HttpTask;
@@ -63,17 +66,101 @@ pub(crate) struct LinkedJob {
     pub(crate) import_name: Arc<str>,
     pub(crate) export_name: Arc<str>,
     pub(crate) reply: tokio::sync::oneshot::Sender<wasmtime::Result<Vec<Val>>>,
+    /// The abandonment flag of the dispatched call enforcing this job's
+    /// deadline (see [`crate::engine::abandon`]).
+    pub(crate) abandoned: Arc<crate::engine::abandon::AbandonFlag>,
+    /// What this call is measured under, built where the link is prepared —
+    /// the manifest identity a linked call needs is not reachable from here.
+    pub(crate) attributes: Arc<[opentelemetry::KeyValue]>,
 }
 
-/// Work an instance can be given. Both shapes run as concurrent tasks on the
-/// same instance, so a component reached both ways shares one warm set rather
-/// than keeping two.
+/// Work an instance can be given. Every shape runs as a concurrent task on the
+/// same instance, so a component reached several ways shares one warm set
+/// rather than keeping one per way in.
 pub(crate) enum InstanceJob {
     /// An inbound HTTP request (`wasi:http/handler@0.3`). Boxed to keep the
     /// variants a similar size; a declined job carries the whole request back.
     Http(Box<ServiceHttpJob>),
     /// A call from another component in the workload.
     Linked(Box<LinkedJob>),
+    /// An inbound message (`wasmcloud:messaging/handler@0.3.0`), delivered by
+    /// whichever messaging backend the workload bound.
+    ///
+    /// Only the async `@0.3.0` handler reaches here. Its call takes an
+    /// [`Accessor`], so deliveries overlap on one instance up to
+    /// `max_concurrency`; the sync `@0.2.0` export holds `&mut Store` for the
+    /// length of its call and keeps its per-message store.
+    Messaging(Box<crate::host::trigger_service::MessagingJob>),
+    /// A call a host plugin dispatched into this component (see
+    /// [`crate::engine::dispatch`]).
+    ///
+    /// The engine routes it like any other job and never looks inside: the
+    /// plugin keeps its own payload and makes its own typed call. That is what
+    /// lets a delivery carry, say, a NATS message's bytes rather than the one
+    /// 48-byte [`Val`] per byte a store-independent lowering would cost.
+    /// Unboxed: it is a handful of pointers, and the call it carries is already
+    /// behind one.
+    Guest(GuestJob),
+}
+
+/// Times one guest invocation, and records it when dropped.
+///
+/// Wall clock, which is what a caller waited and what a latency dashboard is
+/// asking for. It is exact per call, unlike a delta of the store-wide execution
+/// counter, which is only this call's when no other call shared the store —
+/// see [`crate::engine::abandon::GuestExecution`], which answers the separate
+/// question of how much CPU a workload burned.
+///
+/// Recording on drop is what makes it cover a call that ends by trapping or
+/// timing out — the two an operator most wants, and the two an early return
+/// would otherwise skip. `error` names what went wrong for the ones that can
+/// say; a call that ends without setting it is recorded as a success.
+///
+/// Costs nothing on a host that is not metering: the meter is looked up once at
+/// the start, and finding none skips the clock as well as the record.
+pub(crate) struct InvocationSample {
+    /// Both `None` when nothing is measuring this store, which is what a host
+    /// metering nothing gives every call on it.
+    meter: Option<crate::observability::InvocationMeter>,
+    started: Option<std::time::Instant>,
+    attributes: Arc<[opentelemetry::KeyValue]>,
+    error: Option<&'static str>,
+}
+
+impl InvocationSample {
+    /// Measure one call on a store, through the meter of the host that built
+    /// it. `executed` is the store's own — taken from a process-wide meter
+    /// instead, a host metering nothing would record into whichever host in the
+    /// process published itself first.
+    pub(crate) fn start(
+        executed: &crate::engine::abandon::GuestExecution,
+        attributes: Arc<[opentelemetry::KeyValue]>,
+    ) -> Self {
+        // A stamp is only ever set with a recording meter, so its presence is
+        // the whole test.
+        let meter = executed.metering().map(|m| m.invocation().clone());
+        Self {
+            started: meter.as_ref().map(|_| std::time::Instant::now()),
+            meter,
+            attributes,
+            error: None,
+        }
+    }
+
+    /// Mark what went wrong, for a call site that knows. The value is a short
+    /// bounded name — `trap`, `timeout` — never anything a caller supplies.
+    pub(crate) fn failed(&mut self, error: &'static str) {
+        self.error = Some(error);
+    }
+}
+
+impl Drop for InvocationSample {
+    fn drop(&mut self) {
+        let (Some(started), Some(meter)) = (self.started, self.meter.as_ref()) else {
+            return;
+        };
+        meter.record(&self.attributes, started.elapsed(), self.error);
+    }
 }
 
 /// What an instance's driver handle and the calls running on it share: how many
@@ -86,7 +173,7 @@ struct DriverState {
     retired: AtomicBool,
     /// Signalled when a retired instance's last call finishes, so its run loop
     /// stops there and then. Dropping the store is what ends guest work a
-    /// timed-out call left running, and waiting for the pool's next offer
+    /// timed-out call left running, and waiting for the pool's next dispatch
     /// would leave that running for as long as traffic stayed away.
     drained: tokio::sync::Notify,
 }
@@ -116,6 +203,11 @@ impl PoolSlot {
     /// Stop this instance admitting: it drains what it took, ends its run loop,
     /// and its store's teardown ends any guest work still running on it.
     ///
+    /// Only as far as the last call returning, though: every path to `drained`
+    /// runs through a call's task ending, so a guest that never yields holds the
+    /// store open regardless. That one is ended by its abandoned call instead
+    /// (see [`crate::engine::abandon`]).
+    ///
     /// TODO: retirement is a stand-in for cancelling the one bad call. The
     /// host cannot cancel a guest `call_concurrent` subtask
     /// (bytecodealliance/wasmtime#11833), so ending a wedged call's work means
@@ -144,9 +236,20 @@ impl AccessorTask<SharedCtx> for LinkedTask {
             import_name,
             export_name,
             reply,
+            abandoned,
+            attributes,
         } = *self.job;
         let instance = self.instance;
 
+        // The epoch deadline measures this call's own execution, so re-arm it
+        // here. `watch_until_abandoned` below owns the registration.
+        let (calls, executed) = accessor.with(|mut access| {
+            crate::engine::abandon::rearm_for_call(&mut access);
+            (
+                Arc::clone(&access.get().abandoned),
+                Arc::clone(&access.get().executed),
+            )
+        });
         let func = accessor.with(|mut access| {
             instance
                 .get_func(&mut access, func_idx)
@@ -159,12 +262,19 @@ impl AccessorTask<SharedCtx> for LinkedTask {
                 return Ok(());
             }
         };
+        let _sample = InvocationSample::start(&executed, attributes);
 
         let mut results = vec![Val::Bool(false); results_len];
         let call_timeout = crate::timeouts::ephemeral_call();
+        // This bound ends the caller's wait. Keeping a slow guest out of the
+        // epoch callback's reach is `watch_until_abandoned`'s job.
         let outcome = match tokio::time::timeout(
             call_timeout,
-            func.call_concurrent(accessor, &params, &mut results),
+            crate::engine::abandon::watch_until_abandoned(
+                &calls,
+                abandoned,
+                func.call_concurrent(accessor, &params, &mut results),
+            ),
         )
         .await
         {
@@ -232,25 +342,99 @@ pub(crate) struct InstanceDriver {
     admitted: AtomicUsize,
     max_concurrency: usize,
     max_invocations: Option<usize>,
-    /// Whether this instance exports `wasi:http/handler`. A component reached
-    /// only by linked calls does not, which is not an error — but it cannot be
-    /// given HTTP work either.
-    serves_http: bool,
+    /// The triggered work this instance can take, so admission never gives it
+    /// a job it could only fail.
+    accepts: Accepts,
+}
+
+/// The typed handler views bound over one instance, built once when its driver
+/// starts and reused by every call on it.
+///
+/// Each is both the probe and the binding: `Service::new` and
+/// `AsyncMessaging::new` type-check their export against the live instance and
+/// hand back the view. A component reached only by linked calls has neither,
+/// which is not an error — it just cannot be given triggered work.
+///
+/// A set rather than a flag per trigger: the next host-invoked export is a
+/// field and a match arm, not a third bool and a third special case in
+/// admission.
+struct BoundExports {
+    http: Option<Arc<Service>>,
+    messaging: Option<Arc<crate::host::trigger_service::AsyncMessaging>>,
+}
+
+/// Which job kinds an instance will accept — the presence half of
+/// [`BoundExports`], split off so admission can answer without the views (and
+/// so a test can build one without a store).
+#[derive(Clone, Copy)]
+struct Accepts {
+    http: bool,
+    messaging: bool,
+}
+
+impl BoundExports {
+    fn bind(store: &mut wasmtime::Store<SharedCtx>, instance: &Instance) -> Self {
+        Self {
+            http: Service::new(&mut *store, instance).ok().map(Arc::new),
+            messaging: crate::host::trigger_service::AsyncMessaging::new(&mut *store, instance)
+                .ok()
+                .map(Arc::new),
+        }
+    }
+
+    fn accepts(&self) -> Accepts {
+        Accepts {
+            http: self.http.is_some(),
+            messaging: self.messaging.is_some(),
+        }
+    }
+}
+
+impl Accepts {
+    /// Whether this instance can be given `job` at all.
+    ///
+    /// A linked call names the export index it resolved against this very
+    /// component, and a dispatched call binds its own view when it runs, so
+    /// neither is gated here.
+    fn takes(self, job: &InstanceJob) -> bool {
+        match job {
+            InstanceJob::Http(_) => self.http,
+            InstanceJob::Messaging(_) => self.messaging,
+            InstanceJob::Linked(_) | InstanceJob::Guest(_) => true,
+        }
+    }
 }
 
 impl InstanceDriver {
-    /// Build an instantiated store's driver and start it. The caller
-    /// instantiates, so a component that fails to do so reports that failure
-    /// where it can still be returned to whoever asked for the call.
+    /// Build an instantiated store's driver and start it, to serve `job`
+    /// first. The caller instantiates, so a component that fails to do so
+    /// reports that failure where it can still be returned to whoever asked
+    /// for the call.
+    ///
+    /// An instance that does not export what `job` needs comes straight back
+    /// instead: parking it would leave a warm instance that could only ever
+    /// refuse this kind of call, and every later one of the kind would spawn
+    /// another beside it.
     pub(crate) fn spawn(
         instance: ComponentInstance,
+        job: &InstanceJob,
         max_concurrency: usize,
         max_invocations: Option<usize>,
-    ) -> Self {
+    ) -> Result<Self, ComponentInstance> {
         let ComponentInstance {
             mut store,
             instance,
         } = instance;
+
+        // Built before the run loop so admission knows what this instance can
+        // take at all, rather than accepting work it could only drop. The views
+        // move into the run loop; admission keeps only their presence.
+        let bound = BoundExports::bind(&mut store, &instance);
+        let accepts = bound.accepts();
+        if !accepts.takes(job) {
+            return Err(ComponentInstance { store, instance });
+        }
+
         let (tx, mut rx) =
             tokio::sync::mpsc::channel::<(InstanceJob, InFlightGuard)>(max_concurrency.max(1));
         let state = Arc::new(DriverState {
@@ -259,12 +443,6 @@ impl InstanceDriver {
             drained: tokio::sync::Notify::new(),
         });
         let task_state = Arc::clone(&state);
-
-        // Built before the run loop so admission knows whether this instance
-        // can take HTTP at all, rather than accepting a request it could only
-        // drop.
-        let service = Service::new(&mut store, &instance).ok().map(Arc::new);
-        let serves_http = service.is_some();
 
         tokio::spawn(async move {
             // One `run_concurrent` for the life of the instance. Each call is
@@ -285,10 +463,21 @@ impl InstanceDriver {
                             // timed-out call left running.
                             _ = task_state.drained.notified() => break,
                         };
+                        // One slot for whichever arm runs: it holds this call's
+                        // in-flight guard, so it is moved exactly once and the
+                        // arm that declines a job drops it right here.
+                        let slot = PoolSlot {
+                            state: Arc::clone(&task_state),
+                            _in_flight: guard,
+                        };
                         let spawned = match job {
                             InstanceJob::Http(job) => {
-                                let (req, resp_tx) = *job;
-                                let Some(service) = service.as_ref().map(Arc::clone) else {
+                                let ServiceHttpJob {
+                                    req,
+                                    resp_tx,
+                                    abandoned,
+                                } = *job;
+                                let Some(service) = bound.http.as_ref().map(Arc::clone) else {
                                     // Admission declines HTTP for an instance
                                     // without the export, so this is not
                                     // normally reachable; answer the request
@@ -302,19 +491,46 @@ impl InstanceDriver {
                                     service,
                                     req,
                                     resp_tx,
-                                    pool_slot: Some(PoolSlot {
-                                        state: Arc::clone(&task_state),
-                                        _in_flight: guard,
-                                    }),
+                                    abandoned,
+                                    pool_slot: Some(slot),
+                                })
+                            }
+                            InstanceJob::Messaging(job) => {
+                                let crate::host::trigger_service::MessagingJob {
+                                    msg,
+                                    result_tx,
+                                    abandoned,
+                                    attributes,
+                                } = *job;
+                                let Some(handler) = bound.messaging.as_ref().map(Arc::clone) else {
+                                    // As with HTTP: admission declines this for
+                                    // an instance without the export, so report
+                                    // it rather than dropping the delivery if
+                                    // it is ever reached.
+                                    let _ =
+                                        result_tx.send(Err("pooled instance does not export the \
+                                         @0.3.0 messaging handler"
+                                            .into()));
+                                    continue;
+                                };
+                                accessor.spawn(crate::host::trigger_service::MessagingTask {
+                                    handler,
+                                    msg,
+                                    result_tx,
+                                    abandoned,
+                                    attributes,
+                                    pool_slot: Some(slot),
                                 })
                             }
                             InstanceJob::Linked(job) => accessor.spawn(LinkedTask {
                                 instance,
                                 job,
-                                slot: PoolSlot {
-                                    state: Arc::clone(&task_state),
-                                    _in_flight: guard,
-                                },
+                                slot,
+                            }),
+                            InstanceJob::Guest(job) => accessor.spawn(GuestTask {
+                                instance,
+                                job,
+                                pool_slot: Some(slot),
                             }),
                         };
                         if let Err(e) = spawned {
@@ -331,14 +547,14 @@ impl InstanceDriver {
             }
         });
 
-        Self {
+        Ok(Self {
             tx,
             state,
             admitted: AtomicUsize::new(0),
             max_concurrency,
             max_invocations,
-            serves_http,
-        }
+            accepts,
+        })
     }
 
     /// Calls in flight on this instance right now.
@@ -349,6 +565,15 @@ impl InstanceDriver {
     /// Whether this instance has served its last call and is only draining.
     pub(crate) fn is_retired(&self) -> bool {
         self.state.retired.load(Ordering::SeqCst)
+    }
+
+    /// Stop this instance admitting calls, from outside the calls running on
+    /// it: it drains what it already took, ends its run loop and drops its
+    /// store. What the pool's idle sweep uses to give back an instance the
+    /// component's traffic stopped needing (see
+    /// [`crate::engine::instance_pool::InstancePool::sweep`]).
+    pub(crate) fn retire(&self) {
+        self.state.retire();
     }
 
     /// Whether the driver's task has gone (the guest trapped, or the instance
@@ -362,7 +587,7 @@ impl InstanceDriver {
     /// gone. A plain compare-and-swap rather than a semaphore: admission has to
     /// be non-blocking so a saturated instance falls through to the next one
     /// instead of making the caller wait.
-    fn try_admit(&self) -> Option<InFlightGuard> {
+    pub(crate) fn try_admit(&self) -> Option<InFlightGuard> {
         if self.is_retired() || self.is_gone() {
             return None;
         }
@@ -410,7 +635,7 @@ impl InstanceDriver {
     /// receiver stands in for the run loop: kept alive so the channel is open,
     /// never drained.
     #[cfg(test)]
-    fn stub(
+    pub(crate) fn stub(
         max_concurrency: usize,
         max_invocations: Option<usize>,
     ) -> (
@@ -429,7 +654,10 @@ impl InstanceDriver {
                 admitted: AtomicUsize::new(0),
                 max_concurrency,
                 max_invocations,
-                serves_http: true,
+                accepts: Accepts {
+                    http: true,
+                    messaging: true,
+                },
             },
             rx,
         )
@@ -439,10 +667,10 @@ impl InstanceDriver {
     /// could not take it, so the caller can try elsewhere. Boxed because the
     /// refusal carries the whole request back.
     pub(crate) fn try_send(&self, job: InstanceJob) -> Result<(), InstanceJob> {
-        // An instance without the HTTP export can only fail such a call.
-        // Declining it sends the request to a store of its own, where the
-        // binding is built per request and its error reaches the client.
-        if !self.serves_http && matches!(job, InstanceJob::Http(_)) {
+        // An instance without the export a job needs can only fail it.
+        // Declining sends the job to a store of its own, where the binding is
+        // built per call and its error reaches whoever is waiting.
+        if !self.accepts.takes(&job) {
             return Err(job);
         }
         let Some(guard) = self.try_admit() else {

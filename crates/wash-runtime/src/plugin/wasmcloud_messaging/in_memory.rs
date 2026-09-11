@@ -3,15 +3,14 @@ use std::sync::Arc;
 
 use crate::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use crate::engine::workload::{ResolvedWorkload, UnresolvedWorkload, WorkloadItem};
-use crate::observability::Meters;
+use crate::observability::{MeterKind, Meters};
 use crate::plugin::{HostPlugin, WitInterfaces};
 use crate::wit::{WitInterface, WitWorld};
 use anyhow::Context;
-use opentelemetry::KeyValue;
 use tokio::sync::{Notify, RwLock, oneshot};
 use tracing::{Instrument, debug, instrument, trace, warn};
 
-const PLUGIN_MESSAGING_MEMORY_ID: &str = "wasmcloud-messaging-memory";
+pub(crate) const PLUGIN_MESSAGING_MEMORY_ID: &str = "wasmcloud-messaging-memory";
 const MAX_QUEUE_SIZE: usize = 10000;
 /// Default `request` timeout when the caller passes `none`, matching the NATS
 /// client's default of 10 seconds.
@@ -310,7 +309,7 @@ impl InMemoryMessaging {
     pub fn with_limits(limits: super::MessagingLimits) -> Self {
         Self {
             tracker: Arc::new(RwLock::new(WorkloadTracker::default())),
-            meters: Default::default(),
+            meters: Arc::new(RwLock::new(Meters::new(MeterKind::Off))),
             limits,
         }
     }
@@ -634,7 +633,7 @@ impl HostPlugin for InMemoryMessaging {
         // instead. Only components get a `MessagingPre` for per-message work.
         let pre = match workload.instantiate_pre(component_id).await {
             Ok(instance_pre) => Some(
-                HandlerPre::new(instance_pre)
+                HandlerTarget::new(instance_pre)
                     .map_err(anyhow::Error::from)
                     .context("failed to instantiate messaging pre")?,
             ),
@@ -651,7 +650,13 @@ impl HostPlugin for InMemoryMessaging {
 
         // Spawn the message processing task
         let task_component_id = component_id.clone();
-        let fuel_meter = self.meters.read().await.fuel_consumption.clone();
+        let guest_meter = self.meters.read().await.guest();
+        // The identity every message on this component is measured under,
+        // resolved once here rather than per delivery.
+        let attributes = workload
+            .component_identity(&component_id)
+            .await
+            .attributes(PLUGIN_MESSAGING_MEMORY_ID, super::MESSAGING_OPERATION);
 
         let handle = tokio::spawn(async move {
             // Labelled so the inner drain below can end the whole task on
@@ -673,11 +678,31 @@ impl HostPlugin for InMemoryMessaging {
 
                         debug!(subject = %msg.subject, reply_to = %msg.reply_to.as_deref().unwrap_or("<none>"), "Processing message");
 
+                        // The workload holds the handler weakly, so losing it
+                        // means the host this drains into is gone: nothing
+                        // queued now or later can be served, so the task ends
+                        // rather than the drain pass. This message is already
+                        // popped, so a requester waiting on it is failed here
+                        // for the same reason the shed path below does it.
+                        let http_handler = match workload.http_handler() {
+                            Ok(handler) => handler,
+                            Err(e) => {
+                                warn!(error = %e, "ending in-memory receive loop");
+                                if sole_subscriber
+                                    && let (Some(reply_to), Some(pending)) =
+                                        (&msg.reply_to, &pending_requests)
+                                    && let Some(sender) = pending.write().await.remove(reply_to)
+                                {
+                                    let _ = sender.send(Err(super::shed_error()));
+                                }
+                                break 'task;
+                            }
+                        };
+
                         // If this workload runs a long-lived trigger service for
                         // messaging, deliver to it (preserving its in-memory
                         // state) rather than instantiating a component per message.
-                        if workload
-                            .http_handler()
+                        if http_handler
                             .has_trigger_service_messaging(workload.id())
                             .await
                         {
@@ -686,9 +711,12 @@ impl HostPlugin for InMemoryMessaging {
                                 body: msg.body.clone(),
                                 reply_to: msg.reply_to.clone(),
                             };
-                            match workload
-                                .http_handler()
-                                .deliver_trigger_service_message(workload.id(), broker)
+                            match http_handler
+                                .deliver_trigger_service_message(
+                                    workload.id(),
+                                    broker,
+                                    attributes.clone(),
+                                )
                                 .await
                             {
                                 Ok(Ok(())) => debug!(subject = %msg.subject, "trigger service handled message"),
@@ -711,9 +739,8 @@ impl HostPlugin for InMemoryMessaging {
                             continue;
                         };
 
-                        // Admission. Taken BEFORE the store and instance are
-                        // built and held until the handler returns, so permits
-                        // held and instances alive are the same number. Mirrors
+                        // Admission. Taken BEFORE any store or instance is
+                        // built and held until the handler returns. Mirrors
                         // the NATS backend exactly; see `Admission::acquire`
                         // for why the component level is taken before the host
                         // one, and `DEFAULT_ADMISSION_WAIT` for why the wait is
@@ -761,6 +788,52 @@ impl HostPlugin for InMemoryMessaging {
                             }
                         };
 
+                        let span = tracing::span!(
+                            tracing::Level::INFO,
+                            "incoming_wasmcloud_message_memory",
+                            subject = %msg.subject,
+                            reply_to = %msg.reply_to.as_deref().unwrap_or("<none>"),
+                        );
+
+                        // As in the NATS backend: an async `@0.3.0` handler on
+                        // a component that opted into pooling is served on a
+                        // warm instance, honouring the limits it declared.
+                        // Everything else keeps a store per message.
+                        let pool = if pre.serves_async() {
+                            workload.instance_pool_for_component(&component_id).await
+                        } else {
+                            None
+                        };
+
+                        if let Some(pool) = pool {
+                            let broker = crate::host::trigger_service::BrokerMessage {
+                                subject: msg.subject,
+                                body: msg.body,
+                                reply_to: msg.reply_to,
+                            };
+                            let attributes = attributes.clone();
+                            let workload = workload.clone();
+                            let component_id = component_id.clone();
+                            let instance_pre = pre.instance_pre().clone();
+                            tokio::spawn(async move {
+                                // Released on completion, trap or not — which
+                                // is what frees the slot this message holds.
+                                let _permit = permit;
+                                let result = super::deliver_pooled(
+                                    &workload,
+                                    &component_id,
+                                    &instance_pre,
+                                    &pool,
+                                    broker,
+                                    attributes,
+                                )
+                                .instrument(span)
+                                .await;
+                                super::log_delivery(&result);
+                            });
+                            continue;
+                        }
+
                         let mut store = match workload.new_store(&component_id).await {
                             Err(e) => {
                                 warn!("failed to create store for component {component_id}: {e}");
@@ -777,24 +850,26 @@ impl HostPlugin for InMemoryMessaging {
                             Ok(p) => p,
                         };
 
-                        let span = tracing::span!(
-                            tracing::Level::INFO,
-                            "incoming_wasmcloud_message_memory",
-                            subject = %msg.subject,
-                            reply_to = %msg.reply_to.as_deref().unwrap_or("<none>"),
+                        let guest_meter = guest_meter.clone();
+
+                        // As in the NATS backend: nothing awaits this call, so
+                        // its deadline is a timer outliving the store's task.
+                        let call = crate::engine::abandon::DispatchedCall::new(
+                            "messaging (per-message store)",
+                            crate::timeouts::messaging_deliver(),
                         );
+                        let abandoned = store.data().abandoned.watch(call.flag());
+                        let deadline = call.arm_on_timer();
 
-                        let fuel_meter = fuel_meter.clone();
-
+                        let attributes = std::sync::Arc::clone(&attributes);
                         tokio::spawn(async move {
                             // Released on completion, trap or not — which is
                             // what frees the instance slot this message holds.
                             let _permit = permit;
-                            let result = fuel_meter.observe(
-                                &[
-                                    KeyValue::new("plugin", PLUGIN_MESSAGING_MEMORY_ID),
-                                    KeyValue::new("subject", msg.subject.to_string()),
-                                ],
+                            let _abandoned = abandoned;
+                            let _deadline = deadline;
+                            let result = guest_meter.observe(
+                                &attributes,
                                 &mut store,
                                 async move |store| {
                                     proxy
@@ -805,14 +880,7 @@ impl HostPlugin for InMemoryMessaging {
                                 }
                             ).await;
 
-                            match result {
-                                Ok(_) => {
-                                    debug!("Message handled successfully");
-                                }
-                                Err(e) => {
-                                    warn!("Error handling message: {e}");
-                                }
-                            };
+                            super::log_delivery(&result);
                         });
                         }
                     }

@@ -72,7 +72,7 @@ wasi-preview1-component-adapter-provider = "46"
 wasm-metadata = { workspace = true }
 wasm-pkg-client = { workspace = true }
 wasm-pkg-core = { workspace = true }
-wash-runtime = { workspace = true, features = ["washlet", "oci", "wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "wasmcloud-postgres", "wasi-otel", "wasm_component_model_implements"] }
+wash-runtime = { workspace = true, features = ["washlet", "oci", "wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "wasmcloud-postgres", "wasi-otel", "wasmcloud-nats", "wasm_component_model_implements"] }
 wit-component = { workspace = true }
 custom_plugin_cf_d1 = { path = "../custom_plugin_cf_d1" }
 custom_plugin_mail = { path = "../custom_plugin_mail" }
@@ -83,11 +83,6 @@ custom_plugin_wechat = { path = "../custom_plugin_wechat" }
 custom_plugin_telegram = { path = "../custom_plugin_telegram" }
 custom_plugin_event_monitor = { path = "../custom_plugin_event_monitor" }
 custom_plugin_task_queue = { path = "../custom_plugin_task_queue" }
-
-[build-dependencies]
-anyhow = { workspace = true, default-features = true }
-tonic-prost-build = { workspace = true, default-features = true }
-pbjson-build = { workspace = true, default-features = true }
 
 [dev-dependencies]
 bytes = { version = "1", default-features = false }

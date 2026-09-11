@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use async_nats::Subscriber;
 use futures::stream::StreamExt;
-use opentelemetry::KeyValue;
 use tokio::sync::RwLock;
 use tracing::{Instrument, debug, instrument, trace, warn};
 use wasmtime::error::Context as _;
@@ -58,12 +57,12 @@ super::messaging_handler_dispatch! {
 
 use crate::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use crate::engine::workload::{ResolvedWorkload, WorkloadItem};
-use crate::observability::Meters;
+use crate::observability::{MeterKind, Meters};
 use crate::plugin::wasmcloud_messaging::Admitted;
 use crate::plugin::{HostPlugin, WitInterfaces, WorkloadTracker};
 use crate::wit::{WitInterface, WitWorld};
 
-const PLUGIN_MESSAGING_ID: &str = "wasmcloud-messaging";
+pub(crate) const PLUGIN_MESSAGING_ID: &str = "wasmcloud-messaging";
 const CONSUMER_GROUP_CONFIG: &str = "consumer_group";
 const BROADCAST_CONSUMER_GROUP: &str = "broadcast";
 const DEFAULT_CONSUMER_GROUP_PREFIX: &str = "wasmcloud";
@@ -137,7 +136,7 @@ impl NatsMessaging {
         Self {
             client,
             tracker: Arc::new(RwLock::new(WorkloadTracker::default())),
-            meters: Default::default(),
+            meters: Arc::new(RwLock::new(Meters::new(MeterKind::Off))),
             limits,
         }
     }
@@ -508,9 +507,9 @@ impl HostPlugin for NatsMessaging {
         // pre-instantiate; its receive loop delivers to the running service
         // instead. Only components get a `MessagingPre` for per-message work.
         let pre = match workload.instantiate_pre(component_id).await {
-            Ok(instance_pre) => {
-                Some(HandlerPre::new(instance_pre).context("failed to instantiate messaging pre")?)
-            }
+            Ok(instance_pre) => Some(
+                HandlerTarget::new(instance_pre).context("failed to instantiate messaging pre")?,
+            ),
             Err(e) => {
                 trace!(component_id, error = %e, "no per-message instance (long-lived service); messages delivered to the service");
                 None
@@ -572,7 +571,13 @@ impl HostPlugin for NatsMessaging {
         }
 
         let mut messages = futures::stream::select_all(subscriptions);
-        let fuel_meter = self.meters.read().await.fuel_consumption.clone();
+        let guest_meter = self.meters.read().await.guest();
+        // The identity every message on this component is measured under,
+        // resolved once here rather than per delivery.
+        let attributes = workload
+            .component_identity(&component_id)
+            .await
+            .attributes(PLUGIN_MESSAGING_ID, super::MESSAGING_OPERATION);
 
         let span = tracing::Span::current();
         let handle = tokio::spawn(async move {
@@ -602,11 +607,21 @@ impl HostPlugin for NatsMessaging {
                         let reply_to = msg.reply.as_ref().map(|r| r.to_string());
                         let body: Vec<u8> = msg.payload.into();
 
+                        // The workload holds the handler weakly, so losing it
+                        // means the host this subscriber delivers into is gone
+                        // and no later message can be served either.
+                        let http_handler = match workload.http_handler() {
+                            Ok(handler) => handler,
+                            Err(e) => {
+                                warn!(parent: &span, error = %e, "stopping NATS subscriber loop");
+                                break;
+                            }
+                        };
+
                         // If this workload runs a long-lived trigger service for
                         // messaging, deliver to it (preserving its in-memory
                         // state) rather than instantiating a component per message.
-                        if workload
-                            .http_handler()
+                        if http_handler
                             .has_trigger_service_messaging(workload.id())
                             .await
                         {
@@ -615,9 +630,12 @@ impl HostPlugin for NatsMessaging {
                                 body,
                                 reply_to,
                             };
-                            match workload
-                                .http_handler()
-                                .deliver_trigger_service_message(workload.id(), broker)
+                            match http_handler
+                                .deliver_trigger_service_message(
+                                    workload.id(),
+                                    broker,
+                                    attributes.clone(),
+                                )
                                 .await
                             {
                                 Ok(Ok(())) => debug!(%subject, "trigger service handled message"),
@@ -640,10 +658,13 @@ impl HostPlugin for NatsMessaging {
                             continue;
                         };
 
-                        // Admission. Taken BEFORE the store and instance are
-                        // built and held until the handler returns, so permits
-                        // held and instances alive are the same number and the
-                        // ceiling is structural rather than advisory.
+                        // Admission. Taken BEFORE any store or instance is
+                        // built and held until the handler returns, so the
+                        // ceiling is structural rather than advisory. For a
+                        // component with no pool it is equally a ceiling on
+                        // instances, one per permit; for a pooled one the
+                        // instance count is bounded by `poolSize` and only the
+                        // deliveries past it build stores of their own.
                         //
                         // Waiting here stops us draining the subscription.
                         // That cannot back up the socket or endanger the shared
@@ -693,6 +714,55 @@ impl HostPlugin for NatsMessaging {
                             }
                         };
 
+                        let span = tracing::span!(
+                            tracing::Level::INFO,
+                            "incoming_wasmcloud_message",
+                            subject = %subject,
+                            reply_to = %reply_to.as_deref().unwrap_or("<none>"),
+                        );
+
+                        // An async `@0.3.0` handler on a component that opted
+                        // into pooling is served on a warm instance, honouring
+                        // the `poolSize`, `maxInvocations` and `maxConcurrency`
+                        // it declared. Everything else keeps a store per
+                        // message: without a pool there is nothing to reuse,
+                        // and the sync `@0.2.0` call holds `&mut Store` so it
+                        // could not share an instance anyway.
+                        let pool = if pre.serves_async() {
+                            workload.instance_pool_for_component(&component_id).await
+                        } else {
+                            None
+                        };
+
+                        if let Some(pool) = pool {
+                            let msg = crate::host::trigger_service::BrokerMessage {
+                                subject,
+                                body,
+                                reply_to,
+                            };
+                            let attributes = attributes.clone();
+                            let workload = workload.clone();
+                            let component_id = component_id.clone();
+                            let instance_pre = pre.instance_pre().clone();
+                            tokio::spawn(async move {
+                                // Released on completion, trap or not — which
+                                // is what frees the slot this message holds.
+                                let _permit = permit;
+                                let result = super::deliver_pooled(
+                                    &workload,
+                                    &component_id,
+                                    &instance_pre,
+                                    &pool,
+                                    msg,
+                                    attributes,
+                                )
+                                .instrument(span)
+                                .await;
+                                super::log_delivery(&result);
+                            });
+                            continue;
+                        }
+
                         let mut store = match workload.new_store(&component_id).await {
                             Err(e) => {
                                 warn!("failed to create store for component {component_id}: {e}");
@@ -713,24 +783,29 @@ impl HostPlugin for NatsMessaging {
                             body,
                         };
 
-                        let span = tracing::span!(
-                            tracing::Level::INFO,
-                            "incoming_wasmcloud_message",
-                            subject = %msg.subject,
-                            reply_to = %msg.reply_to.as_deref().unwrap_or("<none>"),
+                        let guest_meter = guest_meter.clone();
+
+                        // Nothing awaits this call, so its deadline is a timer
+                        // outliving the store's own task; without it a guest
+                        // pinned on a poison message holds this store, and its
+                        // instance slot, for the life of the host.
+                        let call = crate::engine::abandon::DispatchedCall::new(
+                            "messaging (per-message store)",
+                            crate::timeouts::messaging_deliver(),
                         );
+                        let abandoned = store.data().abandoned.watch(call.flag());
+                        let deadline = call.arm_on_timer();
 
-                        let fuel_meter = fuel_meter.clone();
-
+                        let attributes = std::sync::Arc::clone(&attributes);
                         tokio::spawn(async move {
                             // Released on completion, trap or not — which is
                             // what frees the instance slot this message holds.
                             let _permit = permit;
-                            let result = fuel_meter.observe(
-                                &[
-                                    KeyValue::new("plugin", PLUGIN_MESSAGING_ID),
-                                    KeyValue::new("subject", msg.subject.to_string()),
-                                ],
+                            // Dropped when the call ends, however it ends.
+                            let _abandoned = abandoned;
+                            let _deadline = deadline;
+                            let result = guest_meter.observe(
+                                &attributes,
                                 &mut store,
                                 async move |store| {
                                     proxy
@@ -741,14 +816,7 @@ impl HostPlugin for NatsMessaging {
                                 }
                             ).await;
 
-                            match result {
-                                Ok(_) => {
-                                    debug!("Message handled successfully");
-                                }
-                                Err(e) => {
-                                    warn!("Error handling message: {e}");
-                                }
-                            };
+                            super::log_delivery(&result);
                         });
                     }
                     _ = cancel_token.cancelled() => {

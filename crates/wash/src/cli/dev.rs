@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context as _, bail, ensure};
 use bytes::Bytes;
 use clap::Args;
-use tokio::{select, sync::mpsc};
+use tokio::select;
 use tracing::{debug, info, instrument, warn};
 use wash_runtime::{
     engine::{Engine, WasmProposal},
@@ -25,7 +25,7 @@ use wash_runtime::{
 use crate::{
     cli::{
         CliCommand, CliContext, CommandOutput, component_build::build_dev_component,
-        oci::OCI_CACHE_DIR,
+        oci::OCI_CACHE_DIR, signal,
     },
     config::{Config, load_config},
     wit::WitConfig,
@@ -39,6 +39,10 @@ pub struct DevCommand {}
 impl CliCommand for DevCommand {
     async fn handle(&self, ctx: &CliContext) -> anyhow::Result<CommandOutput> {
         wash_runtime::init_crypto();
+
+        // Armed before the build below, so a signal during it stops this
+        // process rather than being ignored until the session is up.
+        let shutdown = signal::arm()?;
 
         let project_dir = ctx.project_dir();
         info!(path = ?project_dir, "starting development session for project");
@@ -76,18 +80,27 @@ impl CliCommand for DevCommand {
 
         let mut engine_builder = Engine::builder()
             .with_pooling_allocator(true)
-            .with_fuel_consumption(ctx.enable_meters());
+            .with_fuel_consumption(ctx.meters().consumes_fuel());
         for name in &dev_config.wasm_proposals {
             let proposal: WasmProposal = name
                 .parse()
                 .with_context(|| format!("invalid dev.wasm_proposals entry {name:?}"))?;
             engine_builder = engine_builder.with_wasm_proposal(proposal);
         }
+        // `wash host` needs both an operator flag and the workload's
+        // `allowedHostLoopbackPorts`. In a dev session the developer is
+        // both parties, so the flag is redundant: the port list alone gates
+        // it, and an empty list still denies.
+        let socket_policy = Arc::new(wash_runtime::sockets::policy::SocketPolicy {
+            host_loopback_enabled: true,
+            ..Default::default()
+        });
+        engine_builder = engine_builder.with_socket_policy(socket_policy);
         let engine = engine_builder.build()?;
 
         let mut host_builder = Host::builder()
             .with_engine(engine.clone())
-            .with_meters(Meters::new(ctx.enable_meters()));
+            .with_meters(Meters::new(ctx.meters()));
 
         // Enable wasi config. `copy_environment = true` surfaces each
         // component's `LocalResources.environment` via `wasi:config/store`,
@@ -152,6 +165,26 @@ impl CliCommand for DevCommand {
             debug!("wasmcloud:messaging plugin registered with in-memory backend");
         }
 
+        // `wasmcloud:nats` is a NATS-native core pub/sub, JetStream, and KV.
+        // Unlike the plugins above it borrows no *client* from the dev host: it
+        // opens one per workload, under that workload's own credentials and
+        // grant.
+        //
+        // A dev host declares bindings the same way `wash host` does
+        // (`dev.wasmcloud_nats`, with `dev.data_nats_url` as the address a
+        // binding falls back to), but leaves a workload free to describe its
+        // own: a project's manifest has to stay runnable on its own, and the
+        // operator boundary `wash host` enforces has no one to enforce it for
+        // here. With no `data_nats_url` there is no default, and a binding
+        // must name its own servers — in `dev.wasmcloud_nats`, or inline on
+        // the interface.
+        host_builder = host_builder.with_plugin(Arc::new(
+            plugin::wasmcloud_nats::WasmcloudNats::new().with_lattice_prefixes(vec![
+                format!("{}.", wash_runtime::washlet::HOST_API_PREFIX),
+                format!("{}.", wash_runtime::washlet::OPERATOR_API_PREFIX),
+            ]),
+        ))?;
+
         // Per-plugin settings override the in-memory default. The order of precedence is:
         // use a filesystem backend if there is a path override,
         // otherwise it uses NATS if `data_nats_url` is set, otherwise it falls back to
@@ -178,11 +211,17 @@ impl CliCommand for DevCommand {
 
         #[cfg(not(feature = "host-component-plugins"))]
         ensure!(
-            dev_config.host_plugins.is_empty(),
-            "dev.host_plugins requires a wash build with the `host-component-plugins` feature"
+            dev_config.component_plugins()?.is_empty(),
+            "a `dev.plugins` entry with a `file`/`image` requires a wash build with the \
+             `host-component-plugins` feature"
         );
 
         let http_handler = wash_runtime::host::http::DevRouter::default();
+
+        // Before the ceilings below, each of which is a share of the soft
+        // descriptor limit this leaves in place. `wash dev` applies it for the
+        // same reason `wash host` does: both own their process.
+        wash_runtime::host::quota::raise_descriptor_limit();
 
         // One registry for every surface: HTTP pool, raw sockets, inbound
         // published ports.
@@ -364,14 +403,14 @@ impl CliCommand for DevCommand {
         {
             let native_plugins = host_builder.native_plugins();
             let http_handler = host_builder.http_handler();
-            for hp in &dev_config.host_plugins {
+            for hp in dev_config.component_plugins()? {
                 let spec = hp.to_spec(&config, project_dir, Some(project_dir))?;
                 let plugin = wash_runtime::plugin::component_host::load_component_plugin(
                     &spec,
                     &engine,
                     oci_config.clone(),
                     &native_plugins,
-                    http_handler.clone(),
+                    http_handler.as_ref().map(Arc::downgrade),
                     None,
                 )
                 .await
@@ -381,23 +420,26 @@ impl CliCommand for DevCommand {
             }
         }
 
+        // After every plugin is registered, so `build()` can refuse a
+        // declaration naming an id this host has no plugin for.
+        //
+        // `dev.data_nats_url` is the address a `wasmcloud:nats` binding falls
+        // back to. An anchored bundle rather than a plain default: a binding
+        // that names its own `servers` is pointing somewhere else, and should
+        // inherit nothing else from the dev NATS either.
+        let mut plugin_bindings =
+            dev_config.to_plugin_bindings(&config, project_dir, Some(project_dir))?;
+        if let Some(url) = &dev_config.data_nats_url {
+            let nats = plugin_bindings
+                .for_plugin(plugin::wasmcloud_nats::PLUGIN_NATS_ID)
+                .with_default_bundle("servers", [("servers", url.clone())]);
+            plugin_bindings = plugin_bindings.with_plugin(nats);
+        }
+        host_builder = host_builder.with_plugin_bindings(plugin_bindings);
+
         // Build and start the host
         let host = host_builder.build()?.start().await?;
         host.log_interfaces();
-
-        let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
-
-        // Spawn a task to handle Ctrl + C signal
-        tokio::spawn(async move {
-            tokio::signal::ctrl_c()
-                .await
-                .context("failed to wait for ctrl_c signal")?;
-            stop_tx
-                .send(())
-                .await
-                .context("failed to send stop signal after receiving Ctrl + c")?;
-            Result::<_, anyhow::Error>::Ok(())
-        });
 
         info!("development session started, building and deploying component...");
 
@@ -435,9 +477,13 @@ impl CliCommand for DevCommand {
         let display_addr = http_addr.replace("0.0.0.0", "127.0.0.1");
         info!(address = %format!("{}://{}", protocol, display_addr), "listening for HTTP requests");
 
+        // The component is running, so from here a signal stops the session
+        // rather than ending the process.
+        let shutdown = shutdown.ready();
+
         select! {
             // Process a stop
-            _ = stop_rx.recv() => {
+            _ = shutdown => {
                 info!("Stopping development session ...");
             },
         }
@@ -469,21 +515,36 @@ impl CliCommand for DevCommand {
 /// extracted WIT interface set, and its resolved workload values (workload
 /// base merged with the component's overrides), so the pure assembly step
 /// needs no further I/O or host calls.
-/// What `Component.pool_size` / `max_invocations` carry when `wash dev` has
-/// nothing to say about them: they are `sint32` on the wire, and the runtime
-/// reads anything that is not a positive pool size as "do not keep instances".
+/// What a `Component`'s instance limits carry when `wash dev` has nothing to
+/// say about them: they are `sint32` on the wire, and the runtime reads
+/// anything that is not a positive pool size as "do not keep instances".
 const UNSET_LIMIT: i32 = -1;
 
 struct SidecarComponent {
     name: String,
     bytes: Bytes,
+    /// The content/registry digest the source resolved this sidecar's bytes
+    /// to, so it can share the engine's compiled-component cache instead of
+    /// recompiling on every dev reload.
+    digest: Option<String>,
     interfaces: HashSet<WitInterface>,
     workload: ResolvedWorkload,
-    /// Warm-instance limits from `dev.components[].poolSize` /
-    /// `maxInvocations`, `None` where the config left them unset.
+    /// The warm-instance limits from `dev.components[]`, `None` where the
+    /// config left them unset.
     pool_size: Option<i32>,
     max_invocations: Option<i32>,
     max_concurrency: Option<i32>,
+    reclaim_window_seconds: Option<i32>,
+    reclaim_min_instances: Option<i32>,
+}
+
+/// A configured `dev.service` source's loaded inputs, once fetched and its
+/// interfaces extracted. Bundled so [`build_workload`] takes one optional
+/// argument for the service rather than one per field.
+struct LoadedService {
+    bytes: Bytes,
+    digest: Option<String>,
+    interfaces: HashSet<WitInterface>,
 }
 
 /// Thin wrapper around [`build_workload`]: extracts dev-component
@@ -527,11 +588,14 @@ async fn create_workload(
         sidecars.push(SidecarComponent {
             name: name.clone(),
             bytes: loaded.bytes,
+            digest: loaded.digest,
             interfaces,
             workload,
             pool_size: dev_component.pool_size,
             max_invocations: dev_component.max_invocations,
             max_concurrency: dev_component.max_concurrency,
+            reclaim_window_seconds: dev_component.reclaim_window_seconds,
+            reclaim_min_instances: dev_component.reclaim_min_instances,
         });
     }
 
@@ -539,7 +603,7 @@ async fn create_workload(
     // isn't itself the service (`dev.service = false`); see `build_workload`.
     // When `dev.service` is true it is ignored, so there's no point fetching it
     // or folding its imports into the workload host interfaces.
-    let (service_bytes, service_interfaces) = match dev_config.service_source()? {
+    let configured_service = match dev_config.service_source()? {
         Some(source) if !dev_config.service => {
             let loaded = source
                 .load(oci_config.clone())
@@ -548,9 +612,13 @@ async fn create_workload(
             let interfaces = host
                 .intersect_interfaces(&loaded.bytes)
                 .context("failed to extract service interfaces")?;
-            (Some(loaded.bytes), Some(interfaces))
+            Some(LoadedService {
+                bytes: loaded.bytes,
+                digest: loaded.digest,
+                interfaces,
+            })
         }
-        _ => (None, None),
+        _ => None,
     };
 
     Ok(build_workload(
@@ -558,8 +626,7 @@ async fn create_workload(
         bytes,
         dev_interfaces,
         sidecars,
-        service_bytes,
-        service_interfaces,
+        configured_service,
         resolved_workload,
     ))
 }
@@ -584,8 +651,7 @@ fn build_workload(
     bytes: Bytes,
     dev_interfaces: HashSet<WitInterface>,
     sidecars: Vec<SidecarComponent>,
-    service_bytes: Option<Bytes>,
-    service_interfaces: Option<HashSet<WitInterface>>,
+    configured_service: Option<LoadedService>,
     resolved_workload: &ResolvedWorkload,
 ) -> Workload {
     let mut volumes = Vec::<Volume>::new();
@@ -612,8 +678,8 @@ fn build_workload(
     for s in &sidecars {
         all_component_interfaces.push(s.interfaces.clone());
     }
-    if let Some(svc_interfaces) = service_interfaces {
-        all_component_interfaces.push(svc_interfaces);
+    if let Some(svc) = &configured_service {
+        all_component_interfaces.push(svc.interfaces.clone());
     }
 
     let host_interfaces = build_workload_host_interfaces(
@@ -650,12 +716,14 @@ fn build_workload(
             pool_size: UNSET_LIMIT,
             max_invocations: UNSET_LIMIT,
             max_concurrency: UNSET_LIMIT,
+            reclaim_window_seconds: UNSET_LIMIT,
+            reclaim_min_instances: UNSET_LIMIT,
         });
 
-        if let Some(service_bytes) = service_bytes {
+        if let Some(configured_service) = configured_service {
             service = Some(Service {
-                bytes: service_bytes,
-                digest: None,
+                bytes: configured_service.bytes,
+                digest: configured_service.digest,
                 max_restarts: 0,
                 local_resources: local_resources_for(resolved_workload),
             });
@@ -667,14 +735,16 @@ fn build_workload(
         components.push(Component {
             name: sidecar.name,
             bytes: sidecar.bytes,
-            digest: None,
+            digest: sidecar.digest,
             local_resources: local_resources_for(&sidecar.workload),
             // `Component` carries these as `sint32`, where a negative means
-            // "not configured"; the runtime decodes the pair into an
+            // "not configured"; the runtime decodes them into an
             // `InstancePolicy`.
             pool_size: sidecar.pool_size.unwrap_or(UNSET_LIMIT),
             max_invocations: sidecar.max_invocations.unwrap_or(UNSET_LIMIT),
             max_concurrency: sidecar.max_concurrency.unwrap_or(UNSET_LIMIT),
+            reclaim_window_seconds: sidecar.reclaim_window_seconds.unwrap_or(UNSET_LIMIT),
+            reclaim_min_instances: sidecar.reclaim_min_instances.unwrap_or(UNSET_LIMIT),
         });
     }
 
@@ -854,11 +924,14 @@ mod tests {
         SidecarComponent {
             name: name.into(),
             bytes: fake_bytes(name),
+            digest: None,
             interfaces: HashSet::new(),
             workload,
             pool_size: None,
             max_invocations: None,
             max_concurrency: None,
+            reclaim_window_seconds: None,
+            reclaim_min_instances: None,
         }
     }
 
@@ -891,7 +964,6 @@ mod tests {
             HashSet::new(),
             sidecars,
             None,
-            None,
             &resolved,
         );
 
@@ -919,10 +991,10 @@ mod tests {
         );
     }
 
-    /// `poolSize` / `maxInvocations` on a `dev.components` entry must reach the
+    /// The warm-instance limits on a `dev.components` entry must reach the
     /// workload component; the runtime reads them to decide whether to keep
-    /// instances warm. A sidecar that sets neither stays at `-1` (unset), which
-    /// the runtime reads as "no pooling".
+    /// instances warm and when to give them back. A sidecar that sets none
+    /// stays at `-1` (unset), which the runtime reads as "no pooling".
     #[test]
     fn build_workload_carries_warm_instance_limits() {
         let resolved = ResolvedWorkload::default();
@@ -936,6 +1008,8 @@ mod tests {
         let mut pooled = loaded_sidecar("pooled", resolved.clone());
         pooled.pool_size = Some(4);
         pooled.max_invocations = Some(100);
+        pooled.reclaim_window_seconds = Some(30);
+        pooled.reclaim_min_instances = Some(1);
         let sidecars = vec![pooled, loaded_sidecar("unpooled", resolved.clone())];
 
         let workload = build_workload(
@@ -944,17 +1018,47 @@ mod tests {
             HashSet::new(),
             sidecars,
             None,
-            None,
             &resolved,
         );
 
         let pooled = find_component(&workload, "pooled").unwrap();
         assert_eq!(pooled.pool_size, 4);
         assert_eq!(pooled.max_invocations, 100);
+        assert_eq!(pooled.reclaim_window_seconds, 30);
+        assert_eq!(pooled.reclaim_min_instances, 1);
 
         let unpooled = find_component(&workload, "unpooled").unwrap();
         assert_eq!(unpooled.pool_size, UNSET_LIMIT);
         assert_eq!(unpooled.max_invocations, UNSET_LIMIT);
+        assert_eq!(unpooled.reclaim_window_seconds, UNSET_LIMIT);
+        assert_eq!(unpooled.reclaim_min_instances, UNSET_LIMIT);
+    }
+
+    /// The digest `create_workload` resolved when loading a sidecar's bytes
+    /// must reach the sidecar's `Component`, or it can never share the
+    /// engine's compiled-component cache with another workload using the
+    /// same source.
+    #[test]
+    fn build_workload_sidecar_carries_its_resolved_digest() {
+        let resolved = ResolvedWorkload::default();
+        let dev_cfg = DevConfig {
+            components: vec![dev_component_named("sidecar-a")],
+            ..Default::default()
+        };
+        let mut sidecar = loaded_sidecar("sidecar-a", resolved.clone());
+        sidecar.digest = Some("sha256:sidecar-digest".to_string());
+
+        let workload = build_workload(
+            &dev_cfg,
+            fake_bytes("dev"),
+            HashSet::new(),
+            vec![sidecar],
+            None,
+            &resolved,
+        );
+
+        let sidecar = find_component(&workload, "sidecar-a").unwrap();
+        assert_eq!(sidecar.digest.as_deref(), Some("sha256:sidecar-digest"));
     }
 
     /// The config keys are camelCase on the wire and optional, so a component
@@ -962,16 +1066,21 @@ mod tests {
     #[test]
     fn dev_component_warm_instance_limits_deserialize() {
         let with: DevComponent = serde_yaml_ng::from_str(
-            "name: pooled\nfile: pooled.wasm\npoolSize: 8\nmaxInvocations: 50",
+            "name: pooled\nfile: pooled.wasm\npoolSize: 8\nmaxInvocations: 50\n\
+             reclaimWindowSeconds: 60\nreclaimMinInstances: 2",
         )
         .unwrap();
         assert_eq!(with.pool_size, Some(8));
         assert_eq!(with.max_invocations, Some(50));
+        assert_eq!(with.reclaim_window_seconds, Some(60));
+        assert_eq!(with.reclaim_min_instances, Some(2));
 
         let without: DevComponent =
             serde_yaml_ng::from_str("name: plain\nfile: plain.wasm").unwrap();
         assert_eq!(without.pool_size, None);
         assert_eq!(without.max_invocations, None);
+        assert_eq!(without.reclaim_window_seconds, None);
+        assert_eq!(without.reclaim_min_instances, None);
     }
 
     #[test]
@@ -1004,7 +1113,6 @@ mod tests {
             fake_bytes("dev"),
             HashSet::new(),
             sidecars,
-            None,
             None,
             &resolved,
         );
@@ -1054,7 +1162,6 @@ mod tests {
             HashSet::new(),
             Vec::new(),
             None,
-            None,
             &resolved,
         );
 
@@ -1083,8 +1190,11 @@ mod tests {
             fake_bytes("dev"),
             HashSet::new(),
             Vec::new(),
-            Some(fake_bytes("svc-sidecar")),
-            None,
+            Some(LoadedService {
+                bytes: fake_bytes("svc-sidecar"),
+                digest: Some("sha256:svc-sidecar-digest".to_string()),
+                interfaces: HashSet::new(),
+            }),
             &resolved,
         );
 
@@ -1093,6 +1203,10 @@ mod tests {
             .as_ref()
             .expect("service_file should produce a Service");
         assert_eq!(svc.local_resources.environment.get("LOG").unwrap(), "info");
+        // The digest resolved when loading the service's bytes must reach
+        // the Service, or it can never share the engine's compiled-component
+        // cache with another workload using the same source.
+        assert_eq!(svc.digest.as_deref(), Some("sha256:svc-sidecar-digest"));
         let dev = find_component(&workload, "wash-dev-component").unwrap();
         assert_eq!(dev.local_resources.environment.get("LOG").unwrap(), "info");
     }
@@ -1116,8 +1230,11 @@ mod tests {
             fake_bytes("dev"),
             HashSet::new(),
             sidecars,
-            Some(fake_bytes("svc")),
-            None,
+            Some(LoadedService {
+                bytes: fake_bytes("svc"),
+                digest: None,
+                interfaces: HashSet::new(),
+            }),
             &ResolvedWorkload::default(),
         );
 
@@ -1155,11 +1272,14 @@ mod tests {
         let sidecars = vec![SidecarComponent {
             name: "sidecar".into(),
             bytes: fake_bytes("sidecar"),
+            digest: None,
             interfaces: HashSet::from([iface("wasi", "config")]),
             workload: ResolvedWorkload::default(),
             pool_size: None,
             max_invocations: None,
             max_concurrency: None,
+            reclaim_window_seconds: None,
+            reclaim_min_instances: None,
         }];
 
         let workload = build_workload(
@@ -1167,7 +1287,6 @@ mod tests {
             fake_bytes("dev"),
             HashSet::from([iface("wasi", "http")]),
             sidecars,
-            None,
             None,
             &resolved,
         );
@@ -1191,8 +1310,11 @@ mod tests {
             fake_bytes("dev"),
             HashSet::new(),
             Vec::new(),
-            Some(fake_bytes("svc")),
-            Some(HashSet::from([iface("wasi", "keyvalue")])),
+            Some(LoadedService {
+                bytes: fake_bytes("svc"),
+                digest: None,
+                interfaces: HashSet::from([iface("wasi", "keyvalue")]),
+            }),
             &ResolvedWorkload::default(),
         );
 
@@ -1225,7 +1347,6 @@ mod tests {
             fake_bytes("dev"),
             HashSet::new(),
             sidecars,
-            None,
             None,
             &ResolvedWorkload::default(),
         );

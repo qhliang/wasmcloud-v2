@@ -1,7 +1,7 @@
 //! This module is primarily concerned with converting an [`UnresolvedWorkload`] into a [`ResolvedWorkload`] by
 //! resolving all components and their dependencies.
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ops::{Deref, DerefMut},
     path::PathBuf,
     sync::Arc,
@@ -20,14 +20,17 @@ use wasmtime_wasi::p2::bindings::CommandPre;
 #[cfg(feature = "wasi-tls")]
 use crate::engine::ctx::SharedTlsProvider;
 #[cfg(feature = "host-component-plugins")]
-use crate::engine::linked_call::{types_are_bridge_safe, types_are_ephemeral_safe};
+use crate::engine::linked_call::{
+    ServiceExportCall, types_are_bridge_safe, types_are_ephemeral_safe,
+};
 use crate::{
     engine::{
         ctx::SharedCtx,
+        dispatch::{DispatchTarget, INGRESS_BACKLOG, ServiceCalls, ServiceClaim},
         instance_pool::{self, InstancePolicy, InstancePool},
         linked_call::{
             ComponentCtxTemplate, EphemeralCallMode, EphemeralLinkedCall, LinkedExportInvocation,
-            func_is_bridge_safe, func_is_ephemeral_safe, invoke_linked_async_export,
+            LinkedTarget, func_is_bridge_safe, func_is_ephemeral_safe, invoke_linked_async_export,
             invoke_linked_sync_export, new_store_from_templates,
         },
         volumes::{ResolvedVolumeMount, resolve_component_volume_mounts_in_map},
@@ -50,8 +53,7 @@ pub(crate) struct ExternalCallFunc<'a> {
 
 /// What [`ResolvedWorkload::item_exporting`] found about the one item it was
 /// asked about: whether that item exports an interface a host component plugin
-/// imports, and — for a component, the only kind a plugin can call — how to
-/// address the export.
+/// imports, and how to address the export.
 #[cfg(feature = "host-component-plugins")]
 pub(crate) enum ItemExport {
     /// A component exports it.
@@ -67,14 +69,32 @@ pub(crate) enum ItemExport {
         /// by the plugin's name misses it.
         export: Arc<str>,
     },
-    /// The workload's long-lived service exports it. A plugin cannot call it:
-    /// reaching the *running* service means routing into its live instance, the
-    /// way inbound messaging does, and a call built like a component's would
-    /// instead instantiate a second copy whose state is not the one the service
-    /// has been accumulating.
-    Service,
+    /// The workload's long-lived service exports it. Reached by routing into
+    /// the instance already running, the way inbound HTTP and messaging are —
+    /// never by instantiating a second copy, whose state would not be the one
+    /// the service has been accumulating.
+    Service {
+        /// The service's own name for the export, as for a component.
+        export: Arc<str>,
+    },
     /// Neither — this item bound to the plugin for a capability it imports.
     None,
+}
+
+/// The item's own name for the export serving `interface`, if it has one.
+///
+/// Not the plugin's name for the import: the two agree except where matching
+/// tolerated a version on one side only, and addressing the export on an
+/// instance needs the name the item actually used.
+#[cfg(feature = "host-component-plugins")]
+fn export_named(
+    exports: Option<Vec<(String, ComponentItem)>>,
+    interface: &WitInterface,
+) -> Option<Arc<str>> {
+    exports?
+        .into_iter()
+        .find(|(name, _)| WitInterface::from(name.as_str()).contains(interface))
+        .map(|(name, _)| Arc::from(name))
 }
 
 /// Type alias for tracking bound plugins with their matched interfaces during binding.
@@ -116,6 +136,11 @@ pub struct WorkloadMetadata {
     /// from [`crate::engine::Engine`]'s configuration; the workload-level half
     /// (`allowedHosts`, `allowedHostLoopbackPorts`) comes from `local_resources`.
     pub(crate) socket_policy: Arc<crate::sockets::policy::SocketPolicy>,
+    /// The host-wide guest memory budget every store built for this component
+    /// draws on. Installed by the engine alongside `socket_policy`; the
+    /// [`Default`] here is an unmetered budget, so a metadata built outside an
+    /// engine is neither charged nor limited.
+    pub(crate) guest_memory: Arc<crate::engine::guest_memory::GuestMemoryBudget>,
     /// Linked component ids
     linked_components: HashSet<Arc<str>>,
 }
@@ -340,6 +365,7 @@ impl WorkloadService {
                 plugins: None,
                 loopback,
                 socket_policy: Arc::default(),
+                guest_memory: Arc::default(),
                 linked_components: Default::default(),
             },
             handle: None,
@@ -435,6 +461,7 @@ impl WorkloadComponent {
                 plugins: None,
                 loopback,
                 socket_policy: Arc::default(),
+                guest_memory: Arc::default(),
                 linked_components: Default::default(),
             },
             name: component_name.into(),
@@ -577,10 +604,25 @@ pub struct ResolvedWorkload {
     /// All components in the workload. This is behind a `RwLock` to support mutable
     /// access to the component linkers.
     components: Arc<RwLock<BTreeMap<Arc<str>, WorkloadComponent>>>,
-    /// The HTTP handler for outgoing HTTP requests
-    http_handler: Arc<dyn crate::host::http::HostHandler>,
+    /// The HTTP handler for outgoing HTTP requests. See
+    /// [`crate::host::http::live_handler`] for why this is weak and how the
+    /// two kinds of caller differ.
+    http_handler: std::sync::Weak<dyn crate::host::http::HostHandler>,
+    /// The meter of the host running this workload, stamped onto every store
+    /// built for it. Reaches the engine the same way `http_handler` does,
+    /// because a store has no other way back to the host that owns it.
+    invocation: crate::observability::InvocationMeter,
     /// An optional service component that runs once to completion or for the duration of the workload
     service: Option<WorkloadService>,
+    /// The ingress plugin-dispatched calls reach the service on, once one has
+    /// claimed it as a [`DispatchTarget`]. Present whether or not the workload
+    /// has a service — an unclaimed one costs a lock and an empty option.
+    service_calls: Arc<ServiceCalls>,
+    /// Set when the workload is being torn down. A [`DispatchTarget`] outlives
+    /// the workload it names — a plugin holds one until it is unbound, and is
+    /// unbound only after teardown has begun — so a dispatch already on its way
+    /// checks this rather than instantiating into a workload that is going away.
+    released: Arc<std::sync::atomic::AtomicBool>,
     /// The requested host [`WitInterface`]s to resolve this workload
     host_interfaces: Vec<WitInterface>,
     /// TLS provider override for `wasi:tls` client connections in this workload.
@@ -617,25 +659,46 @@ impl std::fmt::Debug for ResolvedWorkload {
 /// leave every restarted incarnation permanently broken.
 struct ServiceStoreRecipe {
     engine: wasmtime::Engine,
-    http_handler: Arc<dyn crate::host::http::HostHandler>,
+    /// Weak, like the workload's own; the supervisor holds this recipe for as
+    /// long as the service runs.
+    http_handler: std::sync::Weak<dyn crate::host::http::HostHandler>,
     active_template: ComponentCtxTemplate,
     linked_templates: Vec<ComponentCtxTemplate>,
     linked_instances: Vec<(Arc<str>, wasmtime::component::InstancePre<SharedCtx>)>,
+    /// Stamped onto every incarnation's store, so a restart is measured like
+    /// the start was. `None` on a host that measures nothing.
+    metering: Option<(
+        crate::observability::WorkloadIdentity,
+        crate::observability::InvocationMeter,
+    )>,
 }
 
 impl ServiceStoreRecipe {
-    /// Build a fresh service store (`is_service = true` so `cli/run` may bind
-    /// its loopback socket).
+    /// Build a fresh service store. Always a service store: the flag it passes
+    /// is what lets `cli/run` bind its loopback socket, and every store built
+    /// from this recipe is an incarnation of a service that may want one.
     async fn build(&self) -> anyhow::Result<wasmtime::Store<SharedCtx>> {
-        new_store_from_templates(
+        let store = new_store_from_templates(
             &self.engine,
-            self.http_handler.clone(),
+            crate::host::http::live_handler(&self.http_handler)?,
             &self.active_template,
             &self.linked_templates,
             &self.linked_instances,
             true,
         )
-        .await
+        .await?;
+        // Every store a call is measured on has to be stamped, this one
+        // included: a trigger service's deliveries are recorded through the
+        // store they run on, and its messaging attributes are built by the
+        // plugin rather than from the stamp — so an unstamped store loses
+        // fully attributed data points rather than empty ones.
+        if let Some((identity, invocation)) = &self.metering {
+            store
+                .data()
+                .executed
+                .set_identity(identity.clone(), invocation.clone());
+        }
+        Ok(store)
     }
 }
 
@@ -643,23 +706,32 @@ impl ServiceStoreRecipe {
 /// paired senders to register with the host-side HTTP/messaging ingresses. Called
 /// once per incarnation (start and each restart) so a restarted service gets fresh
 /// channels whose senders replace the stale registrations.
+///
+/// The plugin-dispatch ingress is built the same way, but its sender is swapped
+/// inside [`ServiceCalls`] rather than returned: dispatchers hold the ingress
+/// itself, so a restart replaces the channel under them with nothing to
+/// re-register.
 #[allow(clippy::type_complexity)]
 fn build_trigger_ingresses(
     serves_http: bool,
     serves_messaging: bool,
+    service_calls: &ServiceCalls,
 ) -> (
     Vec<crate::host::trigger_service::Ingress>,
     Option<tokio::sync::mpsc::Sender<crate::host::http::ServiceHttpJob>>,
     Option<tokio::sync::mpsc::Sender<crate::host::trigger_service::MessagingJob>>,
 ) {
     let mut ingresses = Vec::new();
+    if let Some(rx) = service_calls.next_incarnation() {
+        ingresses.push(crate::host::trigger_service::Ingress::Guest(rx));
+    }
     let http_tx = serves_http.then(|| {
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let (tx, rx) = tokio::sync::mpsc::channel(INGRESS_BACKLOG);
         ingresses.push(crate::host::trigger_service::Ingress::Http(rx));
         tx
     });
     let messaging_tx = serves_messaging.then(|| {
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let (tx, rx) = tokio::sync::mpsc::channel(INGRESS_BACKLOG);
         ingresses.push(crate::host::trigger_service::Ingress::Messaging(rx));
         tx
     });
@@ -670,18 +742,25 @@ impl ResolvedWorkload {
     /// Executes the service, if present, and returns whether it was run.
     #[instrument(name="execute_service", skip_all, fields(workload.id = self.id.as_ref(), workload.name = self.name.as_ref(), workload.namespace = self.namespace.as_ref()))]
     pub(crate) async fn execute_service(&mut self) -> anyhow::Result<Option<Arc<JoinHandle<()>>>> {
+        // Which ingresses the service runs with is settled here, so a plugin
+        // claiming it as a dispatch target from now on is refused rather than
+        // handed a channel nothing would ever serve.
+        self.service_calls.mark_started();
         if self
             .service
             .as_ref()
             .is_some_and(|s| s.metadata.targets_p3())
         {
-            // A p3 service that also exports a host-invoked handler (today
-            // `wasi:http/handler`) co-drives it with `cli/run` on one instance
-            // (see the `trigger service` module).
-            if self.service.as_ref().is_some_and(|s| {
-                crate::engine::exports_wasi_http(&s.metadata.component)
-                    || crate::engine::exports_messaging_handler(&s.metadata.component)
-            }) {
+            // A p3 service that also serves something the host delivers to it —
+            // a host-invoked handler export (today `wasi:http/handler`), or
+            // calls a plugin dispatches to it — co-drives that with `cli/run`
+            // on one instance (see the `trigger service` module).
+            if self.service_calls.claimed()
+                || self.service.as_ref().is_some_and(|s| {
+                    crate::engine::exports_wasi_http(&s.metadata.component)
+                        || crate::engine::exports_messaging_handler(&s.metadata.component)
+                })
+            {
                 return self.execute_trigger_service().await;
             }
             return self.execute_service_p3().await;
@@ -697,9 +776,7 @@ impl ResolvedWorkload {
         let Some(service) = self.service.as_ref() else {
             bail!("service unexpectedly missing during execution");
         };
-        let mut store = self
-            .new_store_from_metadata(&service.metadata, true)
-            .await?;
+        let mut store = self.new_store_from_metadata(&service.metadata).await?;
         let instance = pre.instantiate_async(&mut store).await?;
         let handle = tokio::spawn(async move {
             loop {
@@ -830,6 +907,10 @@ impl ResolvedWorkload {
         let mut store = recipe.build().await?;
         let http_handler = self.http_handler.clone();
         let workload_id: Arc<str> = Arc::from(self.id());
+        // Carried for the supervisor's own logs: the id alone does not say
+        // which workload's service a restart decision is about.
+        let workload_name: Arc<str> = self.name.clone();
+        let workload_namespace: Arc<str> = self.namespace.clone();
         // The hostnames this service serves HTTP on, derived once from the
         // workload's declared interfaces. Passed to every HTTP registration
         // (the first below and each restart re-registration in the supervisor)
@@ -842,16 +923,28 @@ impl ResolvedWorkload {
         // instantiating a component per request/message. The first registration is
         // synchronous (before the driver spawns) so a delivery immediately after
         // start finds the handler; restarts re-register from inside the supervisor.
+        // What a failing `cli/run` costs this service. A service the host only
+        // *dispatches* to would, without that ingress, run as a plain p3
+        // service — where a `cli/run` error ends the incarnation and spends a
+        // restart. Keep that: which plugins a workload binds must not change
+        // what its `maxRestarts` means. A service whose handler exports are the
+        // point keeps the standing behavior, where the handlers go on serving.
+        let cli_run_error = if serves_http || serves_messaging {
+            crate::host::trigger_service::CliRunError::Logged
+        } else {
+            crate::host::trigger_service::CliRunError::Fatal
+        };
+        let service_calls = Arc::clone(&self.service_calls);
         let (ingresses, http_tx, messaging_tx) =
-            build_trigger_ingresses(serves_http, serves_messaging);
+            build_trigger_ingresses(serves_http, serves_messaging, &service_calls);
         if let Some(http_tx) = http_tx {
-            self.http_handler
+            self.http_handler()?
                 .on_service_http_resolved(self.id(), &ingress_hostnames, http_tx)
                 .await
                 .map_err(|e| anyhow::anyhow!("failed to register service HTTP handler: {e:#}"))?;
         }
         if let Some(messaging_tx) = messaging_tx {
-            self.http_handler
+            self.http_handler()?
                 .on_trigger_service_messaging_resolved(self.id(), messaging_tx)
                 .await
                 .map_err(|e| {
@@ -870,27 +963,58 @@ impl ResolvedWorkload {
                 let ingresses = match first.take() {
                     Some(ingresses) => ingresses,
                     None => {
+                        // The handler is held weakly, so a host that went away
+                        // while this service was faulting ends the supervisor:
+                        // there is nothing left to re-register the restarted
+                        // incarnation's ingresses with.
+                        let Some(http_handler) = http_handler.upgrade() else {
+                            error!(
+                                workload.id = %workload_id,
+                                workload.namespace = %workload_namespace,
+                                workload.name = %workload_name,
+                                "host HTTP handler is no longer available; \
+                                 not restarting this workload's service"
+                            );
+                            break;
+                        };
                         let (ingresses, http_tx, messaging_tx) =
-                            build_trigger_ingresses(serves_http, serves_messaging);
+                            build_trigger_ingresses(serves_http, serves_messaging, &service_calls);
                         if let Some(http_tx) = http_tx
                             && let Err(e) = http_handler
                                 .on_service_http_resolved(&workload_id, &ingress_hostnames, http_tx)
                                 .await
                         {
-                            error!(err = %e, "failed to re-register service HTTP handler on restart");
+                            error!(
+                                workload.id = %workload_id,
+                                workload.namespace = %workload_namespace,
+                                workload.name = %workload_name,
+                                err = %e,
+                                "failed to re-register service HTTP handler on restart"
+                            );
                         }
                         if let Some(messaging_tx) = messaging_tx
                             && let Err(e) = http_handler
                                 .on_trigger_service_messaging_resolved(&workload_id, messaging_tx)
                                 .await
                         {
-                            error!(err = %e, "failed to re-register trigger service messaging handler on restart");
+                            error!(
+                                workload.id = %workload_id,
+                                workload.namespace = %workload_namespace,
+                                workload.name = %workload_name,
+                                err = %e,
+                                "failed to re-register trigger service messaging handler on restart"
+                            );
                         }
                         ingresses
                     }
                 };
-                match crate::host::trigger_service::run_trigger_driver(&mut store, &pre, ingresses)
-                    .await
+                match crate::host::trigger_service::run_trigger_driver(
+                    &mut store,
+                    &pre,
+                    ingresses,
+                    cli_run_error,
+                )
+                .await
                 {
                     Ok(()) => {
                         info!("trigger service exited");
@@ -924,8 +1048,25 @@ impl ResolvedWorkload {
         Ok(Some(handle))
     }
 
+    /// Let go of everything this workload is running, as the first step of
+    /// tearing it down (see `crate::host::release`, the one funnel every
+    /// teardown path goes through).
+    ///
+    /// Dispatch stops here rather than when the plugins are unbound: a plugin
+    /// still holding a [`DispatchTarget`] must not build — or park — an
+    /// instance in a workload that is going away.
+    pub(crate) fn begin_teardown(&self) {
+        self.released
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Close the dispatch ingress too, so a plugin mid-delivery to the
+        // service is told now rather than waiting on a reply from a driver that
+        // is about to be aborted.
+        self.service_calls.shutdown();
+        self.stop_service();
+    }
+
     /// Aborts the running service [`JoinHandle`] if it exists.
-    pub(crate) fn stop_service(&self) {
+    fn stop_service(&self) {
         if let Some(service) = &self.service
             && let Some(handle) = &service.handle
         {
@@ -1289,8 +1430,7 @@ impl ResolvedWorkload {
                                 let relocate = !plain_safe
                                     && is_service_workload
                                     && func_is_bridge_safe(&func_ty);
-                                let ephemeral_call = if export_is_async && (plain_safe || relocate)
-                                {
+                                let target = if export_is_async && (plain_safe || relocate) {
                                     let mode = if relocate {
                                         EphemeralCallMode::Relocated {
                                             param_tys: func_ty.params().map(|(_, ty)| ty).collect(),
@@ -1299,7 +1439,9 @@ impl ResolvedWorkload {
                                     } else {
                                         EphemeralCallMode::PlainValue
                                     };
-                                    Some(Arc::new(EphemeralLinkedCall {
+                                    LinkedTarget::Ephemeral(Arc::new(EphemeralLinkedCall {
+                                        pre: pre.clone(),
+                                        invocation: self.invocation.clone(),
                                         engine: plugin_engine.clone(),
                                         http_handler: self.http_handler.clone(),
                                         components: self.components.clone(),
@@ -1310,17 +1452,16 @@ impl ResolvedWorkload {
                                         mode,
                                     }))
                                 } else {
-                                    None
+                                    LinkedTarget::SharedStore
                                 };
 
                                 let inv = LinkedExportInvocation {
                                     import_name: import_name.into(),
                                     export_name: export_name.into(),
-                                    pre: pre.clone(),
                                     plugin_component_id: plugin_component.id.clone(),
                                     func_idx,
                                     param_tys: Arc::default(),
-                                    ephemeral_call,
+                                    target,
                                 };
 
                                 linked_components.insert(inv.plugin_component_id.clone());
@@ -1451,8 +1592,12 @@ impl ResolvedWorkload {
     /// the messaging subscriber) deliver an inbound message to a long-lived
     /// trigger-service instance instead of instantiating a component per
     /// message.
-    pub fn http_handler(&self) -> &Arc<dyn crate::host::http::HostHandler> {
-        &self.http_handler
+    ///
+    /// Held weakly, so this fails once the host that owns the handler is gone
+    /// — which is the answer every caller wants: there is nothing left to
+    /// register with, deliver to, or send an outbound request through.
+    pub fn http_handler(&self) -> anyhow::Result<Arc<dyn crate::host::http::HostHandler>> {
+        crate::host::http::live_handler(&self.http_handler)
     }
 
     /// Gets the name of the workload
@@ -1463,6 +1608,13 @@ impl ResolvedWorkload {
     /// Gets the namespace of the workload
     pub fn namespace(&self) -> &str {
         &self.namespace
+    }
+
+    /// Id of this workload's long-lived service, if it has one. A plugin is
+    /// handed item ids without being told which kind each is; this is how one
+    /// tells the service apart from a component.
+    pub fn service_id(&self) -> Option<&str> {
+        self.service.as_ref().map(|s| s.id())
     }
 
     /// Returns the number of components in this workload.
@@ -1477,6 +1629,18 @@ impl ResolvedWorkload {
     /// deep-clone its by-value `Linker`, and `pre_instantiate_ref` needs only
     /// read access, so concurrent callers don't serialize on a write lock.
     /// Nothing is retained past the returned store.
+    /// A store for `component_id`, stamped with whose execution it runs.
+    ///
+    /// The stamp is what lets the epoch callback credit `guest.execution.total`
+    /// without a call to hang the number on — the only correct instrument for a
+    /// store several calls share. See
+    /// [`crate::engine::abandon::GuestExecution`].
+    ///
+    /// This is the raw store, and a store of its own is what the component asked
+    /// *not* to have when it set `poolSize`. A host plugin calling into a
+    /// workload should go through [`Self::dispatch_target`] instead, which
+    /// serves the call on a warm instance where there is one — and reaches the
+    /// workload's service, which has no store to build at all.
     pub async fn new_store(
         &self,
         component_id: &str,
@@ -1504,15 +1668,27 @@ impl ResolvedWorkload {
                 linked_instances,
             )
         };
-        new_store_from_templates(
+        let store = new_store_from_templates(
             &engine,
-            self.http_handler.clone(),
+            self.http_handler()?,
             &active_template,
             &linked_templates,
             &linked_instances,
             false,
         )
-        .await
+        .await?;
+        // This host's own meter, not a process-wide one: the read lock and the
+        // allocations below are on the hot path of the p2 HTTP path, which
+        // builds a store per request, and of the per-message messaging paths.
+        // A host asked to measure nothing must not pay for them because some
+        // other host in the process measures.
+        if self.invocation.is_enabled() {
+            store.data().executed.set_identity(
+                self.component_identity(component_id).await,
+                self.invocation.clone(),
+            );
+        }
+        Ok(store)
     }
 
     /// The pool a request store for `component_id` may be parked in, or `None`
@@ -1534,6 +1710,166 @@ impl ResolvedWorkload {
             .map_or(1, |component| component.instances.call_concurrency())
     }
 
+    /// The manifest identity an item's guest-execution measurements carry.
+    ///
+    /// Manifest names throughout, never the ids — see
+    /// [`crate::observability::WorkloadIdentity`] for why. Resolve it once
+    /// where a subscription or a route is set up rather than per call: the
+    /// name costs a read lock, and it cannot change under a resolved workload.
+    pub async fn component_identity(
+        &self,
+        item_id: &str,
+    ) -> crate::observability::WorkloadIdentity {
+        // The workload's service is bound as an item like any component and its
+        // id arrives here the same way, but it lives outside the component map
+        // — so answer for it explicitly rather than letting the lookup miss.
+        // Every messaging delivery to a trigger service passes a service id,
+        // so a miss here is the steady state for those workloads, not a race.
+        // `service` is the name `wasmcloud:messaging`'s admission counter uses
+        // for the same item, so the two metrics agree.
+        if let Some(service) = &self.service
+            && service.id() == item_id
+        {
+            return crate::observability::WorkloadIdentity::new(
+                self.namespace(),
+                self.name(),
+                "service",
+            );
+        }
+        let name = self
+            .components
+            .read()
+            .await
+            .get(item_id)
+            .map(|component| Arc::<str>::from(component.name()));
+        crate::observability::WorkloadIdentity::new(
+            self.namespace(),
+            self.name(),
+            // Neither a live component nor the service: an item being torn
+            // down. The call that raced it still has to be measured under
+            // something.
+            name.as_deref().unwrap_or("unknown"),
+        )
+    }
+
+    /// Whether this workload is being torn down, and so must take no more
+    /// dispatched calls.
+    pub(crate) fn released(&self) -> bool {
+        self.released.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Resolve one of this workload's items — a component, or its service — as
+    /// something a host plugin can dispatch work to.
+    ///
+    /// This is how a plugin that drives an external event stream reaches the
+    /// workload's guest code: it resolves a target for each item it was told
+    /// about, from [`HostPlugin::on_workload_resolved`], and dispatches through
+    /// it for as long as the workload runs. Where the call ends up running —
+    /// a warm instance, a store built for it, or the running service — is the
+    /// host's to decide; see [`crate::engine::dispatch`].
+    ///
+    /// `plugin` is the dispatcher's own [`HostPlugin::id`], which names it in
+    /// the guest-execution metrics its calls produce. It is `'static` because a
+    /// plugin id is fixed for the life of the build, and the attribute would
+    /// otherwise be a dimension traffic could invent.
+    ///
+    /// # What it changes for a service
+    ///
+    /// A claimed service is run with an ingress for those calls, so it outlives
+    /// its own `cli/run`: a push-mode handler whose `run` returns — or which has
+    /// no long-running work at all — stays up to keep receiving. Its restart
+    /// budget still means what the workload said it means, though: a `cli/run`
+    /// that *fails* ends the incarnation and spends one restart, exactly as it
+    /// would without any of this.
+    ///
+    /// # Errors
+    ///
+    /// - the workload has no such item, or
+    /// - the item is a service that cannot serve dispatched calls: a p2 service
+    ///   has no concurrent driver to run one alongside its `cli/run`, and a
+    ///   service already running cannot have an ingress added to it — which is
+    ///   why this belongs in `on_workload_resolved`, before the workload
+    ///   starts.
+    ///
+    /// [`HostPlugin::on_workload_resolved`]: crate::plugin::HostPlugin::on_workload_resolved
+    pub async fn dispatch_target(
+        &self,
+        item_id: &str,
+        plugin: &'static str,
+    ) -> anyhow::Result<DispatchTarget> {
+        DispatchTarget::resolve(self, item_id, plugin).await
+    }
+
+    /// Whether `item_id` names this workload's service rather than one of its
+    /// components.
+    ///
+    /// Says nothing about whether that service *can* serve dispatched calls —
+    /// see [`Self::service_can_dispatch`], which the callers ask separately
+    /// because they answer a refusal differently.
+    pub(crate) fn is_service_item(&self, item_id: &str) -> bool {
+        self.service.as_ref().is_some_and(|s| s.id() == item_id)
+    }
+
+    /// Claim this workload's service as a dispatch target, refusing when it
+    /// could never serve one. The claim keeps the service's ingress in place
+    /// (see [`ServiceClaim`]); dropping or releasing it before the service
+    /// starts takes the ingress back.
+    pub(crate) fn claim_service_dispatch(&self) -> anyhow::Result<ServiceClaim> {
+        self.service_can_dispatch()?;
+        self.service_calls.claim()
+    }
+
+    /// Whether this workload's service could serve a call dispatched to it.
+    ///
+    /// A p2 service drives `wasi:cli/run` and nothing else: it has no
+    /// concurrent driver for a call to run alongside that, so there is nowhere
+    /// to deliver one. Asking for such a target is an error; *finding* one while
+    /// binding a plugin is not, and leaves the workload deploying without that
+    /// route.
+    pub(crate) fn service_can_dispatch(&self) -> anyhow::Result<()> {
+        let service = self
+            .service
+            .as_ref()
+            .context("workload has no service to dispatch to")?;
+        ensure!(
+            service.metadata.targets_p3(),
+            "workload '{}' runs a p2 service, which drives `wasi:cli/run` alone and cannot serve \
+             a call dispatched to it; a service a plugin calls into must target wasip3",
+            self.id
+        );
+        Ok(())
+    }
+
+    /// What dispatching to `component_id` needs, resolved once: this workload's
+    /// own key for it (so a caller holding one does not keep a second copy of
+    /// the id), the component pre-linked against its linker, and the warm set
+    /// its calls run on.
+    ///
+    /// All three under one read lock, so a dispatch takes none: what they answer
+    /// is settled when the workload resolves (see
+    /// [`WorkloadComponent::pre_instantiate_ref`] and [`instance_pool::poolable`]).
+    pub(crate) async fn component_dispatch(
+        &self,
+        component_id: &str,
+    ) -> anyhow::Result<(Arc<str>, InstancePre<SharedCtx>, Option<Arc<InstancePool>>)> {
+        let components = self.components.read().await;
+        let (id, component) = components.get_key_value(component_id).with_context(|| {
+            format!(
+                "workload '{}' has no item '{component_id}' to dispatch to",
+                self.id
+            )
+        })?;
+        let pre = component.pre_instantiate_ref().with_context(|| {
+            format!("component '{component_id}' cannot be pre-instantiated to dispatch to")
+        })?;
+        let pool = instance_pool::poolable(
+            &components,
+            component_id,
+            &component.metadata.linked_components,
+        );
+        Ok((Arc::clone(id), pre, pool))
+    }
+
     pub(crate) async fn instance_pool_for_component(
         &self,
         component_id: &str,
@@ -1547,22 +1883,56 @@ impl ResolvedWorkload {
         )
     }
 
+    /// The instance policy that actually applies to `component_id`'s stores:
+    /// [`InstancePolicy::Ephemeral`] unless it *and every component linked
+    /// into its store* opted into pooling — the same rule
+    /// [`Self::instance_pool_for_component`] applies, for the same reason: a
+    /// store holds the whole linked set, so keeping it warm keeps all of them
+    /// warm.
+    ///
+    /// For a plugin that has to keep a warm set of its own rather than
+    /// dispatching through [`Self::dispatch_target`] — the `wasmcloud:nats`
+    /// subscriber's JetStream deliveries, whose call carries a typed `resource`
+    /// handle that is an index into the very store table it must run in, so its
+    /// argument cannot exist before the store is chosen. Anything that *can*
+    /// take the dispatch path should, and get the pool itself rather than only
+    /// the numbers describing it.
+    pub async fn warm_instance_policy(&self, component_id: &str) -> InstancePolicy {
+        match self.instance_pool_for_component(component_id).await {
+            Some(pool) => pool.policy(),
+            None => InstancePolicy::Ephemeral,
+        }
+    }
+
     /// Creates a new wasmtime Store for multiple components from the given workload metadata.
+    ///
+    /// The recipe carries the metering stamp a service's store needs — it
+    /// serves every ingress the workload has, concurrently, for the life of the
+    /// workload, so no call on it can attribute a delta to itself and
+    /// `guest.execution.total` is all there is. See
+    /// [`crate::engine::abandon::GuestExecution`].
     async fn new_store_from_metadata(
         &self,
         metadata: &WorkloadMetadata,
-        is_service: bool,
     ) -> anyhow::Result<wasmtime::Store<SharedCtx>> {
-        let recipe = self.service_store_recipe(metadata).await?;
-        new_store_from_templates(
-            &recipe.engine,
-            recipe.http_handler.clone(),
-            &recipe.active_template,
-            &recipe.linked_templates,
-            &recipe.linked_instances,
-            is_service,
+        self.service_store_recipe(metadata).await?.build().await
+    }
+
+    /// The identity a service's store runs under.
+    ///
+    /// Named `service` rather than by a component name it does not have — the
+    /// same name `wasmcloud:messaging`'s admission counter gives it, so the two
+    /// metrics join. A component's store is stamped by [`Self::new_store`],
+    /// which resolves its real manifest name.
+    fn service_identity(
+        &self,
+        metadata: &WorkloadMetadata,
+    ) -> crate::observability::WorkloadIdentity {
+        crate::observability::WorkloadIdentity::new(
+            metadata.workload_namespace(),
+            metadata.workload_name(),
+            "service",
         )
-        .await
     }
 
     /// Capture everything needed to (re)build this service's store, so the
@@ -1610,9 +1980,20 @@ impl ResolvedWorkload {
             active_template,
             linked_templates,
             linked_instances,
+            metering: self
+                .invocation
+                .is_enabled()
+                .then(|| (self.service_identity(metadata), self.invocation.clone())),
         })
     }
 
+    /// Pre-link `component_id` against its linker, ready to instantiate into a
+    /// store the caller owns.
+    ///
+    /// Only a *component* has one: the workload's service is already
+    /// instantiated, so a plugin that would call into either goes through
+    /// [`Self::dispatch_target`], which covers both and keeps warm instances in
+    /// play.
     pub async fn instantiate_pre(
         &self,
         component_id: &str,
@@ -1645,29 +2026,34 @@ impl ResolvedWorkload {
         if let Some(service) = &self.service
             && service.id() == item_id
         {
-            return if exports(&service.world()) {
-                ItemExport::Service
-            } else {
-                ItemExport::None
+            if !exports(&service.world()) {
+                return ItemExport::None;
+            }
+            return match export_named(service.component_exports().ok(), interface) {
+                Some(export) => ItemExport::Service { export },
+                // The world says it serves this and the component does not name
+                // it so: a version the two spell differently, or exports that
+                // would not parse. Loudly, because everything downstream reads
+                // the same as a service that simply does not export it — the
+                // workload deploys healthy and every call naming it fails with
+                // nothing to connect that to the service.
+                None => {
+                    tracing::warn!(
+                        workload_id = %self.id,
+                        service = item_id,
+                        %interface,
+                        "the workload\'s service declares this interface but exports no \
+                         instance matching it; deploying without that route"
+                    );
+                    ItemExport::None
+                }
             };
         }
         let components = self.components.read().await;
         let Some(component) = components.get(item_id) else {
             return ItemExport::None;
         };
-        // The export's own name, not the plugin's name for the import: the two
-        // agree except where matching tolerated a version on one side only, and
-        // addressing the instance needs the name the component actually used.
-        let Some(export) = component
-            .component_exports()
-            .ok()
-            .and_then(|exports| {
-                exports
-                    .into_iter()
-                    .find(|(name, _)| WitInterface::from(name.as_str()).contains(interface))
-            })
-            .map(|(name, _)| Arc::from(name))
-        else {
+        let Some(export) = export_named(component.component_exports().ok(), interface) else {
             return ItemExport::None;
         };
         ItemExport::Component {
@@ -1681,9 +2067,10 @@ impl ResolvedWorkload {
     /// where the plugin serves what a workload imports.
     ///
     /// A plugin runs in a store of its own, so such a call can never share one
-    /// with the callee: every invocation returned takes the ephemeral path,
-    /// which builds a store for the callee per call (or reuses one of its warm
-    /// instances) and moves arguments and results across the boundary.
+    /// with the callee: arguments and results always move across the boundary.
+    /// A component is called in a store of its own — one of its warm instances,
+    /// or one built for the call — and the workload's service on the instance
+    /// it already runs as.
     ///
     /// A function the callee does not export, or whose signature carries a
     /// `resource` or `error-context` handle that cannot cross, fails the
@@ -1762,11 +2149,12 @@ impl ResolvedWorkload {
                 LinkedExportInvocation {
                     import_name: Arc::from(interface),
                     export_name: Arc::from(func.name),
-                    pre: pre.clone(),
                     plugin_component_id: Arc::clone(&component_id),
                     func_idx,
                     param_tys: Arc::default(),
-                    ephemeral_call: Some(Arc::new(EphemeralLinkedCall {
+                    target: LinkedTarget::Ephemeral(Arc::new(EphemeralLinkedCall {
+                        pre: pre.clone(),
+                        invocation: self.invocation.clone(),
                         engine: engine.clone(),
                         http_handler: self.http_handler.clone(),
                         components: self.components.clone(),
@@ -1775,6 +2163,87 @@ impl ResolvedWorkload {
                         #[cfg(feature = "wasi-tls")]
                         tls_provider: self.tls_provider.clone(),
                         mode,
+                    })),
+                },
+            );
+        }
+        Ok(invocations)
+    }
+
+    /// [`Self::external_export_invocations`] for the workload's service.
+    ///
+    /// The service already runs; a call reaches it over the ingress `claim`
+    /// holds open, on the instance driving `cli/run`, so there is no store to
+    /// build and no `InstancePre` to instantiate.
+    ///
+    /// The caller brings the claim rather than one being taken here, because the
+    /// claim is what makes the service run with an ingress at all: a caller that
+    /// resolves these invocations and then discards them — a plugin routing to a
+    /// component instead — must be able to take that back.
+    ///
+    /// Every argument and result crosses as a relocated value, so the same
+    /// signatures a component may serve are exactly the ones a service may:
+    /// plain values, `stream<T>` and `future<T>`, and nothing carrying a
+    /// `resource` handle.
+    #[cfg(feature = "host-component-plugins")]
+    pub(crate) fn service_export_invocations(
+        &self,
+        claim: &ServiceClaim,
+        interface: &str,
+        funcs: &[ExternalCallFunc<'_>],
+    ) -> anyhow::Result<BTreeMap<Arc<str>, LinkedExportInvocation>> {
+        // No `service_can_dispatch` check here: holding a claim is proof of it,
+        // since `claim_service_dispatch` refuses to mint one otherwise.
+        let service = self
+            .service
+            .as_ref()
+            .context("workload has no service to call into")?;
+        let component = &service.metadata.component;
+        let Some((ComponentItem::ComponentInstance(_), instance_idx)) =
+            component.get_export(None, interface)
+        else {
+            bail!("the workload's service does not export {interface}");
+        };
+        let service_id: Arc<str> = Arc::from(service.id());
+        let service_identity =
+            crate::observability::WorkloadIdentity::new(self.namespace(), self.name(), "service");
+
+        let mut invocations = BTreeMap::new();
+        for func in funcs {
+            let Some((ComponentItem::ComponentFunc(_), func_idx)) =
+                component.get_export(Some(&instance_idx), func.name)
+            else {
+                bail!(
+                    "the workload's service exports {interface} but not {}, which a host \
+                     component plugin imports; the workload's copy of the interface disagrees \
+                     with the plugin's",
+                    func.name
+                );
+            };
+            ensure!(
+                types_are_bridge_safe(func.param_tys) && types_are_bridge_safe(func.result_tys),
+                "{interface}#{} carries a handle that cannot cross the boundary between a \
+                 plugin's store and a workload's; only plain values, `stream<T>`, and \
+                 `future<T>` can",
+                func.name
+            );
+            let plain = types_are_ephemeral_safe(func.param_tys)
+                && types_are_ephemeral_safe(func.result_tys);
+            invocations.insert(
+                Arc::from(func.name),
+                LinkedExportInvocation {
+                    import_name: Arc::from(interface),
+                    export_name: Arc::from(func.name),
+                    plugin_component_id: Arc::clone(&service_id),
+                    func_idx,
+                    param_tys: Arc::default(),
+                    target: LinkedTarget::Service(Arc::new(ServiceExportCall {
+                        calls: Arc::clone(claim.calls()),
+                        param_tys: func.param_tys.into(),
+                        result_tys: func.result_tys.into(),
+                        plain,
+                        attributes: service_identity
+                            .attributes("linked", &format!("{interface}#{}", func.name)),
                     })),
                 },
             );
@@ -1798,9 +2267,10 @@ impl ResolvedWorkload {
         for component in self.components.read().await.values() {
             // Warm instances hold guest resources (sockets, open files) for as
             // long as they stay parked, so release them with the rest of the
-            // workload's teardown. Calls still in flight own their own stores
-            // and are unaffected.
-            component.instances.clear();
+            // workload's teardown, and close the pool against a call that is
+            // building one right now. Calls still in flight own their own
+            // stores and are unaffected.
+            component.instances.close();
 
             if let Some(plugins) = component.plugins() {
                 for (plugin_id, plugin) in plugins.iter() {
@@ -1838,9 +2308,13 @@ impl ResolvedWorkload {
                 }
             }
 
-            if component.exports_wasi_http() {
+            // A handler that is already gone has nothing left to unbind from,
+            // so teardown treats that as done rather than as a failure.
+            if component.exports_wasi_http()
+                && let Some(http_handler) = self.http_handler.upgrade()
+            {
                 anyhow::Context::context(
-                    self.http_handler.on_workload_unbind(self.id()).await,
+                    http_handler.on_workload_unbind(self.id()).await,
                     "failed to notify HTTP handler of workload",
                 )?;
             }
@@ -1880,12 +2354,13 @@ impl ResolvedWorkload {
         // A trigger service registered its HTTP/messaging handlers at start
         // (`execute_trigger_service`); drop those registrations on stop so it no
         // longer receives host-invoked deliveries on a torn-down instance.
-        if self.service.is_some() {
-            if let Err(e) = self.http_handler.on_service_http_unbind(self.id()).await {
+        if self.service.is_some()
+            && let Some(http_handler) = self.http_handler.upgrade()
+        {
+            if let Err(e) = http_handler.on_service_http_unbind(self.id()).await {
                 tracing::error!(workload.id = %self.id(), err = %e, "failed to unbind service HTTP handler, continuing");
             }
-            if let Err(e) = self
-                .http_handler
+            if let Err(e) = http_handler
                 .on_trigger_service_messaging_unbind(self.id())
                 .await
             {
@@ -2051,6 +2526,7 @@ impl UnresolvedWorkload {
     pub async fn bind_plugins(
         &mut self,
         plugins: &HashMap<&'static str, Arc<dyn HostPlugin + 'static>>,
+        plugin_bindings: &crate::plugin::PluginBindings,
     ) -> anyhow::Result<Vec<(Arc<dyn HostPlugin + 'static>, Vec<String>)>> {
         // Track bound plugins with their matched interfaces for cleanup on failure
         let mut bound_plugins_with_interfaces: Vec<BoundPluginWithInterfaces> = Vec::new();
@@ -2088,9 +2564,11 @@ impl UnresolvedWorkload {
             let world = service.world();
 
             trace!(?world, "comparing service world to host interfaces");
+            // An entry this item uses any of, not every name on it: the entry
+            // covers what the whole workload uses (see [`WitWorld::uses`]).
             let required_interfaces: HashSet<WitInterface> = host_interfaces
                 .iter()
-                .filter(|wit_interface| world.includes_bidirectional(wit_interface))
+                .filter(|wit_interface| world.uses(wit_interface))
                 .filter(|wit_interface| {
                     !served_within_workload(wit_interface, service.id(), &world, &component_worlds)
                 })
@@ -2109,7 +2587,7 @@ impl UnresolvedWorkload {
             trace!(?world, "comparing component world to host interfaces");
             let required_interfaces: HashSet<WitInterface> = host_interfaces
                 .iter()
-                .filter(|wit_interface| world.includes_bidirectional(wit_interface))
+                .filter(|wit_interface| world.uses(wit_interface))
                 .filter(|wit_interface| {
                     !served_within_workload(wit_interface, id, world, &component_worlds)
                 })
@@ -2175,13 +2653,25 @@ impl UnresolvedWorkload {
                     if plugin_interfaces.includes_bidirectional(wit_interface)
                         && p.claims(wit_interface)
                     {
-                        // an `(implements ..)` named interface is served only
-                        // by a plugin that supports named instances.
-                        let defer_to_other = if wit_interface.name.is_some() {
-                            !p.supports_named_instances()
-                                && other_plugin_serves(plugins, plugin_id, wit_interface, true)
+                        // An `(implements ..)` label routes to the plugin
+                        // whose `host.plugins` entry declares it; failing
+                        // that, to one that supports named instances. A plain
+                        // import stays with a plugin that serves it plainly.
+                        let defer_to_other = if let Some(label) = wit_interface.name.as_deref() {
+                            match declaring_plugin(plugins, plugin_bindings, label, wit_interface) {
+                                Some(owner) => owner != *plugin_id,
+                                None => {
+                                    !p.supports_named_instances()
+                                        && other_plugin_serves(
+                                            plugins,
+                                            plugin_id,
+                                            wit_interface,
+                                            true,
+                                        )
+                                }
+                            }
                         } else {
-                            p.supports_named_instances()
+                            p.defers_unnamed_instances()
                                 && other_plugin_serves(plugins, plugin_id, wit_interface, false)
                         };
                         if defer_to_other {
@@ -2198,34 +2688,87 @@ impl UnresolvedWorkload {
 
             // If this plugin matches any components, bind them
             if !plugin_component_bindings.is_empty() {
-                // Collect all unique interfaces across all component bindings for on_workload_bind
-                let plugin_matched_interfaces: HashSet<WitInterface> = plugin_component_bindings
+                // The operator's declaration for this plugin, applied before
+                // any of it reaches the plugin, so `on_workload_bind` and
+                // `on_workload_item_bind` see the same resolved map and no
+                // plugin has to know the policy exists. The pre-resolution
+                // interfaces stay in `plugin_component_bindings`: they are what
+                // `unmatched_interfaces` is keyed by.
+                //
+                // Resolution is keyed by binding name across the *whole*
+                // workload, not per component: one label is one binding — one
+                // connection, one grant — however many entries or components a
+                // manifest splits it across.
+                let declared = plugin_bindings.for_plugin(plugin_id);
+                let schema = p.binding_schema();
+                let narrows =
+                    |key: &str, host: &str, workload: &str| p.narrows(key, host, workload);
+                let requested_interfaces: HashSet<WitInterface> = plugin_component_bindings
                     .iter()
                     .flat_map(|(_, interfaces)| interfaces.clone())
                     .collect();
+                let resolved_by_name =
+                    match declared.resolve_by_name(&requested_interfaces, &schema, &narrows) {
+                        Ok(resolved) => resolved,
+                        Err(e) => {
+                            unbind_all(self.id(), &bound_plugins_with_interfaces, "binding policy")
+                                .await;
+                            bail!(e.context(format!(
+                                "workload {} cannot bind plugin '{plugin_id}'",
+                                self.id()
+                            )))
+                        }
+                    };
 
-                // Validate: if multiple named entries of the same namespace:package
-                // are matched to this plugin, the plugin must support named instances
-                let mut ns_pkg_named: HashMap<(&str, &str), Vec<&str>> = HashMap::new();
+                let resolved_component_bindings: Vec<HashSet<WitInterface>> =
+                    plugin_component_bindings
+                        .iter()
+                        .map(|(_, interfaces)| {
+                            declared.apply_resolved(interfaces, &resolved_by_name)
+                        })
+                        .collect();
+
+                // Collect all unique interfaces across all component bindings for on_workload_bind
+                let plugin_matched_interfaces: HashSet<WitInterface> = resolved_component_bindings
+                    .iter()
+                    .flat_map(Clone::clone)
+                    .collect();
+
+                // A name selects one backend of a package, so two bindings for
+                // one package need two backends to route between. A plugin
+                // serving a single instance has one, and collapsing them into
+                // it delivers one binding's configuration under both names.
+                // The operator declaring names under the plugin's
+                // `host.plugins` entry says it routes them, whatever it
+                // reports on its own.
+                let routes_names =
+                    p.supports_named_instances() || declared.binding_names().next().is_some();
+                let mut ns_pkg_bindings: BTreeMap<(&str, &str), BTreeSet<&str>> = BTreeMap::new();
                 for iface in &plugin_matched_interfaces {
-                    if let Some(name) = &iface.name {
-                        ns_pkg_named
-                            .entry((iface.namespace.as_str(), iface.package.as_str()))
-                            .or_default()
-                            .push(name.as_str());
-                    }
+                    let binding =
+                        crate::plugin::binding_of(plugin_id, iface.name.as_deref()).unwrap_or("");
+                    ns_pkg_bindings
+                        .entry((iface.namespace.as_str(), iface.package.as_str()))
+                        .or_default()
+                        .insert(binding);
                 }
-                for ((ns, pkg), mut names) in ns_pkg_named {
-                    if names.len() > 1 && !p.supports_named_instances() {
-                        names.sort_unstable();
+                for ((ns, pkg), bindings) in ns_pkg_bindings {
+                    if bindings.len() > 1 && !routes_names {
+                        let named: Vec<&str> =
+                            bindings.iter().copied().filter(|b| !b.is_empty()).collect();
+                        // Plugins bind in id order, so earlier ones are already
+                        // holding state — a connection, a subscription — for a
+                        // workload that is not going to deploy.
+                        unbind_all(self.id(), &bound_plugins_with_interfaces, "binding policy")
+                            .await;
                         bail!(
-                            "plugin '{}' does not support named instances, but workload \
-                             requires {} named entries for {ns}:{pkg} (names: {}). \
-                             The plugin must implement supports_named_instances() to \
-                             handle multiplexed interfaces.",
-                            plugin_id,
-                            names.len(),
-                            names.join(", ")
+                            "plugin '{plugin_id}' does not support named instances, but the \
+                             workload declares {} bindings for {ns}:{pkg} (named: {}). Each \
+                             name routes to its own backend and this plugin serves one, so \
+                             give those entries a single binding, or register a plugin that \
+                             implements supports_named_instances().",
+                            bindings.len(),
+                            named.join(", "),
                         );
                     }
                 }
@@ -2253,33 +2796,34 @@ impl UnresolvedWorkload {
                         err = ?e,
                         "failed to bind plugin to workload"
                     );
-                    // Clean up all previously bound plugins in reverse order
-                    for (bound_plugin, bound_interfaces, _) in
-                        bound_plugins_with_interfaces.iter().rev()
+                    // Clean up plugin that just failed first.
+                    if let Err(cleanup_err) = p
+                        .on_workload_unbind(
+                            self.id(),
+                            WitInterfaces::new(&plugin_matched_interfaces),
+                        )
+                        .await
                     {
-                        debug!(
-                            plugin_id = bound_plugin.id(),
-                            "calling on_workload_unbind for cleanup after bind failure"
+                        warn!(
+                            plugin_id = plugin_id,
+                            error = ?cleanup_err,
+                            "failed to cleanup partially bound plugin after bind failure"
                         );
-                        if let Err(cleanup_err) = bound_plugin
-                            .on_workload_unbind(self.id(), WitInterfaces::new(bound_interfaces))
-                            .await
-                        {
-                            warn!(
-                                plugin_id = bound_plugin.id(),
-                                error = ?cleanup_err,
-                                "failed to cleanup plugin after bind failure"
-                            );
-                        }
                     }
+                    unbind_all(self.id(), &bound_plugins_with_interfaces, "bind failure").await;
                     bail!(e)
                 }
 
                 // Collect component IDs for this plugin
                 let mut plugin_component_ids = Vec::new();
 
-                // Now bind each component
-                for (id, matching_interfaces) in plugin_component_bindings {
+                // Now bind each component, with the resolved config the
+                // policy produced and the original interfaces to strike off
+                // `unmatched_interfaces`.
+                for ((id, requested_interfaces), matching_interfaces) in plugin_component_bindings
+                    .into_iter()
+                    .zip(resolved_component_bindings)
+                {
                     let mut workload_item = match &id {
                         IdFlavor::Component(component_id) => WorkloadItem::Component(
                             self.components
@@ -2319,25 +2863,27 @@ impl UnresolvedWorkload {
                             err = ?e,
                             "failed to bind workload item to plugin"
                         );
-                        // Clean up all previously bound plugins in reverse order
-                        for (bound_plugin, bound_interfaces, _) in
-                            bound_plugins_with_interfaces.iter().rev()
+                        // This plugin's own on_workload_bind succeeded, so it can hold a state until unbind.
+                        // Go ahead and unbind immediately before the completed plugins.
+                        if let Err(cleanup_err) = p
+                            .on_workload_unbind(
+                                self.id(),
+                                WitInterfaces::new(&plugin_matched_interfaces),
+                            )
+                            .await
                         {
-                            debug!(
-                                plugin_id = bound_plugin.id(),
-                                "calling on_workload_unbind for cleanup after component bind failure"
+                            warn!(
+                                plugin_id = plugin_id,
+                                error = ?cleanup_err,
+                                "failed to cleanup partially bound plugin after item bind failure"
                             );
-                            if let Err(cleanup_err) = bound_plugin
-                                .on_workload_unbind(self.id(), WitInterfaces::new(bound_interfaces))
-                                .await
-                            {
-                                warn!(
-                                    plugin_id = bound_plugin.id(),
-                                    error = ?cleanup_err,
-                                    "failed to cleanup plugin after component bind failure"
-                                );
-                            }
                         }
+                        unbind_all(
+                            self.id(),
+                            &bound_plugins_with_interfaces,
+                            "component bind failure",
+                        )
+                        .await;
                         bail!(e)
                     } else {
                         trace!(
@@ -2350,7 +2896,7 @@ impl UnresolvedWorkload {
 
                         // Remove matched interfaces from unmatched set
                         if let Some(unmatched) = unmatched_interfaces.get_mut(&id) {
-                            for interface in matching_interfaces.iter() {
+                            for interface in requested_interfaces.iter() {
                                 unmatched.remove(interface);
                             }
                         }
@@ -2375,27 +2921,12 @@ impl UnresolvedWorkload {
                     interfaces = ?unmatched,
                     "no plugins found for requested interfaces"
                 );
-                // The same rollback the bind-failure paths perform: without it
-                // every successfully bound plugin keeps tracking a workload
-                // that never deploys.
-                for (bound_plugin, bound_interfaces, _) in
-                    bound_plugins_with_interfaces.iter().rev()
-                {
-                    debug!(
-                        plugin_id = bound_plugin.id(),
-                        "calling on_workload_unbind for cleanup after unmatched interfaces"
-                    );
-                    if let Err(cleanup_err) = bound_plugin
-                        .on_workload_unbind(self.id(), WitInterfaces::new(bound_interfaces))
-                        .await
-                    {
-                        warn!(
-                            plugin_id = bound_plugin.id(),
-                            error = ?cleanup_err,
-                            "failed to cleanup plugin after unmatched interfaces"
-                        );
-                    }
-                }
+                unbind_all(
+                    self.id(),
+                    &bound_plugins_with_interfaces,
+                    "unmatched interfaces",
+                )
+                .await;
                 bail!(
                     "workload component {component_id} requested interfaces that are not available on this host: {unmatched:?}",
                 )
@@ -2432,12 +2963,14 @@ impl UnresolvedWorkload {
     pub async fn resolve(
         mut self,
         plugins: Option<&HashMap<&'static str, Arc<dyn HostPlugin + 'static>>>,
+        plugin_bindings: &crate::plugin::PluginBindings,
         http_handler: Arc<dyn crate::host::http::HostHandler>,
+        meters: &crate::observability::Meters,
     ) -> anyhow::Result<ResolvedWorkload> {
         // Bind to plugins
         let bound_plugins = if let Some(plugins) = plugins {
             trace!("binding plugins to workload");
-            self.bind_plugins(plugins).await?
+            self.bind_plugins(plugins, plugin_bindings).await?
         } else {
             Vec::new()
         };
@@ -2464,8 +2997,11 @@ impl UnresolvedWorkload {
             namespace: self.namespace.clone(),
             components: Arc::new(RwLock::new(self.components)),
             service: self.service,
+            service_calls: Arc::default(),
+            released: Arc::default(),
             host_interfaces: self.host_interfaces,
-            http_handler: http_handler.clone(),
+            http_handler: Arc::downgrade(&http_handler),
+            invocation: meters.invocation.clone(),
             #[cfg(feature = "wasi-tls")]
             tls_provider: self.tls_provider,
         };
@@ -2490,9 +3026,21 @@ impl UnresolvedWorkload {
             .keys()
             .cloned()
             .collect();
-        resolved_workload
+        if let Err(e) = resolved_workload
             .resolve_component_volume_mounts(&all_component_ids)
-            .await?;
+            .await
+        {
+            // Same rollback as the linking failure above: plugins are already
+            // bound at this point, so a bad hostPath would otherwise leave
+            // their state — a live NATS connection among it — registered
+            // against a workload that never deploys.
+            warn!(
+                error = ?e,
+                "failed to resolve component volume mounts, unbinding all plugins"
+            );
+            let _ = resolved_workload.unbind_all_plugins().await;
+            bail!(e);
+        }
 
         // Notify plugins of the resolved workload
         for (plugin, component_ids) in bound_plugins.iter() {
@@ -2643,14 +3191,28 @@ fn served_within_workload(
     if entry.interfaces.is_empty() {
         return false;
     }
-    entry.interfaces.iter().all(|interface| {
-        let imported = item_world
+    // An item exporting any of the entry's interfaces keeps the entry, so the
+    // host can reach that export.
+    if entry.interfaces.iter().any(|interface| {
+        item_world
+            .exports
+            .iter()
+            .any(|ex| entry.same_package(ex) && ex.interfaces.contains(interface))
+    }) {
+        return false;
+    }
+    // Of the names left, only the ones this item imports are its to answer: the
+    // entry covers what the whole workload uses (see [`WitWorld::uses`]).
+    let imported = entry.interfaces.iter().filter(|interface| {
+        item_world
             .imports
             .iter()
-            .any(|im| entry.same_package(im) && im.interfaces.contains(interface));
-        if !imported {
-            return false;
-        }
+            .any(|im| entry.same_package(im) && im.interfaces.contains(*interface))
+    });
+
+    let mut imports_any = false;
+    for interface in imported {
+        imports_any = true;
         let exporters = component_worlds
             .iter()
             .filter(|(id, world)| {
@@ -2661,14 +3223,43 @@ fn served_within_workload(
                         .any(|ex| entry.same_package(ex) && ex.interfaces.contains(interface))
             })
             .count();
-        exporters == 1
-    })
+        if exporters != 1 {
+            return false;
+        }
+    }
+    imports_any
 }
 
-/// Returns whether some *other* registered plugin (not `self_id`) with
-/// `supports_named_instances() == want_named` can serve `iface`.
-/// Used to determine whether a plugin can defer an `(implements ..)`
-///  interface to a named-capable one, and vice versa).
+/// Unbind every plugin already bound for `workload_id`, newest first.
+///
+/// The rollback every bind failure performs: without it a plugin that bound
+/// successfully keeps tracking a workload that never deploys. Cleanup errors
+/// are logged rather than returned — the caller is already failing, and the
+/// error it has is the one worth reporting.
+async fn unbind_all(workload_id: &str, bound: &[BoundPluginWithInterfaces], reason: &str) {
+    for (plugin, interfaces, _) in bound.iter().rev() {
+        debug!(
+            plugin_id = plugin.id(),
+            reason, "calling on_workload_unbind for cleanup"
+        );
+        if let Err(cleanup_err) = plugin
+            .on_workload_unbind(workload_id, WitInterfaces::new(interfaces))
+            .await
+        {
+            warn!(
+                plugin_id = plugin.id(),
+                reason,
+                error = ?cleanup_err,
+                "failed to cleanup plugin after bind failure"
+            );
+        }
+    }
+}
+
+/// Returns whether some *other* registered plugin (not `self_id`) can take
+/// `iface` off this one's hands: with `want_named`, one that supports named
+/// instances; without, one that serves plain imports itself rather than
+/// deferring them ([`HostPlugin::defers_unnamed_instances`]).
 ///
 /// A plugin that would refuse `iface` via [`HostPlugin::claims`] is not a
 /// deferral target: deferring to it would leave the interface bound by nobody.
@@ -2680,9 +3271,33 @@ fn other_plugin_serves(
 ) -> bool {
     plugins.iter().any(|(id, q)| {
         *id != self_id
-            && q.supports_named_instances() == want_named
+            && (if want_named {
+                q.supports_named_instances()
+            } else {
+                !q.defers_unnamed_instances()
+            })
             && q.world().includes_bidirectional(iface)
             && q.claims(iface)
+    })
+}
+
+/// The plugin whose `host.plugins` entry declares `label` and that serves
+/// `iface`, if any — lowest id first, so the answer is stable. An operator's
+/// declaration is the routing key: it beats id order and whatever the plugins
+/// report for named-instance support.
+fn declaring_plugin(
+    plugins: &HashMap<&'static str, Arc<dyn HostPlugin + 'static>>,
+    plugin_bindings: &crate::plugin::PluginBindings,
+    label: &str,
+    iface: &WitInterface,
+) -> Option<&'static str> {
+    plugin_bindings.plugin_ids().find_map(|id| {
+        let (id, q) = plugins.get_key_value(id)?;
+        let declares = plugin_bindings
+            .for_plugin(id)
+            .binding_names()
+            .any(|name| name == label);
+        (declares && q.world().includes_bidirectional(iface) && q.claims(iface)).then_some(*id)
     })
 }
 
@@ -2821,9 +3436,17 @@ mod tests {
         on_workload_item_bind_count: Arc<AtomicUsize>,
         on_workload_resolved_count: Arc<AtomicUsize>,
         named_instance_support: bool,
+        /// Serves labeled and unlabeled imports off one backend, so it never
+        /// defers a plain import to a single-backend plugin.
+        serves_unnamed_too: bool,
         /// Minimum version this plugin will claim, mirroring a plugin whose
         /// `world()` cannot express the constraint. `None` claims everything.
         claims_from: Option<semver::Version>,
+        /// Keys this plugin declares host-owned in code.
+        host_owned: Vec<&'static str>,
+        /// Every interface handed to `on_workload_bind` /
+        /// `on_workload_item_bind`, with the config the plugin actually saw.
+        bound_interfaces: Arc<Mutex<Vec<WitInterface>>>,
     }
 
     impl MockPlugin {
@@ -2840,12 +3463,42 @@ mod tests {
                 on_workload_item_bind_count: Arc::new(AtomicUsize::new(0)),
                 on_workload_resolved_count: Arc::new(AtomicUsize::new(0)),
                 named_instance_support: false,
+                serves_unnamed_too: false,
                 claims_from: None,
+                host_owned: Vec::new(),
+                bound_interfaces: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        /// Declare `keys` host-owned in code, the way a real plugin's
+        /// `binding_schema()` does.
+        fn owning(mut self, keys: &[&'static str]) -> Self {
+            self.host_owned = keys.to_vec();
+            self
+        }
+
+        /// The config this plugin saw for `binding`, from whichever callback
+        /// ran first.
+        fn seen_config(&self, binding: Option<&str>) -> HashMap<String, String> {
+            self.bound_interfaces
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|i| i.name.as_deref() == binding)
+                .unwrap_or_else(|| panic!("plugin never saw a binding named {binding:?}"))
+                .config
+                .clone()
         }
 
         fn with_named_instance_support(mut self) -> Self {
             self.named_instance_support = true;
+            self
+        }
+
+        /// Serves labeled and unlabeled imports off one backend, the way a host
+        /// component plugin does, so it never defers a plain import.
+        fn serving_unnamed_too(mut self) -> Self {
+            self.serves_unnamed_too = true;
             self
         }
 
@@ -2886,11 +3539,19 @@ mod tests {
             self.named_instance_support
         }
 
+        fn defers_unnamed_instances(&self) -> bool {
+            self.named_instance_support && !self.serves_unnamed_too
+        }
+
         fn claims(&self, interface: &WitInterface) -> bool {
             match &self.claims_from {
                 Some(min) => interface.version.as_ref().is_some_and(|v| v >= min),
                 None => true,
             }
+        }
+
+        fn binding_schema(&self) -> crate::plugin::BindingSchema {
+            crate::plugin::BindingSchema::with_host_owned_keys(&self.host_owned)
         }
 
         async fn on_workload_bind(
@@ -2899,6 +3560,10 @@ mod tests {
             interfaces: WitInterfaces<'_>,
         ) -> anyhow::Result<()> {
             self.on_workload_bind_count.fetch_add(1, Ordering::SeqCst);
+            self.bound_interfaces
+                .lock()
+                .unwrap()
+                .extend(interfaces.iter().cloned());
             self.call_records.lock().unwrap().push(CallRecord {
                 plugin_id: self.id.to_string(),
                 method: "on_workload_bind".to_string(),
@@ -2915,10 +3580,28 @@ mod tests {
         ) -> anyhow::Result<()> {
             self.on_workload_item_bind_count
                 .fetch_add(1, Ordering::SeqCst);
+            self.bound_interfaces
+                .lock()
+                .unwrap()
+                .extend(interfaces.iter().cloned());
             self.call_records.lock().unwrap().push(CallRecord {
                 plugin_id: self.id.to_string(),
                 method: "on_workload_item_bind".to_string(),
                 component_id: Some(item.id().to_string()),
+                interfaces: interfaces.iter().map(|i| i.to_string()).collect(),
+            });
+            Ok(())
+        }
+
+        async fn on_workload_unbind(
+            &self,
+            workload_id: &str,
+            interfaces: WitInterfaces<'_>,
+        ) -> anyhow::Result<()> {
+            self.call_records.lock().unwrap().push(CallRecord {
+                plugin_id: self.id.to_string(),
+                method: "on_workload_unbind".to_string(),
+                component_id: Some(workload_id.to_string()),
                 interfaces: interfaces.iter().map(|i| i.to_string()).collect(),
             });
             Ok(())
@@ -3070,7 +3753,10 @@ mod tests {
         let exporter_id = exporter.id().to_string();
 
         let mut workload = marker_workload(vec![importer, exporter]);
-        let bound = workload.bind_plugins(&marker_plugin()).await.unwrap();
+        let bound = workload
+            .bind_plugins(&marker_plugin(), &crate::plugin::PluginBindings::new())
+            .await
+            .unwrap();
         let bound_ids = bound_component_ids(&bound);
 
         assert!(
@@ -3092,7 +3778,10 @@ mod tests {
         let importer_id = importer.id().to_string();
 
         let mut workload = marker_workload(vec![importer]);
-        let bound = workload.bind_plugins(&marker_plugin()).await.unwrap();
+        let bound = workload
+            .bind_plugins(&marker_plugin(), &crate::plugin::PluginBindings::new())
+            .await
+            .unwrap();
 
         assert!(
             bound_component_ids(&bound).contains(&importer_id),
@@ -3113,11 +3802,412 @@ mod tests {
             marker_exporter("exporter-a"),
             marker_exporter("exporter-b"),
         ]);
-        let bound = workload.bind_plugins(&marker_plugin()).await.unwrap();
+        let bound = workload
+            .bind_plugins(&marker_plugin(), &crate::plugin::PluginBindings::new())
+            .await
+            .unwrap();
 
         assert!(
             bound_component_ids(&bound).contains(&importer_id),
             "an ambiguous sibling export is not a provider, so the plugin keeps the import"
+        );
+    }
+
+    /// A workload that both publishes and handles names both interfaces on its
+    /// one unnamed `wasmcloud:messaging` entry, which is the only shape a
+    /// manifest can give a package. Each component uses half of it and both
+    /// bind the messaging plugin, so the publisher gets `consumer` in its
+    /// linker and the handler's export is subscribed.
+    ///
+    /// Uses the real plugin, whose world is the split this turns on: `consumer`
+    /// and `types` served, `handler` called back on the workload.
+    #[tokio::test]
+    async fn a_publisher_and_a_handler_share_one_messaging_entry() {
+        let publisher = component_from_wat(
+            "publisher",
+            r#"(component (import "wasmcloud:messaging/consumer@0.2.0" (instance)))"#,
+        );
+        let handler = component_from_wat(
+            "handler",
+            r#"(component
+                 (instance $handler)
+                 (export "wasmcloud:messaging/handler@0.2.0" (instance $handler)))"#,
+        );
+        let publisher_id = publisher.id().to_string();
+        let handler_id = handler.id().to_string();
+
+        let plugin =
+            Arc::new(crate::plugin::wasmcloud_messaging::in_memory::InMemoryMessaging::new());
+        let plugins = HashMap::from([(plugin.id(), plugin as Arc<dyn HostPlugin>)]);
+
+        let mut workload = UnresolvedWorkload::new(
+            "messaging",
+            "messaging",
+            "test-namespace",
+            None,
+            vec![publisher, handler],
+            vec![WitInterface::from(
+                "wasmcloud:messaging/consumer,handler,types@0.2.0",
+            )],
+        );
+        let bound = workload
+            .bind_plugins(&plugins, &crate::plugin::PluginBindings::new())
+            .await
+            .expect("both halves of the entry are served");
+        let bound_ids = bound_component_ids(&bound);
+
+        assert!(
+            bound_ids.contains(&publisher_id),
+            "the publisher needs `consumer` in its linker"
+        );
+        assert!(
+            bound_ids.contains(&handler_id),
+            "nothing subscribes the handler's export unless the plugin binds it"
+        );
+    }
+
+    /// A component importing a subset of an entry — the ordinary shape of a
+    /// multi-component workload, since one entry covers them all — binds the
+    /// plugin serving that entry.
+    #[tokio::test]
+    async fn a_component_using_part_of_an_entry_still_binds() {
+        const PROBE: &str = "test:probe/alpha,beta@0.1.0";
+
+        let both = component_from_wat(
+            "both",
+            r#"(component
+                 (import "test:probe/alpha@0.1.0" (instance))
+                 (import "test:probe/beta@0.1.0" (instance)))"#,
+        );
+        let alpha_only = component_from_wat(
+            "alpha-only",
+            r#"(component (import "test:probe/alpha@0.1.0" (instance)))"#,
+        );
+        let both_id = both.id().to_string();
+        let alpha_only_id = alpha_only.id().to_string();
+
+        let plugin = Arc::new(MockPlugin::new(
+            "probe-plugin",
+            vec![WitInterface::from(PROBE)],
+            vec![],
+        ));
+        let plugins = HashMap::from([(plugin.id(), plugin as Arc<dyn HostPlugin>)]);
+
+        let mut workload = UnresolvedWorkload::new(
+            "subset",
+            "subset",
+            "test-namespace",
+            None,
+            vec![both, alpha_only],
+            vec![WitInterface::from(PROBE)],
+        );
+        let bound = workload
+            .bind_plugins(&plugins, &crate::plugin::PluginBindings::new())
+            .await
+            .unwrap();
+        let bound_ids = bound_component_ids(&bound);
+
+        assert!(bound_ids.contains(&both_id));
+        assert!(
+            bound_ids.contains(&alpha_only_id),
+            "a component importing one interface of the entry still needs the plugin serving it"
+        );
+    }
+
+    /// A workload still serves itself first when the entry names more than the
+    /// importer uses: the interfaces an item imports are the ones a sibling can
+    /// answer for it, so the link survives and the plugin does not install a
+    /// shim over it. The sibling that *exports* the interface still binds,
+    /// because an export is how the host reaches into a workload.
+    #[tokio::test]
+    async fn a_sibling_export_still_wins_for_part_of_an_entry() {
+        const PROBE: &str = "test:probe/alpha,beta@0.1.0";
+
+        let importer = component_from_wat(
+            "importer",
+            r#"(component (import "test:probe/alpha@0.1.0" (instance)))"#,
+        );
+        let exporter = component_from_wat(
+            "exporter",
+            r#"(component
+                 (instance $alpha)
+                 (export "test:probe/alpha@0.1.0" (instance $alpha)))"#,
+        );
+        let importer_id = importer.id().to_string();
+        let exporter_id = exporter.id().to_string();
+
+        let plugin = Arc::new(MockPlugin::new(
+            "probe-plugin",
+            vec![WitInterface::from(PROBE)],
+            vec![],
+        ));
+        let plugins = HashMap::from([(plugin.id(), plugin as Arc<dyn HostPlugin>)]);
+
+        let mut workload = UnresolvedWorkload::new(
+            "subset",
+            "subset",
+            "test-namespace",
+            None,
+            vec![importer, exporter],
+            vec![WitInterface::from(PROBE)],
+        );
+        let bound = workload
+            .bind_plugins(&plugins, &crate::plugin::PluginBindings::new())
+            .await
+            .unwrap();
+        let bound_ids = bound_component_ids(&bound);
+
+        assert!(
+            !bound_ids.contains(&importer_id),
+            "the importer links to its sibling, so the plugin must not take its import"
+        );
+        assert!(bound_ids.contains(&exporter_id));
+    }
+
+    /// An item that exports one of the entry's interfaces binds the plugin even
+    /// when a sibling answers its imports: an export is how the host reaches
+    /// into a workload, which is a separate question from where imports point.
+    #[tokio::test]
+    async fn an_exporter_binds_even_when_a_sibling_answers_its_imports() {
+        const PROBE: &str = "test:probe/alpha,beta@0.1.0";
+
+        let both_ways = component_from_wat(
+            "both-ways",
+            r#"(component
+                 (import "test:probe/alpha@0.1.0" (instance))
+                 (instance $beta)
+                 (export "test:probe/beta@0.1.0" (instance $beta)))"#,
+        );
+        let exporter = component_from_wat(
+            "exporter",
+            r#"(component
+                 (instance $alpha)
+                 (export "test:probe/alpha@0.1.0" (instance $alpha)))"#,
+        );
+        let both_ways_id = both_ways.id().to_string();
+
+        let plugin = Arc::new(MockPlugin::new(
+            "probe-plugin",
+            vec![WitInterface::from(PROBE)],
+            vec![],
+        ));
+        let plugins = HashMap::from([(plugin.id(), plugin as Arc<dyn HostPlugin>)]);
+
+        let mut workload = UnresolvedWorkload::new(
+            "subset",
+            "subset",
+            "test-namespace",
+            None,
+            vec![both_ways, exporter],
+            vec![WitInterface::from(PROBE)],
+        );
+        let bound = workload
+            .bind_plugins(&plugins, &crate::plugin::PluginBindings::new())
+            .await
+            .unwrap();
+
+        assert!(
+            bound_component_ids(&bound).contains(&both_ways_id),
+            "nothing else can reach the export this component serves"
+        );
+    }
+
+    /// The provider side keeps asking for the whole entry: a plugin serving
+    /// part of one must not claim it, or the rest is left bound by nobody —
+    /// here the interface goes unmatched and the workload is refused, rather
+    /// than deploying with an import nothing serves.
+    #[tokio::test]
+    async fn a_plugin_serving_part_of_an_entry_does_not_claim_it() {
+        let importer = component_from_wat(
+            "importer",
+            r#"(component
+                 (import "test:probe/alpha@0.1.0" (instance))
+                 (import "test:probe/beta@0.1.0" (instance)))"#,
+        );
+
+        let plugin = Arc::new(MockPlugin::new(
+            "alpha-only-plugin",
+            vec![WitInterface::from("test:probe/alpha@0.1.0")],
+            vec![],
+        ));
+        let plugins = HashMap::from([(plugin.id(), plugin as Arc<dyn HostPlugin>)]);
+
+        let mut workload = UnresolvedWorkload::new(
+            "subset",
+            "subset",
+            "test-namespace",
+            None,
+            vec![importer],
+            vec![WitInterface::from("test:probe/alpha,beta@0.1.0")],
+        );
+        let err = match workload
+            .bind_plugins(&plugins, &crate::plugin::PluginBindings::new())
+            .await
+        {
+            Ok(_) => panic!("a partially served entry has no provider"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("not available on this host"),
+            "expected an unmatched-interface refusal, got: {err}"
+        );
+    }
+
+    /// Which half of the bind a [`RollbackPlugin`] refuses.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FailAt {
+        WorkloadBind,
+        ItemBind,
+    }
+
+    /// A plugin that counts its own `on_workload_unbind` and can refuse either half of the bind. Whatever
+    /// a real plugin opened on the way in is released through that callback, so the count is what says whether a failure rolled itself back.
+    struct RollbackPlugin {
+        fail_at: Option<FailAt>,
+        unbinds: Arc<AtomicUsize>,
+    }
+
+    impl RollbackPlugin {
+        fn new(fail_at: Option<FailAt>) -> Self {
+            Self {
+                fail_at,
+                unbinds: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn unbind_count(&self) -> usize {
+            self.unbinds.load(Ordering::SeqCst)
+        }
+
+        fn registered(self: &Arc<Self>) -> HashMap<&'static str, Arc<dyn HostPlugin>> {
+            HashMap::from([(self.id(), self.clone() as Arc<dyn HostPlugin>)])
+        }
+    }
+
+    #[async_trait]
+    impl HostPlugin for RollbackPlugin {
+        fn id(&self) -> &'static str {
+            "rollback-plugin"
+        }
+
+        fn world(&self) -> WitWorld {
+            WitWorld {
+                imports: HashSet::new(),
+                exports: HashSet::from([WitInterface::from(MARKER)]),
+            }
+        }
+
+        async fn on_workload_bind(
+            &self,
+            _workload: &UnresolvedWorkload,
+            _interfaces: WitInterfaces<'_>,
+        ) -> anyhow::Result<()> {
+            match self.fail_at {
+                Some(FailAt::WorkloadBind) => bail!("refusing the workload bind"),
+                _ => Ok(()),
+            }
+        }
+
+        async fn on_workload_item_bind<'a>(
+            &self,
+            _item: &mut WorkloadItem<'a>,
+            _interfaces: WitInterfaces<'_>,
+        ) -> anyhow::Result<()> {
+            match self.fail_at {
+                Some(FailAt::ItemBind) => bail!("refusing the item bind"),
+                _ => Ok(()),
+            }
+        }
+
+        async fn on_workload_unbind(
+            &self,
+            _workload_id: &str,
+            _interfaces: WitInterfaces<'_>,
+        ) -> anyhow::Result<()> {
+            self.unbinds.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A bind can get partway through before it errors, and the plugin that
+    /// failed is in no rollback list — it is added only once every one of its
+    /// items is bound. So the failure path unbinds it itself, or a connection
+    /// opened on the way in outlives the deploy that never happened.
+    #[tokio::test]
+    async fn a_failed_workload_bind_rolls_itself_back() {
+        let plugin = Arc::new(RollbackPlugin::new(Some(FailAt::WorkloadBind)));
+        let mut workload = marker_workload(vec![marker_importer("importer")]);
+
+        assert!(
+            workload
+                .bind_plugins(&plugin.registered(), &crate::plugin::PluginBindings::new())
+                .await
+                .is_err(),
+            "the plugin refused its bind"
+        );
+
+        assert_eq!(
+            plugin.unbind_count(),
+            1,
+            "the plugin that failed its bind must be unbound exactly once"
+        );
+    }
+
+    /// The item bind is worse still: `on_workload_bind` already succeeded, so
+    /// the plugin is certainly holding state by the time an item is refused.
+    #[tokio::test]
+    async fn a_failed_item_bind_rolls_itself_back() {
+        let plugin = Arc::new(RollbackPlugin::new(Some(FailAt::ItemBind)));
+        let mut workload = marker_workload(vec![marker_importer("importer")]);
+
+        assert!(
+            workload
+                .bind_plugins(&plugin.registered(), &crate::plugin::PluginBindings::new())
+                .await
+                .is_err(),
+            "the plugin refused its item bind"
+        );
+
+        assert_eq!(
+            plugin.unbind_count(),
+            1,
+            "the plugin that failed its item bind must be unbound exactly once"
+        );
+    }
+
+    /// Every step of `resolve` after the plugins are bound owes them a
+    /// rollback, volume-mount canonicalization included: a hostPath that does
+    /// not exist is a deploy-time failure like any other, and the plugins it
+    /// leaves behind keep tracking a workload that never runs.
+    #[tokio::test]
+    async fn a_bad_volume_mount_unbinds_the_plugins() {
+        let mut importer = marker_importer("importer");
+        importer.metadata.volume_mounts = vec![(
+            PathBuf::from("/definitely/not/a/directory/on/this/host"),
+            VolumeMount {
+                name: "data".to_string(),
+                mount_path: "/data".to_string(),
+                read_only: true,
+            },
+        )];
+
+        let plugin = Arc::new(RollbackPlugin::new(None));
+        let workload = marker_workload(vec![importer]);
+
+        workload
+            .resolve(
+                Some(&plugin.registered()),
+                &crate::plugin::PluginBindings::new(),
+                Arc::new(crate::host::http::NullServer::default()),
+                &crate::observability::Meters::new(crate::observability::MeterKind::Off),
+            )
+            .await
+            .expect_err("the volume mount cannot be canonicalized");
+
+        assert_eq!(
+            plugin.unbind_count(),
+            1,
+            "a plugin bound before the failing step must be unbound"
         );
     }
 
@@ -3281,6 +4371,139 @@ mod tests {
         }
     }
 
+    /// Build a one-component workload asking for `interfaces`.
+    fn workload_requesting(interfaces: Vec<WitInterface>) -> UnresolvedWorkload {
+        UnresolvedWorkload::new(
+            "test-workload-id".to_string(),
+            "test-workload".to_string(),
+            "test-namespace".to_string(),
+            None,
+            vec![create_test_component("component1")],
+            interfaces,
+        )
+    }
+
+    fn kv_iface(name: Option<&str>, config: &[(&str, &str)]) -> WitInterface {
+        let mut iface = WitInterface::from("wasi:keyvalue/store");
+        iface.name = name.map(str::to_string);
+        iface.config = config
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        iface
+    }
+
+    /// The operator's declaration reaches the plugin as the interface's config,
+    /// on both `on_workload_bind` and `on_workload_item_bind` — a plugin never
+    /// sees the workload's raw map, so it cannot accidentally read around the
+    /// policy.
+    #[tokio::test]
+    async fn test_operator_bindings_reach_the_plugin_as_interface_config() {
+        let plugin = Arc::new(
+            MockPlugin::new("kv", vec![], vec![kv_iface(None, &[])])
+                .with_named_instance_support()
+                .owning(&["url"]),
+        );
+        let mut plugins = HashMap::new();
+        plugins.insert(plugin.id(), plugin.clone() as Arc<dyn HostPlugin>);
+
+        let bindings = crate::plugin::PluginBindings::new().with_plugin(
+            crate::plugin::PluginBindingSet::new("kv")
+                .with_base([("url".to_string(), "redis://host:6379".to_string())].into())
+                .with_binding(
+                    "cache",
+                    [("bucket".to_string(), "cache".to_string())].into(),
+                ),
+        );
+
+        let mut workload =
+            workload_requesting(vec![kv_iface(Some("cache"), &[("timeout-ms", "500")])]);
+        workload.bind_plugins(&plugins, &bindings).await.unwrap();
+
+        let seen = plugin.seen_config(Some("cache"));
+        assert_eq!(seen["url"], "redis://host:6379");
+        assert_eq!(seen["bucket"], "cache");
+        assert_eq!(seen["timeout-ms"], "500");
+        assert_eq!(
+            plugin.get_call_count("on_workload_item_bind"),
+            1,
+            "the item bind must still run against the resolved interface"
+        );
+    }
+
+    /// Under `deny`, a workload writing a host-owned key fails the deploy — and
+    /// every plugin bound before it is unbound, the same as any other bind
+    /// failure.
+    #[tokio::test]
+    async fn test_deny_refuses_a_workload_owned_key_and_rolls_back() {
+        let logger = Arc::new(MockPlugin::new(
+            "aaa-logger",
+            vec![],
+            vec![WitInterface::from("wasi:logging/logging")],
+        ));
+        let kv = Arc::new(
+            MockPlugin::new("kv", vec![], vec![kv_iface(None, &[])])
+                .with_named_instance_support()
+                .owning(&["url"]),
+        );
+        let mut plugins = HashMap::new();
+        plugins.insert(logger.id(), logger.clone() as Arc<dyn HostPlugin>);
+        plugins.insert(kv.id(), kv.clone() as Arc<dyn HostPlugin>);
+
+        let bindings = crate::plugin::PluginBindings::new().with_plugin(
+            crate::plugin::PluginBindingSet::new("kv")
+                .with_binding(
+                    "cache",
+                    [("bucket".to_string(), "cache".to_string())].into(),
+                )
+                .with_workload_config(crate::plugin::WorkloadConfigPolicy::Deny),
+        );
+
+        let mut workload = workload_requesting(vec![
+            WitInterface::from("wasi:logging/logging"),
+            kv_iface(Some("cache"), &[("url", "redis://guest:6379")]),
+        ]);
+        let err = match workload.bind_plugins(&plugins, &bindings).await {
+            Ok(_) => panic!("binding should have been refused"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("`url`"), "got: {err}");
+
+        // `aaa-logger` sorts first, so it bound before `kv` refused.
+        assert_eq!(logger.get_call_count("on_workload_bind"), 1);
+        let unbound = logger
+            .get_call_records()
+            .iter()
+            .filter(|r| r.method == "on_workload_unbind")
+            .count();
+        assert_eq!(unbound, 1, "the already-bound plugin must be rolled back");
+    }
+
+    /// Under `deny`, a name the operator never declared is refused rather than
+    /// silently taking the base config.
+    #[tokio::test]
+    async fn test_deny_refuses_an_undeclared_binding_name() {
+        let plugin = Arc::new(
+            MockPlugin::new("kv", vec![], vec![kv_iface(None, &[])]).with_named_instance_support(),
+        );
+        let mut plugins = HashMap::new();
+        plugins.insert(plugin.id(), plugin.clone() as Arc<dyn HostPlugin>);
+
+        let bindings = crate::plugin::PluginBindings::new().with_plugin(
+            crate::plugin::PluginBindingSet::new("kv")
+                .with_binding("cache", HashMap::new())
+                .with_workload_config(crate::plugin::WorkloadConfigPolicy::Deny),
+        );
+
+        let mut workload = workload_requesting(vec![kv_iface(Some("sessions"), &[])]);
+        let err = match workload.bind_plugins(&plugins, &bindings).await {
+            Ok(_) => panic!("binding should have been refused"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("`sessions`"), "got: {err}");
+        assert_eq!(plugin.get_call_count("on_workload_bind"), 0);
+    }
+
     /// A named binding whose `name` matches a registered plugin id routes
     /// exclusively to that plugin — not to a different plugin that also
     /// serves the same raw interface, and without either plugin needing
@@ -3325,7 +4548,10 @@ mod tests {
             vec![named_iface],
         );
 
-        let bound_plugins = workload.bind_plugins(&plugins).await.unwrap();
+        let bound_plugins = workload
+            .bind_plugins(&plugins, &crate::plugin::PluginBindings::new())
+            .await
+            .unwrap();
 
         assert_eq!(
             custom_plugin.get_call_count("on_workload_bind"),
@@ -3370,7 +4596,10 @@ mod tests {
             vec![named_iface],
         );
 
-        let bound_plugins = workload.bind_plugins(&plugins).await.unwrap();
+        let bound_plugins = workload
+            .bind_plugins(&plugins, &crate::plugin::PluginBindings::new())
+            .await
+            .unwrap();
 
         assert_eq!(
             plugin.get_call_count("on_workload_bind"),
@@ -3422,7 +4651,10 @@ mod tests {
             vec![versionless],
         );
 
-        let bound_plugins = workload.bind_plugins(&plugins).await.unwrap();
+        let bound_plugins = workload
+            .bind_plugins(&plugins, &crate::plugin::PluginBindings::new())
+            .await
+            .unwrap();
 
         assert_eq!(
             newer.get_call_count("on_workload_bind"),
@@ -3472,10 +4704,164 @@ mod tests {
             vec![versioned],
         );
 
-        let bound_plugins = workload.bind_plugins(&plugins).await.unwrap();
+        let bound_plugins = workload
+            .bind_plugins(&plugins, &crate::plugin::PluginBindings::new())
+            .await
+            .unwrap();
 
         assert_eq!(bound_plugins.len(), 1);
         assert_eq!(bound_plugins[0].0.id(), "blobstore-a-newer");
+    }
+
+    /// A plugin that serves labeled *and* plain imports off one backend keeps
+    /// its plain imports when a single-backend native serves the same
+    /// interface. A host component plugin is that shape: the operator deployed
+    /// it to answer `wasi:keyvalue`, and declaring a binding on it says which
+    /// labels it answers to — not that it has stopped answering the unlabeled
+    /// import it was already serving.
+    #[tokio::test]
+    async fn test_a_dual_mode_plugin_keeps_its_plain_imports() {
+        let iface = WitInterface::from("wasi:blobstore/container");
+
+        // Sorts first, so ordering alone cannot be what decides this.
+        let dual = Arc::new(
+            MockPlugin::new("blobstore-a-component", vec![iface.clone()], vec![])
+                .with_named_instance_support()
+                .serving_unnamed_too(),
+        );
+        let native = Arc::new(MockPlugin::new(
+            "blobstore-b-native",
+            vec![iface.clone()],
+            vec![],
+        ));
+
+        let mut plugins = HashMap::new();
+        plugins.insert(dual.id(), dual.clone() as Arc<dyn HostPlugin>);
+        plugins.insert(native.id(), native.clone() as Arc<dyn HostPlugin>);
+
+        let mut workload = UnresolvedWorkload::new(
+            "test-workload-id".to_string(),
+            "test-workload".to_string(),
+            "test-namespace".to_string(),
+            None,
+            vec![create_test_component("component1")],
+            vec![iface],
+        );
+
+        let bound_plugins = workload
+            .bind_plugins(&plugins, &crate::plugin::PluginBindings::new())
+            .await
+            .unwrap();
+
+        assert_eq!(bound_plugins.len(), 1);
+        assert_eq!(
+            bound_plugins[0].0.id(),
+            "blobstore-a-component",
+            "a plugin serving both must not hand its unlabeled import to a native"
+        );
+    }
+
+    /// A multiplexer defers a plain import to any plugin that serves plain
+    /// imports itself — including one that also routes labels. Keying the
+    /// deferral target on named-instance support alone would have the
+    /// multiplexer keep the import the moment the other plugin grew a label.
+    #[tokio::test]
+    async fn test_a_multiplexer_defers_plain_imports_to_a_dual_mode_plugin() {
+        let iface = WitInterface::from("wasi:blobstore/container");
+
+        // Sorts first, so it is offered the import before the dual plugin.
+        let mux = Arc::new(
+            MockPlugin::new("aaa-multiplexed", vec![iface.clone()], vec![])
+                .with_named_instance_support(),
+        );
+        let dual = Arc::new(
+            MockPlugin::new("zzz-component", vec![iface.clone()], vec![])
+                .with_named_instance_support()
+                .serving_unnamed_too(),
+        );
+
+        let mut plugins = HashMap::new();
+        plugins.insert(mux.id(), mux.clone() as Arc<dyn HostPlugin>);
+        plugins.insert(dual.id(), dual.clone() as Arc<dyn HostPlugin>);
+
+        let mut workload = UnresolvedWorkload::new(
+            "test-workload-id".to_string(),
+            "test-workload".to_string(),
+            "test-namespace".to_string(),
+            None,
+            vec![create_test_component("component1")],
+            vec![iface],
+        );
+
+        let bound_plugins = workload
+            .bind_plugins(&plugins, &crate::plugin::PluginBindings::new())
+            .await
+            .unwrap();
+
+        assert_eq!(bound_plugins.len(), 1);
+        assert_eq!(
+            bound_plugins[0].0.id(),
+            "zzz-component",
+            "the multiplexer must hand a plain import to the plugin serving it plainly"
+        );
+    }
+
+    /// An `(implements ..)` label declared under a plugin's `host.plugins`
+    /// entry routes to that plugin: ahead of id order, and whether or not the
+    /// plugin reports named-instance support of its own. The declaration also
+    /// lets it take a named entry beside the unnamed one.
+    #[tokio::test]
+    async fn test_a_declared_label_routes_to_the_declaring_plugin() {
+        let iface = WitInterface::from("wasi:blobstore/container");
+
+        // Sorts first and supports names, so without the declaration it would
+        // claim the label.
+        let mux = Arc::new(
+            MockPlugin::new("aaa-multiplexed", vec![iface.clone()], vec![])
+                .with_named_instance_support(),
+        );
+        let component = Arc::new(MockPlugin::new(
+            "zzz-component",
+            vec![iface.clone()],
+            vec![],
+        ));
+
+        let mut plugins = HashMap::new();
+        plugins.insert(mux.id(), mux.clone() as Arc<dyn HostPlugin>);
+        plugins.insert(component.id(), component.clone() as Arc<dyn HostPlugin>);
+
+        let mut labeled = iface.clone();
+        labeled.name = Some("tenant-a".to_string());
+        let mut workload = UnresolvedWorkload::new(
+            "test-workload-id".to_string(),
+            "test-workload".to_string(),
+            "test-namespace".to_string(),
+            None,
+            vec![create_test_component("component1")],
+            vec![iface, labeled],
+        );
+
+        let declared = crate::plugin::PluginBindings::new().with_plugin(
+            crate::plugin::PluginBindingSet::new("zzz-component")
+                .with_binding("tenant-a", HashMap::new()),
+        );
+        let bound_plugins = workload.bind_plugins(&plugins, &declared).await.unwrap();
+
+        assert_eq!(
+            bound_plugins.len(),
+            1,
+            "both entries must land on the declaring plugin, got {:?}",
+            bound_plugins
+                .iter()
+                .map(|(p, _)| p.id())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(bound_plugins[0].0.id(), "zzz-component");
+        assert_eq!(
+            mux.get_call_count("on_workload_bind"),
+            0,
+            "a label the operator declared elsewhere is not the multiplexer's"
+        );
     }
 
     /// Tests basic plugin binding with one plugin and one component.
@@ -3508,7 +4894,10 @@ mod tests {
             vec![blobstore_interface.clone()],
         );
 
-        let bound_plugins = workload.bind_plugins(&plugins).await.unwrap();
+        let bound_plugins = workload
+            .bind_plugins(&plugins, &crate::plugin::PluginBindings::new())
+            .await
+            .unwrap();
 
         // Verify plugin was called once for workload binding
         assert_eq!(plugin.get_call_count("on_workload_bind"), 1);
@@ -3578,7 +4967,10 @@ mod tests {
 
         // Note: Due to the way world() works on real components, we can't easily mock it
         // This test verifies the structure and call patterns are correct
-        let _bound_plugins = workload.bind_plugins(&plugins).await.unwrap();
+        let _bound_plugins = workload
+            .bind_plugins(&plugins, &crate::plugin::PluginBindings::new())
+            .await
+            .unwrap();
 
         // Each plugin that matches should be in the result
         for (plugin, _component_ids) in &_bound_plugins {
@@ -3625,7 +5017,10 @@ mod tests {
             vec![http_interface.clone()],
         );
 
-        let _bound_plugins = workload.bind_plugins(&plugins).await.unwrap();
+        let _bound_plugins = workload
+            .bind_plugins(&plugins, &crate::plugin::PluginBindings::new())
+            .await
+            .unwrap();
 
         // Only one plugin should be bound per interface
         // Due to HashMap iteration order being unstable, we can't predict which one
@@ -3673,7 +5068,10 @@ mod tests {
         // The component imports wasi:blobstore but no plugin provides it, so
         // binding must fail. (The http interface is host-served and never
         // requires a plugin.)
-        let err = match workload.bind_plugins(&plugins).await {
+        let err = match workload
+            .bind_plugins(&plugins, &crate::plugin::PluginBindings::new())
+            .await
+        {
             Ok(_) => panic!("binding should fail for an unprovided interface"),
             Err(e) => e,
         };
@@ -3727,7 +5125,10 @@ mod tests {
             vec![http_interface],
         );
 
-        let bound_plugins = workload.bind_plugins(&HashMap::new()).await.unwrap();
+        let bound_plugins = workload
+            .bind_plugins(&HashMap::new(), &crate::plugin::PluginBindings::new())
+            .await
+            .unwrap();
         assert!(
             bound_plugins.is_empty(),
             "host-served wasi:http/handler must not require a plugin"
@@ -3763,7 +5164,10 @@ mod tests {
             vec![interface1.clone()],
         );
 
-        let _bound_plugins = workload.bind_plugins(&plugins).await.unwrap();
+        let _bound_plugins = workload
+            .bind_plugins(&plugins, &crate::plugin::PluginBindings::new())
+            .await
+            .unwrap();
 
         // Verify callback order
         let records = plugin.get_call_records();
@@ -3982,8 +5386,12 @@ mod tests {
         );
     }
 
+    /// A component exporting the handler half of a `consumer,handler` entry
+    /// binds the messaging plugin, so its handler is subscribed. That entry is
+    /// how a workload which both publishes and handles is written, often with
+    /// the two halves in different components.
     #[tokio::test]
-    async fn test_host_interface_redundancy() {
+    async fn a_component_exporting_half_an_entry_binds_the_plugin() {
         let messaging_handler = WitInterface {
             namespace: "wasmcloud".to_string(),
             package: "messaging".to_string(),
@@ -4059,22 +5467,22 @@ mod tests {
             ],
         );
 
-        let bound_plugins = workload.bind_plugins(&plugins).await.unwrap();
+        let bound_plugins = workload
+            .bind_plugins(&plugins, &crate::plugin::PluginBindings::new())
+            .await
+            .unwrap();
 
-        // Verify plugin was called once for workload binding
+        // The component imports `wasi:logging`, so the logging plugin binds it.
         assert_eq!(logging_plugin.get_call_count("on_workload_bind"), 1);
-
-        // Verify plugin was called once for component binding
         assert_eq!(logging_plugin.get_call_count("on_workload_item_bind"), 1);
 
-        // Verify plugin was called once for workload binding
-        assert_eq!(messaging_plugin.get_call_count("on_workload_bind"), 0);
+        // It exports `wasmcloud:messaging/handler`, one of the two interfaces
+        // the messaging entry names, so the messaging plugin binds it too —
+        // without that bind nothing subscribes and the handler never runs.
+        assert_eq!(messaging_plugin.get_call_count("on_workload_bind"), 1);
+        assert_eq!(messaging_plugin.get_call_count("on_workload_item_bind"), 1);
 
-        // Verify plugin was called once for component binding
-        assert_eq!(messaging_plugin.get_call_count("on_workload_item_bind"), 0);
-
-        // Verify bound_plugins contains our plugin with the component
-        assert_eq!(bound_plugins.len(), 1);
+        assert_eq!(bound_plugins.len(), 2);
     }
 
     #[tokio::test]
@@ -4109,7 +5517,10 @@ mod tests {
             vec![logging_interface.clone()],
         );
 
-        let bound_plugins = workload.bind_plugins(&plugins).await.unwrap();
+        let bound_plugins = workload
+            .bind_plugins(&plugins, &crate::plugin::PluginBindings::new())
+            .await
+            .unwrap();
 
         // Verify plugin was called once for workload binding
         assert_eq!(plugin.get_call_count("on_workload_bind"), 1);
@@ -4158,7 +5569,9 @@ mod tests {
             ],
         );
 
-        let result = workload.bind_plugins(&plugins).await;
+        let result = workload
+            .bind_plugins(&plugins, &crate::plugin::PluginBindings::new())
+            .await;
         match result {
             Ok(_) => panic!("Expected error for unsupported named instances"),
             Err(e) => {
@@ -4169,6 +5582,115 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A named entry beside an unnamed one is two bindings for one package, so
+    /// a plugin serving a single instance has nowhere to route the second.
+    #[tokio::test]
+    async fn test_a_named_entry_beside_an_unnamed_one_is_refused() {
+        let plugin = Arc::new(MockPlugin::new(
+            "keyvalue-plugin",
+            vec![],
+            vec![keyvalue_interface(None)],
+        ));
+        let plugins = HashMap::from([(plugin.id(), plugin.clone() as Arc<dyn HostPlugin>)]);
+
+        let mut workload = UnresolvedWorkload::new(
+            "test-workload-id".to_string(),
+            "test-workload".to_string(),
+            "test-namespace".to_string(),
+            None,
+            vec![create_test_component("component1")],
+            vec![keyvalue_interface(None), keyvalue_interface(Some("cache"))],
+        );
+
+        let err = match workload
+            .bind_plugins(&plugins, &crate::plugin::PluginBindings::new())
+            .await
+        {
+            Ok(_) => panic!("two bindings cannot share one instance"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("does not support named instances") && err.contains("cache"),
+            "the refusal must name the binding that has nowhere to go, got: {err}"
+        );
+    }
+
+    /// Plugins bind in id order, so a refusal partway through leaves earlier
+    /// ones holding state — a connection, a subscription — for a workload that
+    /// never deploys.
+    #[tokio::test]
+    async fn test_a_refused_binding_rolls_back_the_plugins_already_bound() {
+        let earlier = Arc::new(RollbackPlugin::new(None));
+        let later = Arc::new(MockPlugin::new(
+            "zz-keyvalue-plugin",
+            vec![],
+            vec![keyvalue_interface(None)],
+        ));
+        let mut plugins = earlier.registered();
+        plugins.insert(later.id(), later.clone() as Arc<dyn HostPlugin>);
+
+        let importer = component_from_wat(
+            "importer",
+            &format!(
+                r#"(component
+                     (import "{MARKER}" (instance))
+                     (import "wasi:keyvalue/store@0.2.0-draft" (instance)))"#
+            ),
+        );
+        let mut workload = UnresolvedWorkload::new(
+            "rollback",
+            "rollback",
+            "test-namespace",
+            None,
+            vec![importer],
+            vec![
+                WitInterface::from(MARKER),
+                keyvalue_interface(None),
+                keyvalue_interface(Some("cache")),
+            ],
+        );
+
+        assert!(
+            workload
+                .bind_plugins(&plugins, &crate::plugin::PluginBindings::new())
+                .await
+                .is_err(),
+            "two bindings cannot share one instance"
+        );
+        assert_eq!(
+            earlier.unbind_count(),
+            1,
+            "the plugin bound before the refusal must be unbound"
+        );
+    }
+
+    /// A lone name is one binding: it selects the operator's declaration for
+    /// this plugin and is delivered to it, which a single instance can serve.
+    #[tokio::test]
+    async fn test_a_lone_named_entry_binds_a_single_instance_plugin() {
+        let plugin = Arc::new(MockPlugin::new(
+            "keyvalue-plugin",
+            vec![],
+            vec![keyvalue_interface(None)],
+        ));
+        let plugins = HashMap::from([(plugin.id(), plugin.clone() as Arc<dyn HostPlugin>)]);
+
+        let mut workload = UnresolvedWorkload::new(
+            "test-workload-id".to_string(),
+            "test-workload".to_string(),
+            "test-namespace".to_string(),
+            None,
+            vec![create_test_component("component1")],
+            vec![keyvalue_interface(Some("cache"))],
+        );
+
+        let bound = workload
+            .bind_plugins(&plugins, &crate::plugin::PluginBindings::new())
+            .await
+            .expect("one binding needs no routing");
+        assert_eq!(bound.len(), 1);
     }
 
     /// Same setup but plugin returns `supports_named_instances() == true` -> succeeds
@@ -4194,7 +5716,9 @@ mod tests {
             ],
         );
 
-        let result = workload.bind_plugins(&plugins).await;
+        let result = workload
+            .bind_plugins(&plugins, &crate::plugin::PluginBindings::new())
+            .await;
         if let Err(e) = result {
             panic!("Expected success but got error: {e}");
         }
@@ -4221,7 +5745,9 @@ mod tests {
             vec![keyvalue_interface(Some("cache"))],
         );
 
-        let result = workload.bind_plugins(&plugins).await;
+        let result = workload
+            .bind_plugins(&plugins, &crate::plugin::PluginBindings::new())
+            .await;
         if let Err(e) = result {
             panic!("Single named entry should not require named instance support: {e}");
         }
@@ -4263,7 +5789,7 @@ mod tests {
         );
 
         let bound = workload
-            .bind_plugins(&plugins)
+            .bind_plugins(&plugins, &crate::plugin::PluginBindings::new())
             .await
             .expect("standalone + multiplexed plugins should bind together");
         let bound_ids: std::collections::HashSet<&str> =
@@ -4308,7 +5834,9 @@ mod tests {
             vec![iface],
         );
 
-        let result = workload.bind_plugins(&plugins).await;
+        let result = workload
+            .bind_plugins(&plugins, &crate::plugin::PluginBindings::new())
+            .await;
         if let Err(e) = result {
             panic!("Unnamed interfaces should work as before: {e}");
         }

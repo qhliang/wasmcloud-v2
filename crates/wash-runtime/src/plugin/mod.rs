@@ -56,6 +56,10 @@ pub mod wasmcloud_messaging;
 
 pub mod wasmcloud_secrets;
 
+/// NATS-native capability: core pub/sub, JetStream, and KV.
+#[cfg(feature = "wasmcloud-nats")]
+pub mod wasmcloud_nats;
+
 /// Host capabilities provided by a WebAssembly component running in its own
 /// supervised store (rather than by a Rust plugin running in-store). Needs
 /// `oci` for the loader that fetches a plugin's wasm.
@@ -71,6 +75,119 @@ pub mod component_host;
 pub mod component_plugin_spec;
 #[cfg(feature = "oci")]
 pub use component_plugin_spec::ComponentPluginSpec;
+
+/// Every plugin id this codebase has, independent of which cargo features a
+/// given build enabled.
+///
+/// The roster exists to tell two conditions apart, because only one of them
+/// should refuse to start: an id that is not here at all is a typo, and may be
+/// shadowing a real plugin the operator meant to constrain — an inert
+/// `workloadConfig: deny` is exactly the shape that rule guards against. An id
+/// that *is* here but was not compiled in is a chart/binary skew, and refusing
+/// there buys nothing: if the plugin is absent, no workload can bind it either,
+/// so the declaration denies nothing and protects nothing.
+///
+/// Native ids only. A component plugin's id is whatever the operator wrote on
+/// the entry that loads it, so it cannot be enumerated here — and does not need
+/// to be, since a host that loaded one has it registered and never reaches the
+/// roster.
+///
+/// Keep it in sync when a plugin id is added. A missing entry only downgrades a
+/// warning to a refusal, and only on a host that was not built with the plugin,
+/// so the failure is loud rather than silent.
+pub const KNOWN_PLUGIN_IDS: &[&str] = &[
+    "wasi-blobstore",
+    "wasi-blobstore-multiplexed",
+    "wasi-config",
+    "wasi-keyvalue",
+    "wasi-keyvalue-multiplexed",
+    "wasi-logging",
+    "wasi-otel",
+    "wasi-webgpu",
+    "wasmcloud-blobstore-multiplexed",
+    "wasmcloud-keyvalue-multiplexed",
+    "wasmcloud-messaging",
+    "wasmcloud-messaging-async-multiplexed",
+    "wasmcloud-messaging-memory",
+    "wasmcloud-messaging-multiplexed",
+    "wasmcloud-nats",
+    "wasmcloud-postgres",
+    "wasmcloud-secrets",
+];
+
+#[cfg(test)]
+mod roster_tests {
+    /// Every native plugin's id, from the constant the plugin itself uses. A
+    /// plugin added without its roster entry gets a refusal instead of a
+    /// warning on any build that did not compile it in.
+    #[test]
+    fn the_roster_names_every_native_plugin() {
+        #[allow(unused_mut)]
+        let mut ids: Vec<&str> = vec![
+            super::wasmcloud_messaging::nats::PLUGIN_MESSAGING_ID,
+            super::wasmcloud_messaging::in_memory::PLUGIN_MESSAGING_MEMORY_ID,
+            super::wasmcloud_secrets::WASMCLOUD_SECRETS_ID,
+        ];
+        // Every multiplexer carries the same gate as its module: the plugin's
+        // own feature does not compile one in.
+        #[cfg(feature = "wasm_component_model_implements")]
+        ids.extend([
+            super::wasmcloud_messaging::multiplexed::MULTIPLEXED_MESSAGING_ID,
+            super::wasmcloud_messaging::multiplexed_async::MULTIPLEXED_ASYNC_MESSAGING_ID,
+        ]);
+        #[cfg(feature = "wasi-blobstore")]
+        ids.push(super::wasi_blobstore::nats::PLUGIN_BLOBSTORE_ID);
+        #[cfg(all(
+            feature = "wasi-blobstore",
+            feature = "wasm_component_model_implements"
+        ))]
+        ids.extend([
+            super::wasi_blobstore::multiplexed::MULTIPLEXED_BLOBSTORE_ID,
+            super::wasi_blobstore::multiplexed_async::MULTIPLEXED_ASYNC_BLOBSTORE_ID,
+        ]);
+        #[cfg(feature = "wasi-keyvalue")]
+        ids.push(super::wasi_keyvalue::nats::PLUGIN_KEYVALUE_ID);
+        #[cfg(all(feature = "wasi-keyvalue", feature = "wasm_component_model_implements"))]
+        ids.extend([
+            super::wasi_keyvalue::multiplexed::MULTIPLEXED_KEYVALUE_ID,
+            super::wasi_keyvalue::multiplexed_async::MULTIPLEXED_ASYNC_KEYVALUE_ID,
+        ]);
+        #[cfg(feature = "wasi-config")]
+        ids.push(super::wasi_config::WASI_CONFIG_ID);
+        #[cfg(feature = "wasi-logging")]
+        ids.push(super::wasi_logging::PLUGIN_LOGGING_ID);
+        #[cfg(feature = "wasi-otel")]
+        ids.push(super::wasi_otel::WASI_OTEL_ID);
+        // Same gate as the module: the feature alone does not compile it in.
+        #[cfg(all(
+            feature = "wasi-webgpu",
+            not(target_os = "windows"),
+            not(target_arch = "s390x")
+        ))]
+        ids.push(super::wasi_webgpu::WASI_WEBGPU_ID);
+        #[cfg(all(feature = "wasmcloud-postgres", not(doctest)))]
+        ids.push(super::wasmcloud_postgres::PLUGIN_POSTGRES_ID);
+        #[cfg(feature = "wasmcloud-nats")]
+        ids.push(super::wasmcloud_nats::PLUGIN_NATS_ID);
+
+        let missing: Vec<&str> = ids
+            .into_iter()
+            .filter(|id| !super::KNOWN_PLUGIN_IDS.contains(id))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "missing from KNOWN_PLUGIN_IDS: {missing:?}"
+        );
+    }
+}
+
+/// Operator-declared bindings: the host's side of an
+/// `interface-binding{name, config}`, and the `workloadConfig` policy that
+/// decides whether a workload may write over it.
+pub mod bindings;
+pub use bindings::{
+    BindingSchema, KeyOwnership, PluginBindingSet, PluginBindings, WorkloadConfigPolicy, binding_of,
+};
 
 /// Shared `(implements ..)` multiplexing core
 #[cfg(feature = "wasm_component_model_implements")]
@@ -106,24 +223,91 @@ impl<'a> WitInterfaces<'a> {
         self.inner.iter()
     }
 
-    /// Returns the [`crate::wit::WitInterface`] that matches the given namespace, package, and set of interfaces, if one exists.
+    /// Every entry matching the given namespace, package, and set of
+    /// interfaces, ordered by [`entry_order`].
+    ///
+    /// A workload may declare one package across several entries, and all of
+    /// them were matched to this plugin. What a plugin leaves unread here is
+    /// config a workload declared and no component ever sees, so a plugin
+    /// serving one instance folds the whole set rather than picking from it.
+    pub fn matching(
+        &self,
+        namespace: &str,
+        package: &str,
+        interfaces: &[&str],
+    ) -> Vec<&'a crate::wit::WitInterface> {
+        let mut matched: Vec<&crate::wit::WitInterface> = self
+            .inner
+            .iter()
+            .filter(|interface| entry_matches(interface, namespace, package, interfaces))
+            .collect();
+        matched.sort_by_cached_key(|interface| entry_order(interface));
+        matched
+    }
+
+    /// The first entry matching the given namespace, package, and set of
+    /// interfaces — the unnamed entry, a package's default route, when there is
+    /// one.
+    ///
+    /// For a plugin that reads a single entry; one that must see everything a
+    /// workload declared for its package wants [`Self::matching`].
     pub fn get(
         &self,
         namespace: &str,
         package: &str,
         interfaces: &[&str],
-    ) -> Option<&crate::wit::WitInterface> {
-        self.inner.iter().find(|interface| {
-            interface.namespace == namespace
-                && interface.package == package
-                && interfaces.iter().all(|i| interface.interfaces.contains(*i))
-        })
+    ) -> Option<&'a crate::wit::WitInterface> {
+        self.inner
+            .iter()
+            .filter(|interface| entry_matches(interface, namespace, package, interfaces))
+            .min_by_key(|interface| entry_order(interface))
     }
 
     /// Returns `true` if the given namespace, package, and set of interfaces are contained within this collection of [`crate::wit::WitInterface`]s.
     pub fn contains(&self, namespace: &str, package: &str, interfaces: &[&str]) -> bool {
-        self.get(namespace, package, interfaces).is_some()
+        self.inner
+            .iter()
+            .any(|interface| entry_matches(interface, namespace, package, interfaces))
     }
+}
+
+/// Whether one entry answers for `namespace:package` and covers `interfaces`.
+///
+/// An entry naming no interfaces covers its whole package, the rule
+/// [`crate::wit::WitWorld::uses`] matched it to the plugin under. Reading it
+/// more strictly here leaves the plugin bound and its interface unserved.
+fn entry_matches(
+    interface: &crate::wit::WitInterface,
+    namespace: &str,
+    package: &str,
+    interfaces: &[&str],
+) -> bool {
+    interface.namespace == namespace
+        && interface.package == package
+        && (interface.interfaces.is_empty()
+            || interfaces.iter().all(|i| interface.interfaces.contains(*i)))
+}
+
+/// Orders the entries of one package: the unnamed entry — a package's default
+/// route — first, then by name, instance, interfaces, and the keys each entry
+/// configures. Two entries alike in all of those carry the same resolved
+/// config, so their order between themselves does not change what a plugin
+/// reads.
+///
+/// Keys, never values: once bindings resolve, an entry's config carries
+/// whatever `secretFrom` produced.
+fn entry_order(interface: &crate::wit::WitInterface) -> (Option<&str>, String, String, String) {
+    let sorted = |mut items: Vec<&str>| {
+        items.sort_unstable();
+        items.join(",")
+    };
+    (
+        // `None` sorts before `Some`, putting the unnamed entry first.
+        interface.name.as_deref(),
+        interface.instance(),
+        sorted(interface.interfaces.iter().map(String::as_str).collect()),
+        sorted(interface.config.keys().map(String::as_str).collect()),
+    )
 }
 
 /// A workload a plugin has failed out of band (after it was already running),
@@ -211,6 +395,64 @@ pub trait HostPlugin: std::any::Any + Send + Sync + 'static {
         true
     }
 
+    /// The config keys this plugin considers the host operator's rather than a
+    /// workload's — where a binding connects, as whom, and what it may reach.
+    ///
+    /// Only consulted under `workloadConfig: deny`, where these keys are
+    /// refused to a workload even when no operator set them: an ungranted
+    /// allowlist has to resolve to empty, not to whatever the manifest wrote.
+    /// Name every alias the plugin's own reader accepts — a deny set covering
+    /// one spelling of a key read under two denies nothing.
+    ///
+    /// The default owns nothing, which leaves a plugin's config entirely the
+    /// workload's to write, as it was before bindings existed.
+    fn binding_schema(&self) -> BindingSchema {
+        BindingSchema::empty()
+    }
+
+    /// Check the operator's declaration for this plugin at host startup.
+    ///
+    /// Called once by [`crate::host::HostBuilder::build`] with whatever
+    /// `host.plugins` declared for this id. A plugin parses each of
+    /// [`PluginBindingSet::host_layers`] with its own reader here, so a
+    /// declaration it cannot use fails the host rather than the first workload
+    /// that needs it — and so an operator cannot write a value the manifest
+    /// parser would have rejected.
+    ///
+    /// The default accepts everything, which is what a plugin with no
+    /// [`HostPlugin::binding_schema`] wants.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the plugin's own parser refuses. The error should name the
+    /// binding.
+    fn validate_bindings(&self, _declared: &PluginBindingSet) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Whether a workload's `value` for a narrowable `key` is contained by the
+    /// host's `ceiling`.
+    ///
+    /// Called only for keys [`HostPlugin::binding_schema`] marks
+    /// [`KeyOwnership::HostCeiling`], only under
+    /// [`WorkloadConfigPolicy::Deny`], and only when both sides set the key.
+    /// Returning `false` refuses the bind. The generic layer has no opinion
+    /// about what containment means for any key.
+    ///
+    /// A predicate rather than a merge function returning the intersection:
+    /// a merge would let a plugin produce a value *neither* side wrote, so the
+    /// resolved config would contain a computed artifact and an operator
+    /// debugging a grant would not be reading anything anyone declared. Here
+    /// the resolved value is always exactly the manifest's, and the host's is
+    /// purely a gate.
+    ///
+    /// The default refuses everything, so a plugin that classifies a key
+    /// narrowable and forgets the predicate gets a refusal rather than a silent
+    /// acceptance: the unsafe direction is the one that requires writing code.
+    fn narrows(&self, _key: &str, _ceiling: &str, _value: &str) -> bool {
+        false
+    }
+
     /// Returns whether this plugin supports handling multiple named instances
     /// of the same namespace:package interface.
     ///
@@ -226,7 +468,22 @@ pub trait HostPlugin: std::any::Any + Send + Sync + 'static {
         false
     }
 
+    /// Whether a plain, unlabeled import is handed to another plugin that
+    /// serves it plainly. Defaults to [`HostPlugin::supports_named_instances`]:
+    /// a closed multiplexer routes labels between backends it names in code,
+    /// so a single-backend plugin is the better answer for an import with no
+    /// label. A plugin serving both off one backend returns `false`.
+    fn defers_unnamed_instances(&self) -> bool {
+        self.supports_named_instances()
+    }
+
     /// Injects metrics into the plugin.
+    ///
+    /// A plugin holding meters starts out at
+    /// [`MeterKind::Off`](crate::observability::MeterKind::Off), not
+    /// [`Meters::default`](crate::observability::Meters::default): until the
+    /// host hands its own over here, the plugin must not build instruments from
+    /// whichever OTel provider happened to exist when it was constructed.
     ///
     /// # Arguments
     /// * `meters` - A `Meters` object containing the metrics to inject.
@@ -307,6 +564,14 @@ pub trait HostPlugin: std::any::Any + Send + Sync + 'static {
     /// has been successfully bound and resolved. The default implementation
     /// does nothing.
     ///
+    /// A plugin that *calls into* the workload — pushing an event stream at an
+    /// interface the workload exports, rather than serving one it imports —
+    /// resolves its [`ResolvedWorkload::dispatch_target`] here and holds it for
+    /// the life of the binding. Here specifically: the workload has not started
+    /// yet, which is what lets a target naming its long-lived service reserve
+    /// the ingress the service will serve calls on. See
+    /// [`crate::engine::dispatch`].
+    ///
     /// # Arguments
     /// * `workload` - The fully resolved workload
     /// * `component_id` - The ID of the specific component within the workload
@@ -329,6 +594,14 @@ pub trait HostPlugin: std::any::Any + Send + Sync + 'static {
     /// This method allows plugins to clean up any resources associated with
     /// the workload. This can be called during binding failures (before resolution)
     /// or during normal workload shutdown (after resolution).
+    ///
+    /// Implementations must be idempotent, and must tolerate a workload they
+    /// never finished binding: a failed [`HostPlugin::on_workload_bind`] or
+    /// [`HostPlugin::on_workload_item_bind`] is rolled back by unbinding the
+    /// plugin that failed, so this runs over whatever half of the bind managed
+    /// to execute — and it may run again when the workload stops. Release what
+    /// is there and treat what is not as already released, rather than
+    /// erroring.
     ///
     /// The default implementation does nothing.
     ///
