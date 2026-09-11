@@ -100,7 +100,11 @@ impl bindings::exports::custom::wechat::handler::Guest for CustomHandler {
 
         let prompt = msg.text_content.as_deref().unwrap_or("");
         if prompt.is_empty() {
-            log(Level::Warn, LOG_CTX, "WECHAT: empty message, skipping reply");
+            log(
+                Level::Warn,
+                LOG_CTX,
+                "WECHAT: empty message, skipping reply",
+            );
             return Ok(());
         }
 
