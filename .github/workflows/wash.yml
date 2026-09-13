@@ -275,10 +275,26 @@ jobs:
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
-          outputs: type=image,name=ghcr.io/wasmcloud/wash,push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/wash,push-by-digest=true,name-canonical=true,push=true
           cache-from: |
             type=gha,scope=wash-release-arm64-${{ github.head_ref || github.ref_name }}
             type=gha,scope=wash-release-arm64-main
+      - name: Login to Aliyun ACR
+        if: github.event_name != 'pull_request'
+        uses: aliyun/acr-login@v1
+        with:
+          login-server: https://registry.cn-hangzhou.aliyuncs.com
+          username: "${{ secrets.ALIYUN_ACR_USERNAME }}"
+          password: "${{ secrets.ALIYUN_ACR_PASSWORD }}"
+      - name: Copy wash image to Aliyun ACR
+        if: github.event_name != 'pull_request'
+        env:
+          DIGEST: ${{ steps.build_push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          SRC="ghcr.io/${{ github.repository_owner }}/wash@${DIGEST}"
+          DST="registry.cn-hangzhou.aliyuncs.com/big_bumblebee/wash:${DIGEST#sha256:}"
+          docker buildx imagetools create -t "${DST}" "${SRC}"
       - name: Export digest
         if: github.event_name != 'pull_request'
         env:
@@ -383,11 +399,26 @@ jobs:
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
-          outputs: type=image,name=ghcr.io/wasmcloud/wash,push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/wash,push-by-digest=true,name-canonical=true,push=true
           cache-from: |
             type=gha,scope=wash-release-amd64-${{ github.head_ref || github.ref_name }}
             type=gha,scope=wash-release-amd64-main
           cache-to: type=gha,scope=wash-release-amd64-${{ github.head_ref || github.ref_name }},mode=max
+      - name: Login to Aliyun ACR
+        uses: aliyun/acr-login@v1
+        with:
+          login-server: https://registry.cn-hangzhou.aliyuncs.com
+          username: "${{ secrets.ALIYUN_ACR_USERNAME }}"
+          password: "${{ secrets.ALIYUN_ACR_PASSWORD }}"
+      - name: Copy wash image to Aliyun ACR
+        env:
+          DIGEST: ${{ steps.build_push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          SRC="ghcr.io/${{ github.repository_owner }}/wash@${DIGEST}"
+          DST="registry.cn-hangzhou.aliyuncs.com/big_bumblebee/wash:${DIGEST#sha256:}"
+          docker buildx imagetools create -t "${DST}" "${SRC}"
+
       - name: Export digest
         env:
           DIGEST: ${{ steps.build_push.outputs.digest }}
@@ -677,7 +708,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
-          images: ghcr.io/wasmcloud/wash
+          images: ghcr.io/${{ github.repository_owner }}/wash
           tags: |
             type=raw,value=canary
             type=sha,format=long,prefix=sha-
@@ -702,12 +733,12 @@ jobs:
             args+=(-t "$tag")
           done
           for d in "${digests[@]}"; do
-            args+=("ghcr.io/wasmcloud/wash@sha256:$d")
+            args+=("ghcr.io/${{ github.repository_owner }}/wash@sha256:$d")
           done
           docker buildx imagetools create "${args[@]}"
       - name: Inspect image
         run: |
-          docker buildx imagetools inspect "ghcr.io/wasmcloud/wash:${STEPS_META_OUTPUTS_VERSION}"
+          docker buildx imagetools inspect "ghcr.io/${{ github.repository_owner }}/wash:${STEPS_META_OUTPUTS_VERSION}"
         env:
           STEPS_META_OUTPUTS_VERSION: ${{ steps.meta.outputs.version }}
 
