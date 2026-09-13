@@ -185,11 +185,15 @@ workloads can use a separate NATS cluster from the control plane if desired.
 {{- end }}
 
 {{/*
-Partitions a host group's hostPlugins[] into file-backed entries (config/
-configFrom/secretFrom/allowedHosts/allowedIpNameLookups set. There is no
-`--host-plugin` CLI-arg equivalent, since a secret must never land on the
-command line) vs plain CLI-only entries, and collects the deduped
+Partitions a host group's plugins[] (plus the deprecated hostPlugins[] alias)
+into file-backed entries vs plain CLI-only entries, and collects the deduped
 configFrom/secretFrom names referenced across the file-backed set.
+
+An entry is file-backed when it sets anything `--host-plugin` cannot express —
+config/configFrom/secretFrom/allowedHosts/allowedIpNameLookups, or any of the
+binding fields (workloadConfig/hostOwnedKeys/bindings). A secret must never
+land on the command line, and a native entry (no image/file) has nothing to put
+there at all, so it is always file-backed.
 
 Shared by deployment.yaml (which needs both partitions, to render
 `--host-plugin` args for `cli` and mount volumes for `fileBacked`) and
@@ -198,14 +202,24 @@ host-plugin-config.yaml (which needs only `fileBacked`, to render the
 
 Takes the host group dict directly (e.g. `.` inside
 `range .Values.runtime.hostGroups`). Returns a JSON object
-`{fileBacked, cli, configFromNames, secretFromNames}` and parses the result
-with `fromJson`.
+`{fileBacked, cli, configFromNames, secretFromNames, needsConfigFile}`
+and parses the result with `fromJson`.
 */}}
 {{- define "runtime-operator.hostPluginPartition" -}}
+{{- /* Removed keys, refused rather than ignored. Helm drops values nothing
+       reads, so an upgrade that keeps `wasmcloudNats` would render a host with
+       no binding, no credential and no grant — visible only as denied calls,
+       from a values file that still reads correct. */}}
+{{- if .wasmcloudNats }}
+{{- fail "runtime.hostGroups[].wasmcloudNats has been removed: declare it under this host group's `plugins` as an entry with `id: wasmcloud-nats`, moving `config`/`configFrom`/`secretFrom` onto the entry and `bindings` across unchanged" }}
+{{- end }}
+{{- if .wasmcloudNatsWorkloadConfig }}
+{{- fail "runtime.hostGroups[].wasmcloudNatsWorkloadConfig has been removed: set `workloadConfig` on this host group's `plugins` entry with `id: wasmcloud-nats`" }}
+{{- end }}
 {{- $fileBacked := list }}
 {{- $cli := list }}
-{{- range .hostPlugins }}
-{{- if or .config .configFrom .secretFrom .allowedHosts .allowedIpNameLookups }}
+{{- range concat (default list .plugins) (default list .hostPlugins) }}
+{{- if or .config .configFrom .secretFrom .allowedHosts .allowedIpNameLookups .workloadConfig .hostOwnedKeys .bindings (not (or .image .file)) }}
 {{- $fileBacked = append $fileBacked . }}
 {{- else }}
 {{- $cli = append $cli . }}
@@ -220,8 +234,16 @@ with `fromJson`.
 {{- range .secretFrom }}
 {{- $secretFromNames = append $secretFromNames . }}
 {{- end }}
+{{- range $name, $binding := (default dict .bindings) }}
+{{- range $binding.configFrom }}
+{{- $configFromNames = append $configFromNames . }}
 {{- end }}
-{{- dict "fileBacked" $fileBacked "cli" $cli "configFromNames" ($configFromNames | uniq) "secretFromNames" ($secretFromNames | uniq) | toJson }}
+{{- range $binding.secretFrom }}
+{{- $secretFromNames = append $secretFromNames . }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- dict "fileBacked" $fileBacked "cli" $cli "configFromNames" ($configFromNames | uniq) "secretFromNames" ($secretFromNames | uniq) "needsConfigFile" (gt (len $fileBacked) 0) | toJson }}
 {{- end }}
 
 {{/*
@@ -268,7 +290,8 @@ secrets:
   {{- end }}
 {{- end }}
 host:
-  hostPlugins:
+  {{- if $partition.fileBacked }}
+  plugins:
     {{- range $partition.fileBacked }}
     - id: {{ .id }}
       {{- if .image }}
@@ -305,7 +328,19 @@ host:
       allowedIpNameLookups:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with .workloadConfig }}
+      workloadConfig: {{ . }}
+      {{- end }}
+      {{- with .hostOwnedKeys }}
+      hostOwnedKeys:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .bindings }}
+      bindings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     {{- end }}
+  {{- end }}
 {{- end }}
 
 {{/*
@@ -335,6 +370,29 @@ configmap.reloader.stakater.com/reload: {{ join "," $partition.configFromNames |
 {{- if $partition.secretFromNames }}
 secret.reloader.stakater.com/reload: {{ join "," $partition.secretFromNames | quote }}
 {{- end }}
+{{- end }}
+
+{{/*
+One host-group probe, resolved against the chart-wide default. Fields resolve
+one by one, so a group retuning one timing keeps the rest.
+
+Written as a key-by-key overlay rather than `merge` because sprig's merge
+treats every zero as unset: it would drop a group's `enabled: false` and its
+`initialDelaySeconds: 0` alike, in favour of whatever the chart-wide block
+says.
+
+Call with (dict "group" .probes "chart" $top.Values.runtime.probes "name" "liveness")
+and read the result back with `fromJson`.
+*/}}
+{{- define "runtime-operator.hostProbe" -}}
+{{- $probe := dict }}
+{{- range $field, $value := (index (.chart | default dict) .name) | default dict }}
+{{- $_ := set $probe $field $value }}
+{{- end }}
+{{- range $field, $value := (index (.group | default dict) .name) | default dict }}
+{{- $_ := set $probe $field $value }}
+{{- end }}
+{{- $probe | toJson }}
 {{- end }}
 
 {{/*

@@ -13,9 +13,65 @@
        `--host-plugin` CLI-arg equivalent (deliberately: a secret must never
        land on the command line). See host-plugin-config.yaml, which renders
        the ConfigMap this deployment mounts. */}}
+{{- /* A host group's own `resources` replaces the chart-wide block wholesale
+       (no merge), and carries the host knobs `defaultHeapMemory`,
+       `coreInstances`, `guestMemoryMode` and `maxConcurrentStarts` alongside
+       the Kubernetes requests/limits. */}}
+{{- $resources := .resources | default $top.Values.runtime.resources | default dict }}
+{{- /* Probes, unlike `resources`, merge per field: a group naming one timing
+       keeps the chart-wide values for the rest. */}}
+{{- /* The shutdown budget, checked rather than described: the host serves for
+       `drainDelaySeconds`, then drains commands for up to 5s, and SIGKILL lands
+       at `terminationGracePeriodSeconds` whatever it is doing. */}}
+{{- $drain := int ($top.Values.runtime.drainDelaySeconds | default 0) }}
+{{- if gt (add $drain 5) (int $top.Values.runtime.terminationGracePeriodSeconds) }}
+{{- fail (printf "runtime.terminationGracePeriodSeconds (%v) is under drainDelaySeconds (%v) plus the 5s command drain; the host would be killed mid-shutdown" $top.Values.runtime.terminationGracePeriodSeconds $drain) }}
+{{- end }}
+{{- $probeArgs := dict "group" .probes "chart" $top.Values.runtime.probes }}
+{{- /* The port the probes are answered on, merged per field like the timings
+       beside it: a group may turn it off or move it without restating the
+       chart-wide default. */}}
+{{- $endpoint := include "runtime-operator.hostProbe" (merge (dict "name" "endpoint") $probeArgs) | fromJson }}
+{{- /* The ports and names this chart renders itself. A group that claims one
+       again fails here, by name, rather than at the API server, which rejects
+       a duplicate containerPort by array index. */}}
+{{- $groupName := .name }}
+{{- $reserved := dict }}
+{{- $reservedNames := dict }}
+{{- if and .http .http.enabled }}
+{{- $_ := set $reserved (toString (int .http.port)) "http.port" }}
+{{- $_ := set $reservedNames "http" "http.port" }}
+{{- end }}
+{{- if $endpoint.enabled }}
+{{- $probePort := toString (int $endpoint.port) }}
+{{- with index $reserved $probePort }}
+{{- fail (printf "host group %s: probes.endpoint.port and http.port are both %v; the host would fail to bind the second" $groupName $endpoint.port) }}
+{{- end }}
+{{- $_ := set $reserved $probePort "probes.endpoint.port" }}
+{{- $_ := set $reservedNames "probes" "probes.endpoint.port" }}
+{{- end }}
+{{- range .ports }}
+{{- $port := toString (int .containerPort) }}
+{{- $name := toString .name }}
+{{- $portClash := index $reserved $port }}
+{{- if $portClash }}
+{{- fail (printf "host group %s: ports[] gives containerPort %s, already rendered from %s; drop it" $groupName $port $portClash) }}
+{{- end }}
+{{- $_ := set $reserved $port (printf "ports[].%s" $name) }}
+{{- /* A container port may be unnamed, and two of those are not a clash. */}}
+{{- if .name }}
+{{- $nameClash := index $reservedNames $name }}
+{{- if $nameClash }}
+{{- fail (printf "host group %s: ports[] gives the name %q, already rendered from %s; rename it" $groupName $name $nameClash) }}
+{{- end }}
+{{- $_ := set $reservedNames $name (printf "ports[].%s" $name) }}
+{{- end }}
+{{- end }}
+{{- $liveness := include "runtime-operator.hostProbe" (merge (dict "name" "liveness") $probeArgs) | fromJson }}
+{{- $readiness := include "runtime-operator.hostProbe" (merge (dict "name" "readiness") $probeArgs) | fromJson }}
 {{- $partition := include "runtime-operator.hostPluginPartition" . | fromJson }}
-{{- $fileBackedPlugins := $partition.fileBacked }}
 {{- $cliPlugins := $partition.cli }}
+{{- $needsConfigFile := $partition.needsConfigFile }}
 {{- $configFromNames := $partition.configFromNames }}
 {{- $secretFromNames := $partition.secretFromNames }}
 apiVersion: apps/v1
@@ -55,7 +111,7 @@ spec:
              cannot — the contents of the ConfigMaps/Secrets this file only
              references by name. See the helper. */}}
       {{- $annotations := dict }}
-      {{- if $fileBackedPlugins }}
+      {{- if $needsConfigFile }}
       {{- $configFile := include "runtime-operator.hostPluginConfigFile" $partition }}
       {{- $_ := set $annotations "checksum/host-plugin-config" ($configFile | sha256sum) }}
       {{- $reloader := include "runtime-operator.hostPluginReloaderAnnotations" $partition | fromYaml }}
@@ -99,7 +155,7 @@ spec:
         {{- with .volumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-        {{- if $fileBackedPlugins }}
+        {{- if $needsConfigFile }}
         - name: host-plugin-config
           configMap:
             name: hostgroup-{{ .name }}-host-config
@@ -136,6 +192,50 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            {{- /* Host memory budgets, from the effective `resources`:
+                   `limits.memory` is the host's total guest memory budget,
+                   guestMemoryMode says whether that budget is enforced or only
+                   counted, and defaultHeapMemory/coreInstances are wasmtime
+                   knobs parked alongside them (all three stripped back out of
+                   the `resources:` block below). Unset means unset — the host
+                   then derives its budget from its cgroup, counts against it
+                   rather than enforcing it, and leaves the pool knobs at
+                   wasmtime's defaults.
+
+                   These go through the flags' `WASH_*` env fallbacks rather
+                   than `args` on purpose. The chart is routinely paired with a
+                   host image it does not ship (`runtime.image.tag`), and an
+                   older host aborts on an argument it does not recognise —
+                   whereas it simply ignores an env var it has never heard of.
+                   Keep any new host knob on this side of that line. */}}
+            {{- with $resources.limits }}
+            {{- with .memory }}
+            - name: WASH_HOST_MAX_GUEST_MEMORY
+              value: "{{ . }}"
+            {{- end }}
+            {{- end }}
+            {{- with $resources.defaultHeapMemory }}
+            - name: WASH_DEFAULT_HEAP_MEMORY
+              value: "{{ . }}"
+            {{- end }}
+            {{- with $resources.coreInstances }}
+            - name: WASH_CORE_INSTANCES
+              value: "{{ . }}"
+            {{- end }}
+            {{- with $resources.guestMemoryMode }}
+            - name: WASH_GUEST_MEMORY_MODE
+              value: "{{ . }}"
+            {{- end }}
+            {{- /* Not `with`: Go templates treat the integer 0 as empty, and
+                   `0` is the most serialized setting a host can be given (it
+                   clamps to one start at a time). Tested for a number instead,
+                   so nil, "" and a mistyped bool all skip rather than reaching
+                   the host as an argument it cannot parse. */}}
+            {{- $starts := $resources.maxConcurrentStarts }}
+            {{- if or (kindIs "int64" $starts) (kindIs "float64" $starts) (and (kindIs "string" $starts) (ne $starts "")) }}
+            - name: WASH_MAX_CONCURRENT_STARTS
+              value: "{{ $starts }}"
+            {{- end }}
             {{- with $top.Values.runtime.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -172,7 +272,61 @@ spec:
             - "--data-nats-tls-cert=/data-cert/tls.crt"
             - "--data-nats-tls-key=/data-cert/tls.key"
             {{- end }}
+            {{- /* The `wasmcloud:nats` plugin's own address. Defaults to the
+                   host's data plane — and carries that data plane's TLS
+                   material with it as one bundle. Set
+                   `wasmcloudNatsUrl` when the NATS workloads talk to is not
+                   the one backing the data plane. Whether a
+                   manifest may describe a binding at all is
+                   `plugins[].workloadConfig` — see values.yaml. */}}
+            {{- with .wasmcloudNatsUrl }}
+            - "--wasmcloud-nats-url={{ . }}"
+            {{- end }}
             - "--oci-cache-dir=/oci-cache"
+            {{- with $top.Values.runtime.drainDelaySeconds }}
+            - "--drain-delay={{ . }}s"
+            {{- end }}
+            {{- with $top.Values.runtime.natsConnectTimeoutSeconds }}
+            - "--nats-connect-timeout={{ . }}s"
+            {{- end }}
+            {{- if $endpoint.enabled }}
+            - "--probe-addr=0.0.0.0:{{ $endpoint.port }}"
+            {{- end }}
+            {{- /* `networking` is the host's half of every two-sided grant, plus
+                   the ceilings it enforces alone. A key is rendered only when
+                   the values file sets it, so an unset one keeps the host's own
+                   default rather than having the chart restate it — which
+                   matters for the derived ceilings, where "unset" and "the same
+                   number typed out" mean different things downstream. */}}
+            {{- with .networking }}
+            {{- if .allowHostLoopback }}
+            - "--allow-host-loopback"
+            {{- end }}
+            {{- with .socketEgress }}
+            - "--socket-egress={{ . }}"
+            {{- end }}
+            {{- if hasKey . "denySpecialRanges" }}
+            - "--deny-special-ranges={{ .denySpecialRanges }}"
+            {{- end }}
+            {{- if .denyPrivateRanges }}
+            - "--deny-private-ranges"
+            {{- end }}
+            {{- with .maxConnections }}
+            - "--max-connections={{ . }}"
+            {{- end }}
+            {{- with .maxHttpIngressConnections }}
+            - "--max-http-ingress-connections={{ . }}"
+            {{- end }}
+            {{- with .maxOutboundHttpConnectionsPerWorkload }}
+            - "--max-outbound-http-connections-per-workload={{ . }}"
+            {{- end }}
+            {{- with .maxOutboundSocketConnectionsPerWorkload }}
+            - "--max-outbound-socket-connections-per-workload={{ . }}"
+            {{- end }}
+            {{- with .maxInboundSocketConnectionsPerWorkload }}
+            - "--max-inbound-socket-connections-per-workload={{ . }}"
+            {{- end }}
+            {{- end }}
             {{- if and (.http) (.http.enabled) }}
             - "--http-addr=0.0.0.0:{{ .http.port }}"
             {{- if and ($top.Values.global.tls.enabled) (.http.tls) (.http.tls.enabled) }}
@@ -199,11 +353,11 @@ spec:
                    one --host-plugin flag per entry, rendered into the CLI's
                    `key=value` grammar (unchanged). Entries that DO set any of
                    those render into the mounted config file instead — see
-                   $fileBackedPlugins / --config below. */}}
+                   $needsConfigFile / --config below. */}}
             {{- range $cliPlugins }}
             - "--host-plugin=id={{ .id }}{{ if .image }},image={{ .image }}{{ if .pullPolicy }},pull={{ .pullPolicy }}{{ end }}{{ if .digest }},digest={{ .digest }}{{ end }}{{ else if .file }},file={{ .file }}{{ end }}{{ if .maxRestarts }},max-restarts={{ .maxRestarts }}{{ end }}"
             {{- end }}
-            {{- if $fileBackedPlugins }}
+            {{- if $needsConfigFile }}
             - "--user-config=/etc/wasmcloud/host-config/config.yaml"
             {{- end }}
             {{- /* Chart-wide runtime.extraArgs applies to every host group; per-host-group
@@ -239,7 +393,7 @@ spec:
             {{- with .volumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
-            {{- if $fileBackedPlugins }}
+            {{- if $needsConfigFile }}
             - name: host-plugin-config
               mountPath: /etc/wasmcloud/host-config
               readOnly: true
@@ -254,7 +408,7 @@ spec:
               readOnly: true
             {{- end }}
             {{- end }}
-          {{- with (.resources | default $top.Values.runtime.resources) }}
+          {{- with omit $resources "defaultHeapMemory" "coreInstances" "guestMemoryMode" "maxConcurrentStarts" }}
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
@@ -264,6 +418,11 @@ spec:
               containerPort: {{ .http.port }}
               protocol: TCP
             {{- end }}
+            {{- if $endpoint.enabled }}
+            - name: probes
+              containerPort: {{ $endpoint.port }}
+              protocol: TCP
+            {{- end }}
             {{- /* Optional additional container ports (e.g. metrics scrape).
                    Do NOT re-list the http port — the chart renders it from
                    `.http.port` above; a duplicate containerPort fails
@@ -271,23 +430,60 @@ spec:
             {{- with .ports }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
-          {{- if and (.http) (.http.enabled) }}
+          {{- /* With the probe endpoint on, the probes ask the host about
+                 itself: `/livez` is "restart me", `/readyz` is "stop sending me
+                 work". Without it they fall back to a TCP connect on the
+                 traffic port, which cannot tell a wedged host from a busy one
+                 and cannot say "full" at all. Every field
+                 but `enabled` is passed through as given, so a `0` reaches the
+                 manifest and `runtime.probes` stays the one place the timings
+                 are written down. */}}
+          {{- if or $endpoint.enabled (and (.http) (.http.enabled)) }}
+          {{- /* Liveness on the probe port answers only once the host has
+                 bound it, which is late in startup — after the plugin pulls
+                 and compiles. A startup probe gives that as long as it needs
+                 without loosening the liveness timings that follow it. */}}
+          {{- if and $endpoint.enabled $liveness.enabled }}
+          startupProbe:
+            httpGet:
+              path: /livez
+              port: probes
+            periodSeconds: 5
+            failureThreshold: {{ $endpoint.startupFailureThreshold }}
+          {{- end }}
+          {{- if $liveness.enabled }}
           livenessProbe:
+            {{- if $endpoint.enabled }}
+            httpGet:
+              path: /livez
+              port: probes
+            {{- else }}
             tcpSocket:
               port: http
-            initialDelaySeconds: 10
-            periodSeconds: 20
-            failureThreshold: 3
+            {{- end }}
+            {{- range $field, $value := omit $liveness "enabled" }}
+            {{ $field }}: {{ $value }}
+            {{- end }}
+          {{- end }}
+          {{- if $readiness.enabled }}
           readinessProbe:
+            {{- if $endpoint.enabled }}
+            httpGet:
+              path: /readyz
+              port: probes
+            {{- else }}
             tcpSocket:
               port: http
-            initialDelaySeconds: 5
-            periodSeconds: 10
+            {{- end }}
+            {{- range $field, $value := omit $readiness "enabled" }}
+            {{ $field }}: {{ $value }}
+            {{- end }}
+          {{- end }}
           {{- end }}
           securityContext:
             {{- toYaml $top.Values.runtime.securityContext | nindent 12 }}
       dnsPolicy: ClusterFirst
       restartPolicy: Always
-      terminationGracePeriodSeconds: 0
+      terminationGracePeriodSeconds: {{ $top.Values.runtime.terminationGracePeriodSeconds }}
 ---
 {{- end }}

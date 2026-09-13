@@ -11,7 +11,8 @@ use wash_runtime::{
     plugin::{self},
 };
 
-use crate::cli::{CliCommand, CliContext, CommandOutput};
+use crate::cli::{CliCommand, CliContext, CommandOutput, signal};
+
 use crate::config::{HttpClientTrustRoots, load_config};
 
 #[derive(Debug, Clone, Args)]
@@ -23,6 +24,17 @@ pub struct HostCommand {
     /// NATS URL for Control Plane communications
     #[arg(long = "scheduler-nats-url", default_value = "nats://localhost:4222")]
     pub scheduler_nats_url: String,
+
+    /// How long to keep retrying NATS at startup before giving up, across both
+    /// the scheduler and data connections together.
+    ///
+    /// A host brought up beside its NATS has no ordering against it, and
+    /// exiting on the first refusal makes the pod restart until the race
+    /// happens to go the other way. The chart sets this; zero — the default —
+    /// fails on the first refusal, which is what someone running `wash host`
+    /// against a NATS they start themselves wants to see.
+    #[arg(long = "nats-connect-timeout", default_value = "0s", value_parser = humantime::parse_duration)]
+    pub nats_connect_timeout: Duration,
 
     /// Path to TLS CA certificate file for NATS Scheduler connection
     #[arg(long = "scheduler-nats-tls-ca")]
@@ -126,6 +138,34 @@ pub struct HostCommand {
     #[arg(long = "max-connections", env = "WASH_MAX_CONNECTIONS")]
     pub max_connections: Option<usize>,
 
+    /// Address for the probe listener serving `/livez` and `/readyz`.
+    ///
+    /// Point Kubernetes probes here rather than at `--http-addr`. A TCP probe
+    /// against the traffic port cannot tell a wedged host from a busy one — the
+    /// kernel answers the handshake either way — and cannot express "full, send
+    /// work elsewhere" at all. Unset, no probe listener is started.
+    #[arg(long = "probe-addr", env = "WASH_PROBE_ADDR")]
+    pub probe_addr: Option<SocketAddr>,
+
+    /// Cap on the TCP connections accepted on `--http-addr` at once.
+    ///
+    /// Connections, not requests: a keep-alive connection counts while it sits
+    /// idle, and one HTTP/2 connection counts once however many streams it
+    /// carries. Separate from `--max-connections`, which is what workloads may
+    /// hold, because which workload an inbound connection belongs to is unknown
+    /// until its first request names one; and from
+    /// `--max-inbound-socket-connections-per-workload`, which is a workload's
+    /// own published ports rather than this listener.
+    ///
+    /// Connections past this are closed as soon as they are accepted, so the
+    /// host keeps answering rather than going silent. Defaults to a quarter of
+    /// the process's descriptor limit.
+    #[arg(
+        long = "max-http-ingress-connections",
+        env = "WASH_MAX_HTTP_INGRESS_CONNECTIONS"
+    )]
+    pub max_http_ingress_connections: Option<usize>,
+
     /// Cap on live pooled HTTP and gRPC connections a single workload may
     /// hold, across all authorities it talks to. Idle keep-alive connections
     /// count, so this is really how large a workload's pool may grow.
@@ -204,6 +244,76 @@ pub struct HostCommand {
     )]
     pub wasmcloud_messaging_max_in_flight_per_component: Option<usize>,
 
+    /// Total memory on this host that all guests may use (e.g. `8GiB`).
+    ///
+    /// Unset, it is derived: three quarters of the cgroup limit that would
+    /// actually OOM-kill this process, falling back to the machine's total
+    /// where there is no cgroup, clamped to 256 MiB..1 TiB. An unset flag means
+    /// the derived number, never "unbounded".
+    ///
+    /// What this bounds is the *total* of every guest's linear memory, which
+    /// no other knob does: `--default-heap-memory` bounds one memory and
+    /// `--core-instances` bounds a count of slots. Whether it is enforced or
+    /// only accounted is `--guest-memory-mode`, which counts by default.
+    //
+    // Deliberately no `default_value_t`: a parse-time default is
+    // indistinguishable downstream from an operator typing the same number, and
+    // the derivation has to tell them apart.
+    #[arg(long = "max-guest-memory", env = "WASH_HOST_MAX_GUEST_MEMORY")]
+    pub max_guest_memory: Option<String>,
+
+    /// How `--max-guest-memory` is applied.
+    ///
+    /// `count` (the default) charges every guest `memory.grow` to the budget
+    /// and records what it would have refused, but allows the growth anyway.
+    /// Guest memory was never bounded in aggregate and the budget is derived
+    /// when unset, so enforcing on upgrade would hand every host a ceiling
+    /// nobody chose; run in `count` first, watch the reported high-water mark
+    /// and `would_refuse` count, then switch to `enforce`.
+    ///
+    /// Under `enforce`, a growth past the budget makes the guest's
+    /// `memory.grow` return -1 — the same failure it already sees on hitting
+    /// `--default-heap-memory` — rather than trapping it.
+    ///
+    /// `enforce` makes `--max-guest-memory` a real ceiling, so it has to leave
+    /// the host room to be a host: wasmtime, compiled module images, NATS, OCI
+    /// pulls and HTTP buffers are not charged to this budget but do come out
+    /// of the same container limit. An unset budget already reserves a quarter
+    /// of the detected limit for them; a budget set to the whole container
+    /// limit can be OOM-killed before it ever refuses a guest.
+    //
+    // Parsed through `parse_guest_memory_mode` rather than plain `value_enum`
+    // so a blank value counts as unset, matching the sibling size knobs: a
+    // ConfigMap key or `value: ""` reaches clap as `Some("")`, and failing to
+    // parse that would refuse to start the host over a variable nobody set.
+    #[arg(
+        long = "guest-memory-mode",
+        env = "WASH_GUEST_MEMORY_MODE",
+        value_parser = parse_guest_memory_mode,
+        default_value = "count"
+    )]
+    pub guest_memory_mode: GuestMemoryMode,
+
+    /// Ceiling on how large any single guest linear memory may grow
+    /// (e.g. `512MiB`).
+    ///
+    /// This is the pooling allocator's `max_memory_size`. Unset, it stays
+    /// wasmtime's own default of 4 GiB — which is what every host has run to
+    /// date, and why an instance count has never implied a byte count.
+    ///
+    /// Every slot is sized for this whether or not anything grows into it, so
+    /// raising it raises the pool's whole address-space reservation.
+    #[arg(long = "default-heap-memory", env = "WASH_DEFAULT_HEAP_MEMORY")]
+    pub default_heap_memory: Option<String>,
+
+    /// Instance slots the pooling allocator keeps.
+    ///
+    /// Unset, this stays wasmtime's default of 1000. Multiplied by
+    /// `--default-heap-memory` it is the pool's address-space reservation, so
+    /// the two are worth setting together.
+    #[arg(long = "core-instances", env = "WASH_CORE_INSTANCES")]
+    pub core_instances: Option<u32>,
+
     /// How long a pooled HTTP connect waits for a slot before failing with a
     /// connect timeout (e.g. `5s`, `500ms`).
     ///
@@ -256,6 +366,25 @@ pub struct HostCommand {
     #[arg(long = "oci-ca-path", env = "WASH_OCI_CA_PATHS", value_delimiter = ',')]
     pub oci_ca_paths: Vec<PathBuf>,
 
+    /// How long to keep serving after a shutdown signal, before stopping.
+    ///
+    /// A pod leaves its Service when Kubernetes marks it Terminating, but that
+    /// removal takes time to reach every kube-proxy, and a host that stops the
+    /// moment it is signalled refuses the requests still in flight toward it.
+    /// This is that gap: readiness reports the host as gone, and it keeps
+    /// answering until the delay is up.
+    ///
+    /// Must fit inside `terminationGracePeriodSeconds` alongside the command
+    /// drain that follows it, or the kernel ends the process mid-drain. Zero
+    /// stops immediately, which is what a developer pressing Ctrl-C wants.
+    #[arg(
+        long = "drain-delay",
+        env = "WASH_DRAIN_DELAY",
+        value_parser = humantime::parse_duration,
+        default_value = "0s"
+    )]
+    pub drain_delay: Duration,
+
     /// Timeout for pulling artifacts from OCI registries
     #[arg(long = "registry-pull-timeout", value_parser = humantime::parse_duration, default_value = "30s")]
     pub registry_pull_timeout: Duration,
@@ -263,6 +392,17 @@ pub struct HostCommand {
     /// The directory to use for caching OCI artifacts
     #[arg(long = "oci-cache-dir")]
     pub oci_cache_dir: Option<PathBuf>,
+
+    /// How many workloads this host pulls and compiles at once.
+    ///
+    /// Each start it admits ends in a compile that spreads over every core the
+    /// host can see, so this is a floor on what a burst of starts takes from
+    /// the cores serving HTTP and NATS, not a ceiling. Cap the compiles
+    /// themselves with `RAYON_NUM_THREADS` or `WASMTIME_PARALLEL_COMPILATION=false`.
+    /// Defaults to one fewer than the host can see, at most 4; lower it on a
+    /// host that must stay responsive while it starts things.
+    #[arg(long = "max-concurrent-starts", env = "WASH_MAX_CONCURRENT_STARTS")]
+    pub max_concurrent_starts: Option<usize>,
 
     /// Enable WASI OpenTelemetry plugin
     #[arg(long = "wasi-otel", default_value_t = false)]
@@ -290,7 +430,17 @@ pub struct HostCommand {
     /// Deny outbound connections to loopback, link-local (including the cloud
     /// metadata address), multicast, and documentation ranges — including
     /// whatever DNS returned for a permitted name.
-    #[arg(long = "deny-special-ranges", default_value_t = true)]
+    //
+    // Takes an optional value, unlike the default-off toggles above: presence
+    // alone cannot express "off" for something whose default is on. The bare
+    // flag still means `true`.
+    #[arg(
+        long = "deny-special-ranges",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
     pub deny_special_ranges: bool,
 
     /// Deny outbound connections to private ranges (RFC1918, ULA, CGNAT).
@@ -298,6 +448,37 @@ pub struct HostCommand {
     /// ordinary in-cluster case.
     #[arg(long = "deny-private-ranges", default_value_t = false)]
     pub deny_private_ranges: bool,
+
+    /// NATS the `wasmcloud:nats` plugin's bindings dial when the host's own
+    /// declaration for a binding names no `servers`.
+    ///
+    /// Defaults to `--data-nats-url`, so a workload on the cluster's own NATS
+    /// needs no address in its manifest and the same manifest runs in dev and
+    /// on a cluster. Set this when the NATS a workload talks to is not the one
+    /// backing the host's data plane.
+    ///
+    /// The data-plane fallback also carries the host's `--data-nats-tls-*`
+    /// material, so a TLS-fronted cluster NATS works with no per-binding
+    /// configuration. Setting this flag switches the fallback to address
+    /// only — the data plane's certificates say nothing about another NATS —
+    /// and it carries no grant either way: a binding that inherits it still
+    /// reaches nothing until the host grants it something.
+    #[arg(long = "wasmcloud-nats-url", env = "WASH_WASMCLOUD_NATS_URL")]
+    pub wasmcloud_nats_url: Option<String>,
+
+    /// Removed: the policy is `workloadConfig` on the `host.plugins` entry.
+    ///
+    /// Hidden, and kept only to fail loudly. Dropping the arg outright makes
+    /// clap reject the *flag*, but `WASH_WASMCLOUD_NATS_WORKLOAD_CONFIG` in a
+    /// pod spec would simply stop being read — and a host that quietly stops
+    /// enforcing `deny` is the one failure this whole mechanism exists to
+    /// prevent.
+    #[arg(
+        long = "wasmcloud-nats-workload-config",
+        env = "WASH_WASMCLOUD_NATS_WORKLOAD_CONFIG",
+        hide = true
+    )]
+    pub removed_wasmcloud_nats_workload_config: Option<String>,
 
     /// Enable additional wasm proposals on the engine. Accepts a comma-separated
     /// list and/or repeated flags, e.g. `--wasm-proposal gc,threads`. Accepted
@@ -379,11 +560,82 @@ fn host_plugin_registry_credentials(
     }
 }
 
+impl HostCommand {
+    /// The operator's plugin binding declarations, plus the fallbacks this
+    /// host's own flags supply.
+    ///
+    /// `wasmcloud:nats` is the only plugin with a fallback today: a binding
+    /// that names no `servers` dials the data plane. The TLS material rides
+    /// with it as an *anchored bundle* rather than as three independent
+    /// defaults, because certs are only valid for the address they were issued
+    /// for — an operator who points a binding at some other NATS and sets no
+    /// TLS must not inherit the cluster's. The bundle is evaluated at resolve
+    /// time, so a workload setting `servers` under `allow` skips it too.
+    fn plugin_bindings(
+        &self,
+        config: &crate::config::Config,
+        project_dir: &std::path::Path,
+    ) -> anyhow::Result<wash_runtime::plugin::PluginBindings> {
+        let declared = config
+            .host()
+            .to_plugin_bindings(config, project_dir, Some(project_dir))
+            .context("failed to resolve host.plugins")?;
+
+        let mut bundle: Vec<(&str, String)> = vec![(
+            "servers",
+            self.wasmcloud_nats_url
+                .clone()
+                .unwrap_or_else(|| self.data_nats_url.clone()),
+        )];
+        // Only when the fallback address *is* the data plane:
+        // `--wasmcloud-nats-url` points at some other NATS, whose trust the
+        // data plane's certs say nothing about.
+        if self.wasmcloud_nats_url.is_none() {
+            for (key, path) in [
+                ("tls-ca", self.data_nats_tls_ca.as_deref()),
+                ("tls-cert", self.data_nats_tls_cert.as_deref()),
+                ("tls-key", self.data_nats_tls_key.as_deref()),
+            ] {
+                if let Some(path) = path {
+                    bundle.push((key, path.display().to_string()));
+                }
+            }
+            if self.data_nats_tls_first {
+                bundle.push(("tls-first", "true".to_string()));
+            }
+        }
+
+        let nats = declared
+            .for_plugin(wash_runtime::plugin::wasmcloud_nats::PLUGIN_NATS_ID)
+            .with_default_bundle("servers", bundle);
+        Ok(declared.with_plugin(nats))
+    }
+}
+
 impl CliCommand for HostCommand {
     async fn handle(&self, ctx: &CliContext) -> anyhow::Result<CommandOutput> {
+        // Validated before anything is connected or built. A bad size is a typo
+        // in a flag, and reporting it after a NATS dial has already failed
+        // buries the actionable error under an unrelated one. The resolved
+        // numbers are reported later, by the engine that installs them.
+        let host_memory = wash_runtime::engine::host_memory::HostMemoryBudgets::resolve_strs(
+            self.max_guest_memory.as_deref(),
+            self.default_heap_memory.as_deref(),
+            self.core_instances,
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
+        anyhow::ensure!(
+            self.max_http_ingress_connections != Some(0),
+            "max_http_ingress_connections must be at least 1"
+        );
+
         // Installed before connect_nats so TLS-enabled NATS clusters have a
         // crypto provider available. Idempotent; also called by Ingress::new.
         wash_runtime::init_crypto();
+
+        // Armed before the plugin pulls below, so a signal during them stops
+        // this process rather than being ignored until the host is up.
+        let shutdown = signal::arm()?;
 
         // Picked up the same way `wash dev` reads its own config file: global
         // config merged with the project-local one, if any. `wash host` has
@@ -396,6 +648,14 @@ impl CliCommand for HostCommand {
             load_config::<crate::config::Config>(&ctx.user_config_path(), Some(project_dir), None)
                 .context("failed to load config for wash host")?;
 
+        // One budget for both connections below, not one each: the flag says
+        // how long startup may spend waiting for NATS, and two windows in
+        // series would spend twice that with the second URL down. Zero asks to
+        // give up on the first refusal.
+        let connect_deadline = tokio::time::Instant::now() + self.nats_connect_timeout;
+        let connect_retry =
+            (!self.nats_connect_timeout.is_zero()).then_some(self.nats_connect_timeout);
+
         let scheduler_nats_client = wash_runtime::washlet::connect_nats(
             self.scheduler_nats_url.clone(),
             wash_runtime::washlet::NatsConnectionOptions {
@@ -404,6 +664,7 @@ impl CliCommand for HostCommand {
                 tls_first: self.scheduler_nats_tls_first,
                 tls_cert: self.scheduler_nats_tls_cert.clone(),
                 tls_key: self.scheduler_nats_tls_key.clone(),
+                connect_retry,
             },
         )
         .await
@@ -417,29 +678,44 @@ impl CliCommand for HostCommand {
                 tls_first: self.data_nats_tls_first,
                 tls_cert: self.data_nats_tls_cert.clone(),
                 tls_key: self.data_nats_tls_key.clone(),
+                // Whatever the scheduler connection left of the budget. A
+                // budget already spent becomes `None`, so the failure reads as
+                // the refusal it is rather than as a timeout of no length.
+                connect_retry: connect_retry.and_then(|_| {
+                    let left =
+                        connect_deadline.saturating_duration_since(tokio::time::Instant::now());
+                    (!left.is_zero()).then_some(left)
+                }),
             },
         )
         .await
         .context("failed to connect to NATS")?;
         let data_nats_client = Arc::new(data_nats_client);
 
-        // Parse the CA bundles before anything pulls, and fail if any is
-        // invalid.
-        if !self.oci_ca_paths.is_empty() {
-            wash_runtime::oci::set_extra_ca_certificates(&self.oci_ca_paths)
-                .context("failed to load --oci-ca-path CA certificates")?;
-        }
-
         let host_config = wash_runtime::host::HostConfig {
             allow_oci_insecure: self.allow_insecure_registries,
             allow_outbound_http_insecure: self.allow_outbound_http_insecure,
             oci_pull_timeout: Some(self.registry_pull_timeout),
             oci_cache_dir: self.oci_cache_dir.clone(),
+            oci_ca_paths: self.oci_ca_paths.clone(),
         };
+
+        // The host applies these itself when it is built, but host component
+        // plugins are pulled before that. Install them here too — the same
+        // bundles a second time are a no-op — and fail now if any is invalid.
+        wash_runtime::oci::set_extra_ca_certificates(&host_config.oci_ca_paths)
+            .context("failed to load --oci-ca-path CA certificates")?;
+
+        // Before any ceiling below is derived: each is a share of the soft
+        // descriptor limit, and this is what that limit ends up being.
+        match wash_runtime::host::quota::raise_descriptor_limit() {
+            Some(limit) => tracing::debug!(descriptors = limit, "descriptor limit"),
+            None => tracing::debug!("descriptor limit is not known on this platform"),
+        }
 
         let mut engine_builder = Engine::builder()
             .with_pooling_allocator(true)
-            .with_fuel_consumption(ctx.enable_meters());
+            .with_fuel_consumption(ctx.meters().consumes_fuel());
         for proposal in &self.wasm_proposals {
             engine_builder = engine_builder.with_wasm_proposal(*proposal);
         }
@@ -467,6 +743,8 @@ impl CliCommand for HostCommand {
             ..Default::default()
         });
         engine_builder = engine_builder.with_socket_policy(Arc::clone(&socket_policy));
+        engine_builder = engine_builder.with_host_memory(host_memory);
+        engine_builder = engine_builder.with_guest_memory_mode(self.guest_memory_mode.into());
 
         let engine = engine_builder.build()?;
 
@@ -483,6 +761,42 @@ impl CliCommand for HostCommand {
             self.wasmcloud_messaging_max_in_flight_per_component,
             engine.total_core_instances(),
         )?;
+
+        if let Some(value) = &self.removed_wasmcloud_nats_workload_config {
+            anyhow::bail!(
+                "`--wasmcloud-nats-workload-config` (WASH_WASMCLOUD_NATS_WORKLOAD_CONFIG) has \
+                 been removed. Set `workloadConfig: {value}` on the `host.plugins` entry with \
+                 `id: wasmcloud-nats` instead, where it applies to that plugin's bindings alone"
+            )
+        }
+
+        // Resolved before anything is built: a binding an operator declared
+        // wrong is a typo in the host's config file, and the workload that
+        // later asks for it is not the thing at fault.
+        let plugin_bindings = self.plugin_bindings(&config, project_dir)?;
+        // Stated at startup because it decides what every workload on the
+        // plugin can reach, and the default declines to take a manifest's word
+        // for it. `warn` is called out rather than merely reported: it enforces
+        // nothing, so an operator who set it and forgot has no protection.
+        for id in plugin_bindings.plugin_ids() {
+            let declared = plugin_bindings.for_plugin(id);
+            let policy = declared.workload_config();
+            let names = declared.binding_names().collect::<Vec<_>>().join(",");
+            if policy == wash_runtime::plugin::WorkloadConfigPolicy::Warn {
+                tracing::warn!(
+                    plugin_id = id,
+                    bindings = names,
+                    "workloadConfig is `warn`: nothing is refused, only reported"
+                );
+            } else {
+                info!(
+                    plugin_id = id,
+                    workload_config = policy.as_str(),
+                    bindings = names,
+                    "plugin bindings resolved (see host.plugins)"
+                );
+            }
+        }
 
         let mut cluster_host_builder = wash_runtime::washlet::ClusterHostBuilder::default()
             .with_engine(engine.clone())
@@ -514,7 +828,25 @@ impl CliCommand for HostCommand {
             .with_plugin(Arc::new(plugin::wasi_keyvalue::NatsKeyValue::new(
                 &data_nats_client,
             )))?
-            .with_meters(Meters::new(ctx.enable_meters()));
+            // Opens its own per-workload connections rather than borrowing the
+            // host's client, and denies the host's control subjects to every
+            // workload. What each binding *is* — its servers, its credentials,
+            // and its grants — comes from the host's own declaration, so a
+            // workload asks for a capability by name and cannot widen one.
+            .with_plugin(Arc::new(
+                plugin::wasmcloud_nats::WasmcloudNats::new()
+                    // A subscription's byte budget is per subscription and
+                    // this host's memory is not. Without the budget the plugin
+                    // cannot tell whether the subscriptions it is about to
+                    // start fit, and the first sign of the mismatch is an
+                    // OOMKill.
+                    .with_memory_budget(host_memory.max_guest_memory)
+                    .with_lattice_prefixes(vec![
+                        format!("{}.", wash_runtime::washlet::HOST_API_PREFIX),
+                        format!("{}.", wash_runtime::washlet::OPERATOR_API_PREFIX),
+                    ]),
+            ))?
+            .with_meters(Meters::new(ctx.meters()));
 
         #[cfg(feature = "wasm_component_model_implements")]
         {
@@ -588,10 +920,25 @@ impl CliCommand for HostCommand {
             cluster_host_builder = cluster_host_builder.with_environment(environment);
         }
 
+        if let Some(starts) = self.max_concurrent_starts {
+            cluster_host_builder = cluster_host_builder.with_max_concurrent_starts(starts);
+        }
+
+        // Sized off the interval this host will actually heartbeat on, not off a
+        // number restated here: the bound decides when a host is restarted, and
+        // it has to move if the interval does.
+        let liveness = wash_runtime::host::probes::Liveness::new(
+            wash_runtime::washlet::liveness_silence(cluster_host_builder.heartbeat_interval()),
+        );
+        cluster_host_builder = cluster_host_builder.with_liveness(Arc::clone(&liveness));
+
         // One publishing context for the whole host: workloads and plugins
         // reserve from the same table, so a collision between them is a start
         // failure naming both rather than two listeners that each think they
         // own the address.
+        // Taken while the ingress is built, so the probe listener below can
+        // report a full ingress as a reason to stop being sent work.
+        let mut ingress_connections = None;
         if let Some(addr) = self.http_addr {
             let http_router = wash_runtime::host::http::DynamicRouter::default();
 
@@ -614,6 +961,9 @@ impl CliCommand for HostCommand {
             let mut ingress_builder = wash_runtime::host::http::Ingress::builder(http_router, addr)
                 .outgoing_handler(outgoing_handler)
                 .allow_outbound_http_insecure(self.allow_outbound_http_insecure);
+            if let Some(max) = self.max_http_ingress_connections {
+                ingress_builder = ingress_builder.max_connections(max);
+            }
             if let (Some(cert_path), Some(key_path)) = (&self.tls_cert_path, &self.tls_key_path) {
                 let mut tls = wash_runtime::host::http::TlsConfig::new(cert_path, key_path);
                 if let Some(ca) = self.tls_ca_path.as_deref() {
@@ -622,6 +972,7 @@ impl CliCommand for HostCommand {
                 ingress_builder = ingress_builder.tls(tls);
             }
             let ingress = ingress_builder.build().await?;
+            ingress_connections = Some(ingress.connection_limit());
             cluster_host_builder = cluster_host_builder.with_http_handler(Arc::new(ingress));
         }
 
@@ -673,10 +1024,10 @@ impl CliCommand for HostCommand {
             // still add one ad hoc via `--host-plugin` without duplicating
             // the rest.
             let mut specs: Vec<wash_runtime::plugin::ComponentPluginSpec> = Vec::new();
-            for hp in &config.host().host_plugins {
+            for hp in config.host().component_plugins()? {
                 specs.push(
                     hp.to_spec(&config, project_dir, Some(project_dir))
-                        .with_context(|| format!("failed to resolve host_plugins '{}'", hp.id))?,
+                        .with_context(|| format!("failed to resolve host.plugins '{}'", hp.id))?,
                 );
             }
             specs.extend(self.host_plugins.iter().cloned());
@@ -687,7 +1038,7 @@ impl CliCommand for HostCommand {
                     &engine,
                     plugin_oci_config.clone(),
                     &native_plugins,
-                    http_handler.clone(),
+                    http_handler.as_ref().map(Arc::downgrade),
                     Some(Arc::clone(&socket_policy)),
                 )
                 .await
@@ -698,30 +1049,335 @@ impl CliCommand for HostCommand {
         }
         #[cfg(not(feature = "host-component-plugins"))]
         anyhow::ensure!(
-            self.host_plugins.is_empty() && config.host().host_plugins.is_empty(),
-            "--host-plugin/WASH_HOST_PLUGINS/host.hostPlugins requires a wash build with the \
-             `host-component-plugins` feature"
+            self.host_plugins.is_empty() && config.host().component_plugins()?.is_empty(),
+            "--host-plugin/WASH_HOST_PLUGINS and a `host.plugins` entry with a `file`/`image` \
+             require a wash build with the `host-component-plugins` feature"
         );
+
+        // After every plugin is registered — including the component plugins
+        // above — so `build()` can refuse a declaration naming an id this host
+        // has no plugin for.
+        cluster_host_builder = cluster_host_builder.with_plugin_bindings(plugin_bindings);
 
         let cluster_host = cluster_host_builder
             .build()
             .context("failed to build cluster host")?;
+
+        // The host is about to start taking work, so from here a signal runs
+        // the shutdown below rather than ending the process.
+        let shutdown = shutdown.ready();
+
+        let probe = self.probe_addr.map(|addr| {
+            let mut state =
+                wash_runtime::host::probes::ProbeState::default().with_liveness(liveness);
+            // Cloned, not moved: the ingress is also what this command watches
+            // for an accept loop that ends on its own, below.
+            if let Some(connections) = ingress_connections.clone() {
+                state = state.with_readiness(Arc::new(connections));
+            }
+            (addr, state)
+        });
+        let (probe_stop, probe_stopped) = tokio::sync::oneshot::channel::<()>();
+        let probe_state = probe.as_ref().map(|(_, state)| state.clone());
+        if let Some((addr, state)) = probe {
+            // Bound here rather than inside the task: a port already taken
+            // leaves every probe failing, and a pod restart-looping for a
+            // reason buried in startup output is worse than not starting.
+            let listener = wash_runtime::host::probes::bind(addr).await?;
+            tokio::spawn(async move {
+                let stop = async {
+                    let _ = probe_stopped.await;
+                };
+                wash_runtime::host::probes::serve(listener, state, stop).await;
+            });
+        }
+
         let host_cleanup = wash_runtime::washlet::run_cluster_host(cluster_host)
             .await
             .context("failed to start cluster node")?;
 
-        tokio::signal::ctrl_c()
-            .await
-            .context("failed to listen for shutdown signal")?;
+        // Only now: the listener has been answering `/readyz` with "starting"
+        // since it bound, because until this returns the host has no
+        // subscription and no workloads, and a pod that joins the Service in
+        // that window is sent traffic nothing is behind.
+        if let Some(state) = &probe_state {
+            state.started();
+        }
+
+        // A signal is not the only way this ends. An ingress accept loop that
+        // returns stops the host from under this — every workload unbound —
+        // and waiting for a signal that is never coming would leave a live
+        // process holding nothing and serving nothing. `host_cleanup` cannot be
+        // raced here instead: awaiting it is what *asks* for the shutdown.
+        let ingress_stopped = async {
+            match &ingress_connections {
+                Some(connections) => connections.stopped().await,
+                None => std::future::pending().await,
+            }
+        };
+        let stopped_itself = tokio::select! {
+            () = shutdown => false,
+            () = ingress_stopped => {
+                tracing::error!("HTTP ingress stopped accepting connections; stopping the host");
+                true
+            }
+        };
+
+        // Reported before the wait, not after: the point of the wait is that
+        // the host is still serving while everything upstream learns it is
+        // going away.
+        if let Some(state) = &probe_state {
+            state.drain();
+        }
+        // Nothing to keep serving while the endpoint is withdrawn: the ingress
+        // that would have served it is the thing that died, and the host has
+        // already stopped itself.
+        if !stopped_itself && !self.drain_delay.is_zero() {
+            info!(delay = ?self.drain_delay, "Draining...");
+            tokio::time::sleep(self.drain_delay).await;
+        }
 
         info!("Stopping host...");
 
         host_cleanup.await?;
+        let _ = probe_stop.send(());
 
         Ok(CommandOutput::ok(
             "Host exited successfully".to_string(),
             None,
         ))
+    }
+}
+
+#[cfg(test)]
+mod nats_tests {
+    use clap::Parser;
+
+    use super::HostCommand;
+    use wash_runtime::plugin::{WorkloadConfigPolicy, bindings::never_narrows, wasmcloud_nats};
+
+    /// `HostCommand` is an `Args` group, so give it a `Parser` to parse under.
+    #[derive(Debug, Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        host: HostCommand,
+    }
+
+    fn parse(args: &[&str]) -> HostCommand {
+        TestCli::parse_from(std::iter::once("wash-host").chain(args.iter().copied())).host
+    }
+
+    fn config_from(yaml: &str) -> crate::config::Config {
+        serde_yaml_ng::from_str(yaml).expect("config must parse")
+    }
+
+    fn nats_bindings(
+        host: &HostCommand,
+        config: &crate::config::Config,
+    ) -> anyhow::Result<wash_runtime::plugin::PluginBindingSet> {
+        Ok(host
+            .plugin_bindings(config, std::path::Path::new("."))?
+            .for_plugin(wasmcloud_nats::PLUGIN_NATS_ID)
+            .clone())
+    }
+
+    fn resolve(
+        declared: &wash_runtime::plugin::PluginBindingSet,
+        binding: &str,
+        workload: &[(&str, &str)],
+    ) -> anyhow::Result<std::collections::HashMap<String, String>> {
+        declared.resolve(
+            binding,
+            &workload
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+            &wasmcloud_nats::binding_schema(),
+            never_narrows(),
+        )
+    }
+
+    /// Restored with the mechanism: `--wasmcloud-nats-url` is now an anchored
+    /// default bundle rather than a seeded `servers`, so it has to still beat
+    /// the data plane at resolve time.
+    #[test]
+    fn the_address_flag_overrides_the_data_plane() {
+        let host = parse(&[
+            "--data-nats-url",
+            "nats://data:4222",
+            "--wasmcloud-nats-url",
+            "nats://workloads:4222",
+        ]);
+        let declared = nats_bindings(&host, &config_from("{}")).unwrap();
+        let resolved = resolve(&declared, "", &[]).unwrap();
+        assert_eq!(
+            resolved.get("servers").map(String::as_str),
+            Some("nats://workloads:4222")
+        );
+    }
+
+    /// With no `host.plugins` entry a host denies by default — and, owning
+    /// nothing an operator declared, refuses nothing a manifest writes.
+    #[test]
+    fn workload_config_defaults_to_deny() {
+        let declared = nats_bindings(&parse(&[]), &config_from("{}")).unwrap();
+        assert_eq!(declared.workload_config(), WorkloadConfigPolicy::Deny);
+    }
+
+    /// A binding that names no servers falls back to the data plane, so a
+    /// workload on the cluster's own NATS needs no address.
+    #[test]
+    fn the_address_falls_back_to_the_data_plane() {
+        let host = parse(&["--data-nats-url", "nats://data:4222"]);
+        let declared = nats_bindings(&host, &config_from("{}")).expect("the flags must resolve");
+        let resolved = resolve(&declared, "", &[]).unwrap();
+        assert_eq!(
+            resolved.get("servers").map(String::as_str),
+            Some("nats://data:4222")
+        );
+    }
+
+    /// The data plane's TLS material rides with its address as one bundle. A
+    /// binding pointed somewhere else takes neither — certs are only valid for
+    /// the address they were issued for.
+    #[test]
+    fn the_tls_material_travels_with_the_address_it_belongs_to() {
+        let host = parse(&[
+            "--data-nats-url",
+            "nats://data:4222",
+            "--data-nats-tls-ca",
+            "/certs/ca.crt",
+        ]);
+        let declared = nats_bindings(&host, &config_from("{}")).unwrap();
+
+        let inherited = resolve(&declared, "", &[]).unwrap();
+        assert_eq!(
+            inherited.get("tls-ca").map(String::as_str),
+            Some("/certs/ca.crt"),
+            "a binding on the data plane gets its certs"
+        );
+
+        // Evaluated at resolve time, so a workload naming its own address under
+        // `allow` skips the bundle too — not just an operator who declared one.
+        let elsewhere = resolve(
+            &declared
+                .clone()
+                .with_workload_config(WorkloadConfigPolicy::Allow),
+            "",
+            &[("servers", "nats://elsewhere:4222")],
+        )
+        .unwrap();
+        assert_eq!(
+            elsewhere.get("servers").map(String::as_str),
+            Some("nats://elsewhere:4222")
+        );
+        assert!(
+            !elsewhere.contains_key("tls-ca"),
+            "the data plane's certs say nothing about another NATS: {elsewhere:?}"
+        );
+    }
+
+    /// An operator's declaration reaches the binding, and `deny` refuses a
+    /// manifest that would point itself elsewhere.
+    #[test]
+    fn a_declared_binding_is_the_whole_allowlist() {
+        let config = config_from(
+            r#"
+host:
+  plugins:
+    - id: wasmcloud-nats
+      bindings:
+        orders:
+          config:
+            subject-allow: orders.processed
+"#,
+        );
+        let host = parse(&["--data-nats-url", "nats://data:4222"]);
+        let declared = nats_bindings(&host, &config).unwrap();
+
+        resolve(&declared, "orders", &[]).expect("a workload that only asks is served");
+        resolve(&declared, "orders", &[("servers", "nats://elsewhere:4222")])
+            .expect_err("but one that points itself at another cluster is not");
+    }
+
+    /// `allow` puts the host's declaration back under the manifest instead of
+    /// around it. It is written on the entry now, not on a flag.
+    #[test]
+    fn allow_lets_a_manifest_describe_its_own_binding() {
+        let config = config_from(
+            r#"
+host:
+  plugins:
+    - id: wasmcloud-nats
+      workloadConfig: allow
+"#,
+        );
+        let host = parse(&["--data-nats-url", "nats://data:4222"]);
+        let declared = nats_bindings(&host, &config).unwrap();
+
+        let resolved = resolve(&declared, "", &[("subject-allow", "orders.>")])
+            .expect("allow accepts a workload's own grant");
+        assert_eq!(
+            resolved.get("subject-allow").map(String::as_str),
+            Some("orders.>")
+        );
+    }
+
+    /// An unparseable policy is a config error, named as one.
+    #[test]
+    fn the_workload_config_value_is_typed() {
+        serde_yaml_ng::from_str::<crate::config::Config>(
+            "host:\n  plugins:\n    - id: wasmcloud-nats\n      workloadConfig: sometimes\n",
+        )
+        .expect_err("`sometimes` is not a policy");
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use std::time::Duration;
+
+    use clap::Parser;
+
+    use super::HostCommand;
+
+    #[derive(Debug, Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        host: HostCommand,
+    }
+
+    fn parse(args: &[&str]) -> HostCommand {
+        TestCli::parse_from(std::iter::once("wash-host").chain(args.iter().copied())).host
+    }
+
+    /// The chart renders this in whole seconds with a unit suffix. It has to
+    /// parse as written there.
+    #[test]
+    fn the_chart_spelling_of_the_drain_delay_parses() {
+        assert_eq!(
+            parse(&["--drain-delay=15s"]).drain_delay,
+            Duration::from_secs(15)
+        );
+    }
+
+    /// Nothing is watching a host outside Kubernetes, and the wait would only
+    /// be a person's Ctrl-C taking longer.
+    #[test]
+    fn no_one_waits_for_a_drain_by_default() {
+        assert!(parse(&[]).drain_delay.is_zero());
+    }
+
+    /// The wait is not conditional on the probe listener: a host behind
+    /// something that health-checks it by other means still has traffic to stop
+    /// arriving, and a flag that parsed and then did nothing would say nothing
+    /// about it.
+    #[test]
+    fn a_drain_delay_stands_on_its_own() {
+        assert_eq!(
+            parse(&["--drain-delay=30s"]).drain_delay,
+            Duration::from_secs(30)
+        );
     }
 }
 
@@ -748,6 +1404,41 @@ mod tests {
         // credentials — never a basic auth with an empty half.
         assert_eq!(host_plugin_registry_credentials(Some("user"), None), None);
         assert_eq!(host_plugin_registry_credentials(None, Some("pass")), None);
+    }
+}
+
+/// CLI spelling of [`wash_runtime::engine::guest_memory::GuestMemoryMode`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GuestMemoryMode {
+    /// Charge and report guest memory growth; allow it either way.
+    #[default]
+    Count,
+    /// Refuse guest memory growth past `--max-guest-memory`.
+    Enforce,
+}
+
+/// [`GuestMemoryMode`] from a flag or environment value, reading a blank one
+/// as unset.
+fn parse_guest_memory_mode(raw: &str) -> Result<GuestMemoryMode, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(GuestMemoryMode::default());
+    }
+    match raw.to_ascii_lowercase().as_str() {
+        "count" => Ok(GuestMemoryMode::Count),
+        "enforce" => Ok(GuestMemoryMode::Enforce),
+        _ => Err(format!(
+            "invalid guest-memory-mode {raw:?}; expected 'count' or 'enforce'"
+        )),
+    }
+}
+
+impl From<GuestMemoryMode> for wash_runtime::engine::guest_memory::GuestMemoryMode {
+    fn from(mode: GuestMemoryMode) -> Self {
+        match mode {
+            GuestMemoryMode::Count => Self::Count,
+            GuestMemoryMode::Enforce => Self::Enforce,
+        }
     }
 }
 

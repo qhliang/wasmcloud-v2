@@ -176,7 +176,7 @@ impl<'a> bindings::custom::wechat::sender::HostWechatClient for ActiveCtx<'a> {
         let handle = self.table.get(&client)?;
 
         let qr_api = handle.client.qr_login();
-        match qr_api.start(None).await {
+        match qr_api.start(None, &[]).await {
             Ok(session) => {
                 let json = serde_json::json!({
                     "qrcode": session.qrcode,
@@ -215,7 +215,7 @@ impl<'a> bindings::custom::wechat::sender::HostWechatClient for ActiveCtx<'a> {
         };
 
         let qr_api = handle.client.qr_login();
-        match qr_api.poll_status(&session).await {
+        match qr_api.poll_status(&session, None).await {
             Ok(status) => {
                 let json = match status {
                     weixin_agent::LoginStatus::Wait => {
@@ -244,6 +244,19 @@ impl<'a> bindings::custom::wechat::sender::HostWechatClient for ActiveCtx<'a> {
                     weixin_agent::LoginStatus::Expired => {
                         serde_json::json!({"status": "expired"})
                     }
+                    // weixin-agent 0.3.0 新增状态：
+                    weixin_agent::LoginStatus::NeedVerifyCode => {
+                        serde_json::json!({"status": "need_verify_code"})
+                    }
+                    weixin_agent::LoginStatus::VerifyCodeBlocked => {
+                        serde_json::json!({"status": "verify_code_blocked"})
+                    }
+                    weixin_agent::LoginStatus::BindedRedirect => {
+                        serde_json::json!({"status": "binded_redirect"})
+                    }
+                    // `LoginStatus` 标注了 #[non_exhaustive]：上游再加状态时
+                    // 这里退化为 unknown，前端按既有状态机忽略即可。
+                    _ => serde_json::json!({"status": "unknown"}),
                 };
                 Ok(Ok(json.to_string()))
             }

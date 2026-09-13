@@ -28,7 +28,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         with:
           filters: |
@@ -170,6 +170,10 @@ jobs:
           SKIP_IMAGE_BUILD: "true"
           PROMETHEUS_INSTALL_SKIP: "true"
           CERT_MANAGER_INSTALL_SKIP: "true"
+          # The runner takes the cluster with it, so the suite's teardown has
+          # nothing to leave clean for. It also empties the namespace before the
+          # diagnostics below can read it.
+          E2E_SKIP_TEARDOWN: "true"
           KIND_CLUSTER_NAME: wasmcloud-e2e
       - name: Dump diagnostics
         if: failure()

@@ -65,7 +65,7 @@
 //! workload a call goes to, and the fallback that sends an unaddressed call back
 //! to the workload whose capability call is being served.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -95,6 +95,7 @@ use crate::host::trigger_service::{
     decode_bind_reply,
 };
 use crate::oci::OciConfig;
+use crate::plugin::binding_of;
 use crate::plugin::component_plugin_spec::ComponentPluginSpec;
 use crate::plugin::{HostPlugin, WitInterfaces};
 use crate::sockets::loopback;
@@ -286,7 +287,10 @@ pub struct ComponentHostPlugin {
     /// handler a workload's outgoing calls use. `None` traps every call with
     /// "http client not available", matching today's behavior for a plugin
     /// that imports `wasi:http/outgoing-handler` with no handler configured.
-    http_handler: Option<Arc<dyn crate::host::http::HostHandler>>,
+    ///
+    /// Weak — a bound plugin is reached from every workload that binds it, and
+    /// the ingress holds those. See [`crate::host::http::live_handler`].
+    http_handler: Option<std::sync::Weak<dyn crate::host::http::HostHandler>>,
     max_restarts: u32,
     /// Ports this plugin declared, as the operator wrote them.
     /// The subset of `ports` this plugin binds for real itself, precomputed for
@@ -342,7 +346,7 @@ impl ComponentHostPlugin {
         #[builder(default)] allowed_ip_name_lookups: Arc<
             [crate::host::allowed_ip_name::AllowedIpName],
         >,
-        http_handler: Option<Arc<dyn crate::host::http::HostHandler>>,
+        http_handler: Option<std::sync::Weak<dyn crate::host::http::HostHandler>>,
         #[builder(default)] ports: Arc<[crate::host::declared_port::DeclaredPort]>,
         socket_policy: Option<Arc<crate::sockets::policy::SocketPolicy>>,
     ) -> anyhow::Result<Self> {
@@ -517,13 +521,24 @@ impl ComponentHostPlugin {
         // here that it really exports it: an item that imports it instead has
         // nobody to serve it, and would otherwise fail later as an unresolved
         // wasmtime import with no mention of this plugin.
+        // The item's own world says what it imports and under which name; the
+        // matched entries say which bindings the workload declared. Both are
+        // needed below, and the world is a recompute, so read it once.
+        let world = item.world();
         for called in self.state.workload_calls.imports() {
             let iface_names: Vec<&str> = called.wit.interfaces.iter().map(String::as_str).collect();
             if !interfaces.contains(&called.wit.namespace, &called.wit.package, &iface_names) {
                 continue;
             }
+            // An entry naming its package alone matches every interface in it,
+            // this one included, so an item may be here without touching the
+            // interface at all. Only an item that does has anything to answer
+            // for below.
+            if !world.uses(&called.wit) {
+                continue;
+            }
             anyhow::ensure!(
-                item.world()
+                world
                     .exports
                     .iter()
                     .any(|exported| exported.contains(&called.wit)),
@@ -541,13 +556,109 @@ impl ComponentHostPlugin {
             let iface_names: Vec<&str> =
                 exported.wit.interfaces.iter().map(String::as_str).collect();
             // Only wire interfaces this workload was actually matched on.
-            if !interfaces.contains(&exported.wit.namespace, &exported.wit.package, &iface_names) {
+            let entries =
+                interfaces.matching(&exported.wit.namespace, &exported.wit.package, &iface_names);
+            if entries.is_empty() {
                 continue;
             }
-            add_capabilities_to_linker(linker, &self.state, exported)?;
-            debug!(id = self.id, interface = %exported.name, "wired host component capability");
+            let declared: BTreeSet<Option<&str>> = entries
+                .iter()
+                .map(|entry| binding_of(self.id, entry.name.as_deref()))
+                .collect();
+            for label in import_labels(&world, &exported.wit) {
+                // The binding a call through this import carries: the matched
+                // entry of the same shape. A labeled import needs an entry
+                // naming its label and a plain import needs the unnamed entry.
+                // A named entry says nothing about a plain import — the host
+                // cannot vouch for a binding the component never asked for by
+                // name — so a mismatch is refused here rather than bound
+                // unnamed or left as an unresolved import.
+                let binding = match binding_of(self.id, label.as_deref()) {
+                    Some(name) if declared.contains(&Some(name)) => Some(name),
+                    Some(name) => anyhow::bail!(
+                        "component '{}' imports {} under label `{name}`, but no {}:{} entry of \
+                         workload '{}' names it; add an entry with `name: {name}` (host \
+                         component plugin '{}')",
+                        item.id(),
+                        exported.name,
+                        exported.wit.namespace,
+                        exported.wit.package,
+                        item.workload_id(),
+                        self.id,
+                    ),
+                    None if declared.contains(&None) => None,
+                    None => anyhow::bail!(
+                        "component '{}' imports {} plainly, but every {}:{} entry of workload \
+                         '{}' is named ({}); import it under one of those labels or add an \
+                         unnamed entry (host component plugin '{}')",
+                        item.id(),
+                        exported.name,
+                        exported.wit.namespace,
+                        exported.wit.package,
+                        item.workload_id(),
+                        declared
+                            .iter()
+                            .flatten()
+                            .copied()
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        self.id,
+                    ),
+                }
+                .map(Arc::<str>::from);
+                add_capabilities_to_linker(
+                    linker,
+                    &self.state,
+                    exported,
+                    label.as_deref(),
+                    binding.clone(),
+                )?;
+                debug!(
+                    id = self.id,
+                    interface = %exported.name,
+                    instance = label.as_deref().unwrap_or(&exported.name),
+                    binding = binding.as_deref().unwrap_or("<unnamed>"),
+                    "wired host component capability"
+                );
+            }
         }
         Ok(())
+    }
+}
+
+/// The names a component imports `exported` under: `None` for a plain import
+/// and each distinct `(implements ..)` label, unnamed first. From the
+/// component's own world, because that is what has to be defined on its
+/// linker; the manifest's entries say which of them are bindings.
+///
+/// Versions are matched the way wasmtime's linker matches them — same major,
+/// and same minor below 1.0 — since the plain instance is defined under the
+/// plugin's own version and resolved by that rule.
+fn import_labels(world: &WitWorld, exported: &WitInterface) -> BTreeSet<Option<Arc<str>>> {
+    world
+        .imports
+        .iter()
+        .filter(|imported| {
+            imported.namespace == exported.namespace
+                && imported.package == exported.package
+                && versions_compatible(imported.version.as_ref(), exported.version.as_ref())
+                && exported
+                    .interfaces
+                    .iter()
+                    .any(|name| imported.interfaces.contains(name))
+        })
+        .map(|imported| imported.name.as_deref().map(Arc::from))
+        .collect()
+}
+
+/// Whether two interface versions resolve to one another under the component
+/// model's semver rule; an unversioned side matches anything.
+fn versions_compatible(a: Option<&semver::Version>, b: Option<&semver::Version>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            a.major == b.major && (a.major != 0 || a.minor == b.minor) && a.pre == b.pre
+        }
+        _ => true,
     }
 }
 
@@ -590,7 +701,7 @@ pub async fn load_component_plugin(
     engine: &Engine,
     oci_config: OciConfig,
     native_plugins: &HashMap<&'static str, Arc<dyn HostPlugin>>,
-    http_handler: Option<Arc<dyn crate::host::http::HostHandler>>,
+    http_handler: Option<std::sync::Weak<dyn crate::host::http::HostHandler>>,
     socket_policy: Option<Arc<crate::sockets::policy::SocketPolicy>>,
 ) -> anyhow::Result<Arc<ComponentHostPlugin>> {
     let loaded = spec
@@ -637,6 +748,14 @@ impl HostPlugin for ComponentHostPlugin {
 
     fn world(&self) -> WitWorld {
         self.world.clone()
+    }
+
+    /// Never: one store answers a labeled and an unlabeled import alike, so
+    /// declaring a binding must not hand the plain imports this plugin already
+    /// served to a single-backend native. Which labels route here is the
+    /// operator's `host.plugins` declaration, read by the engine.
+    fn defers_unnamed_instances(&self) -> bool {
+        false
     }
 
     fn set_workload_failure_sink(&self, sink: crate::plugin::WorkloadFailureSink) {
@@ -722,7 +841,7 @@ impl HostPlugin for ComponentHostPlugin {
         // reached the guest (tokio's bounded send does not enqueue a dropped
         // send), so no hook is running — forget the workload and fail, no
         // unbind needed.
-        let reply_rx = match send_lifecycle_job(
+        let (reply_rx, call) = match send_lifecycle_job(
             &sender_arc,
             &self.state,
             lifecycle,
@@ -732,7 +851,7 @@ impl HostPlugin for ComponentHostPlugin {
         )
         .await
         {
-            Ok(reply_rx) => reply_rx,
+            Ok(sent) => sent,
             Err(e) => {
                 self.state.forget_workload(&workload_id);
                 return Err(e.context(format!(
@@ -748,7 +867,7 @@ impl HostPlugin for ComponentHostPlugin {
         // hook actually returns — guaranteeing bind-then-unbind ordering so
         // whatever it provisions late is still reclaimed (see
         // [`spawn_deferred_unbind`]).
-        let failure = match await_bind_reply(reply_rx, &self.state).await {
+        let failure = match await_bind_reply(reply_rx, call, &self.state).await {
             BindReply::Completed(Ok(results)) => match decode_bind_reply(&results) {
                 Ok(Ok(())) => {
                     debug!(id = self.id, %workload_id, "workload bound to host component plugin");
@@ -1006,8 +1125,11 @@ async fn link_native_imports(
 
     let mut synthetic =
         UnresolvedWorkload::new(id, id, id, None, [plugin_component], native_imports);
+    // No operator bindings: a plugin's own native imports are configured by the
+    // plugin entry's `config`, delivered through `on-workload-bind`, not by a
+    // workload naming a binding.
     synthetic
-        .bind_plugins(native_plugins)
+        .bind_plugins(native_plugins, &crate::plugin::PluginBindings::new())
         .await
         .with_context(|| {
             format!("failed to resolve native capability imports for plugin '{id}'")
@@ -1202,13 +1324,24 @@ async fn build_plugin_linker(
 
     let mut linked = std::collections::HashSet::new();
     for imported in introspect_imports(component)? {
-        if exports.iter().any(|e| e.name == imported.name) {
-            add_capabilities_to_linker(&mut linker, state, &imported).with_context(|| {
-                format!(
-                    "failed to wire self-import {} on plugin '{id}'",
-                    imported.name
-                )
-            })?;
+        // A self-import, plain or under a label, is the plugin calling its own
+        // capability: it carries no binding, and routes to the export by the
+        // export's name whatever the import is called.
+        let own = exports.iter().find(|e| {
+            e.wit.same_package(&imported.wit)
+                && e.wit
+                    .interfaces
+                    .iter()
+                    .any(|i| imported.wit.interfaces.contains(i))
+        });
+        if let Some(own) = own {
+            add_capabilities_to_linker(&mut linker, state, own, imported.wit.name.as_deref(), None)
+                .with_context(|| {
+                    format!(
+                        "failed to wire self-import {} on plugin '{id}'",
+                        imported.name
+                    )
+                })?;
             linked.insert(Arc::clone(&imported.name));
         }
     }
@@ -1316,6 +1449,25 @@ fn install_host_identity(
             },
         )
         .map_err(|e| e.context("failed to define wasmcloud:host/identity#get-component-id"))?;
+    let binding_state = Arc::clone(state);
+    instance
+        .func_new(
+            "get-binding-name",
+            move |mut store, _ty, _params, results| {
+                let root = caller_root_task(&mut store);
+                // `option<string>`: a plain import genuinely has no binding,
+                // and that is the common case rather than a degradation.
+                let binding = root
+                    .and_then(|task| binding_state.registry()?.caller_for_task(task))
+                    .and_then(|c| c.binding)
+                    .map(|name| Box::new(Val::String(name.to_string())));
+                if let Some(slot) = results.first_mut() {
+                    *slot = Val::Option(binding);
+                }
+                Ok(())
+            },
+        )
+        .map_err(|e| e.context("failed to define wasmcloud:host/identity#get-binding-name"))?;
     Ok(())
 }
 
@@ -1399,14 +1551,23 @@ fn install_host_cancel(
 /// plugin's persistent store via the channel held by `state`. Used on a
 /// workload's linker ([`ComponentHostPlugin::on_workload_item_bind`]) and on the
 /// plugin's own linker for self-imports ([`build_plugin_linker`]).
+///
+/// `label` is the `(implements ..)` name the caller imports the interface
+/// under, if any: the component model names such an import by its label, so
+/// that is the linker instance defined, and `iface.name` otherwise. `binding`
+/// rides along on every routed call for `wasmcloud:host/identity#get-binding-name`.
+/// The plugin's own instance is always addressed by `iface.name`.
 fn add_capabilities_to_linker(
     linker: &mut Linker<SharedCtx>,
     state: &Arc<ComponentHostPluginState>,
     iface: &ExportedInterface,
+    label: Option<&str>,
+    binding: Option<Arc<str>>,
 ) -> anyhow::Result<()> {
+    let instance_name = label.unwrap_or(&iface.name);
     let mut linker_instance = linker
-        .instance(&iface.name)
-        .map_err(|e| e.context(format!("failed to open linker instance {}", iface.name)))?;
+        .instance(instance_name)
+        .map_err(|e| e.context(format!("failed to open linker instance {instance_name}")))?;
 
     // Register each resource the interface defines as a cross-store proxy. A
     // caller holds an opaque proxy; dropping it here routes a drop of the real
@@ -1425,8 +1586,7 @@ fn add_capabilities_to_linker(
             )
             .map_err(|e| {
                 e.context(format!(
-                    "failed to register proxied resource {}/{}",
-                    iface.name, resource
+                    "failed to register proxied resource {instance_name}/{resource}"
                 ))
             })?;
     }
@@ -1434,6 +1594,7 @@ fn add_capabilities_to_linker(
     for func in &iface.funcs {
         let state = Arc::clone(state);
         let interface = Arc::clone(&iface.name);
+        let call_binding = binding.clone();
         let func_name = Arc::clone(&func.name);
         let param_tys = Arc::clone(&func.param_tys);
         let result_tys = Arc::clone(&func.result_tys);
@@ -1444,13 +1605,14 @@ fn add_capabilities_to_linker(
                 move |accessor, _func_ty, params: &[Val], results: &mut [Val]| {
                     let state = Arc::clone(&state);
                     let interface = Arc::clone(&interface);
+                    let binding = call_binding.clone();
                     let func = Arc::clone(&func_name);
                     let param_tys = Arc::clone(&param_tys);
                     let result_tys = Arc::clone(&result_tys);
                     Box::pin(async move {
                         route_capability_call(
-                            accessor, &state, interface, func, params, &param_tys, result_tys,
-                            results,
+                            accessor, &state, interface, binding, func, params, &param_tys,
+                            result_tys, results,
                         )
                         .await
                     })
@@ -1458,8 +1620,8 @@ fn add_capabilities_to_linker(
             )
             .map_err(|e| {
                 e.context(format!(
-                    "failed to install capability shim for {}/{}",
-                    iface.name, func.name
+                    "failed to install capability shim for {instance_name}/{}",
+                    func.name
                 ))
             })?;
     }
@@ -1510,6 +1672,7 @@ async fn route_capability_call(
     accessor: &Accessor<SharedCtx>,
     state: &ComponentHostPluginState,
     interface: Arc<str>,
+    binding: Option<Arc<str>>,
     func: Arc<str>,
     params: &[Val],
     param_tys: &[Type],
@@ -1529,6 +1692,9 @@ async fn route_capability_call(
                 CallerIdentity {
                     workload_id: Arc::clone(&ctx.workload_id),
                     component_id: Some(Arc::clone(&ctx.component_id)),
+                    // Fixed when the shim was installed, not read from the
+                    // call, so nothing the guest passes can influence it.
+                    binding,
                 }
             };
             let mut dones = Vec::new();
@@ -1550,6 +1716,14 @@ async fn route_capability_call(
     })?;
 
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    // Deadline enforced here, in the calling workload's task, outside the
+    // plugin's store (see `crate::engine::abandon`). The plugin store is
+    // `WarnThenTrap`: an abandoned call is logged at the grace and only traps
+    // the shared store at the escalation.
+    let call = crate::engine::abandon::DispatchedCall::new(
+        "capability (plugin)",
+        crate::timeouts::plugin_capability_call(),
+    );
     sender
         .send(CapabilityJob::Call(CapabilityCall {
             interface,
@@ -1558,15 +1732,25 @@ async fn route_capability_call(
             args,
             result_tys,
             reply: reply_tx,
+            abandoned: call.flag(),
         }))
         .await
         .map_err(|_| {
             wasmtime::format_err!("host component plugin '{}' channel closed", state.id)
         })?;
 
-    let produced = reply_rx.await.map_err(|_| {
-        wasmtime::format_err!("host component plugin '{}' dropped the reply", state.id)
-    })??;
+    let produced = call
+        .await_reply(reply_rx)
+        .await
+        .ok_or_else(|| {
+            wasmtime::format_err!(
+                "host component plugin '{}' produced no reply in time",
+                state.id
+            )
+        })?
+        .map_err(|_| {
+            wasmtime::format_err!("host component plugin '{}' dropped the reply", state.id)
+        })??;
 
     // Inject the relocated results into the caller store.
     accessor.with(|mut access| -> wasmtime::Result<()> {
@@ -1593,7 +1777,7 @@ async fn run_supervisor(
     mut rx: tokio::sync::mpsc::Receiver<CapabilityJob>,
     allowed_hosts: Arc<[crate::host::allowed_hosts::AllowedHost]>,
     allowed_ip_name_lookups: Arc<[crate::host::allowed_ip_name::AllowedIpName]>,
-    http_handler: Option<Arc<dyn crate::host::http::HostHandler>>,
+    http_handler: Option<std::sync::Weak<dyn crate::host::http::HostHandler>>,
     network: crate::host::ports::NetworkHandle,
     direct_binds: Arc<[crate::sockets::policy::DirectBind]>,
     socket_policy: Arc<crate::sockets::policy::SocketPolicy>,
@@ -1783,7 +1967,7 @@ fn build_plugin_store(
     native_plugins: &HashMap<&'static str, Arc<dyn HostPlugin>>,
     allowed_hosts: &Arc<[crate::host::allowed_hosts::AllowedHost]>,
     allowed_ip_name_lookups: &Arc<[crate::host::allowed_ip_name::AllowedIpName]>,
-    http_handler: Option<Arc<dyn crate::host::http::HostHandler>>,
+    http_handler: Option<std::sync::Weak<dyn crate::host::http::HostHandler>>,
     network: &crate::host::ports::NetworkHandle,
     direct_binds: &Arc<[crate::sockets::policy::DirectBind]>,
     socket_policy: &Arc<crate::sockets::policy::SocketPolicy>,
@@ -1828,13 +2012,37 @@ fn build_plugin_store(
         )
         .with_sockets(sockets_ctx)
         .with_allowed_hosts(Arc::clone(allowed_hosts));
-    if let Some(http_handler) = http_handler {
-        ctx_builder = ctx_builder.with_http_handler(http_handler);
+    // A store built after the host went away gets no handler, which its egress
+    // already reports; there is nothing left to send through.
+    if let Some(http_handler) = http_handler.as_ref().and_then(std::sync::Weak::upgrade) {
+        ctx_builder = ctx_builder.with_http_handler(&http_handler);
     }
     let ctx = ctx_builder.build();
     // The registry marks this as the plugin (real) side of the resource bridge
     // and keeps the resources it hands out across the boundary alive.
-    Store::new(engine.inner(), SharedCtx::new(ctx).with_resource_registry())
+    // A host component plugin is a guest too: its linear memory is charged to
+    // the same host-wide budget the workloads on this engine draw on.
+    let mut store = Store::new(
+        engine.inner(),
+        SharedCtx::new(ctx)
+            .with_resource_registry()
+            .with_guest_memory(engine.guest_memory()),
+    );
+    // The other half of the same requirement: on a fuel-metering engine a store
+    // starts with no fuel, and calling a guest without fuel traps. See
+    // `new_store_from_templates`, which does this for every workload store.
+    let _ = store.set_fuel(u64::MAX);
+    // Required, not optional: the engine enables `epoch_interruption`, and a
+    // store that never sets a deadline traps the moment it runs any guest code.
+    // `WarnThenTrap` because this one store serves every workload that imports
+    // the plugin's capability: an abandoned call gets a long runway to finish
+    // on its own before ending it costs every tenant a supervised restart.
+    crate::engine::abandon::arm_epoch_deadline(
+        &mut store,
+        crate::engine::abandon::AbandonedCallPolicy::WarnThenTrap,
+    );
+    crate::engine::guest_memory::install_memory_limiter(&mut store);
+    store
 }
 
 /// Introspect a plugin component's exported interfaces and their functions from
@@ -1953,6 +2161,116 @@ mod tests {
         }
     }
 
+    /// `wasmcloud:secrets/store@2.1.0` under `label` (`None` for plain).
+    fn secrets_store(label: Option<&str>) -> WitInterface {
+        let mut wit = WitInterface::from("wasmcloud:secrets/store@2.1.0");
+        wit.name = label.map(str::to_string);
+        wit
+    }
+
+    /// A world importing `wasmcloud:secrets/store` under each of `labels`.
+    fn importing(labels: &[Option<&str>]) -> WitWorld {
+        WitWorld {
+            imports: labels.iter().map(|l| secrets_store(*l)).collect(),
+            exports: HashSet::new(),
+        }
+    }
+
+    fn labels(world: &WitWorld, served: &str) -> Vec<Option<Arc<str>>> {
+        import_labels(world, &WitInterface::from(served))
+            .into_iter()
+            .collect()
+    }
+
+    #[test]
+    fn a_plain_import_wires_the_interfaces_own_instance() {
+        assert_eq!(
+            labels(&importing(&[None]), "wasmcloud:secrets/store@2.1.0"),
+            vec![None]
+        );
+    }
+
+    #[test]
+    fn a_labeled_import_wires_the_label() {
+        // The component model names an `(implements ..)` import by its label, so
+        // that is the linker instance the plugin has to define.
+        assert_eq!(
+            labels(
+                &importing(&[Some("restricted")]),
+                "wasmcloud:secrets/store@2.1.0"
+            ),
+            vec![Some(Arc::from("restricted"))]
+        );
+    }
+
+    #[test]
+    fn a_component_importing_both_gets_both_instances() {
+        assert_eq!(
+            labels(
+                &importing(&[None, Some("restricted")]),
+                "wasmcloud:secrets/store@2.1.0"
+            ),
+            vec![None, Some(Arc::from("restricted"))],
+            "the unnamed instance sorts first, and neither displaces the other"
+        );
+    }
+
+    /// A label equal to the plugin id still names the linker instance — the
+    /// import is called that — and only the *binding* reads as unnamed.
+    #[test]
+    fn a_label_equal_to_the_plugin_id_keeps_its_instance_name() {
+        assert_eq!(
+            labels(
+                &importing(&[Some("k8s-secrets")]),
+                "wasmcloud:secrets/store@2.1.0"
+            ),
+            vec![Some(Arc::from("k8s-secrets"))]
+        );
+        assert_eq!(binding_of("k8s-secrets", Some("k8s-secrets")), None);
+        assert_eq!(
+            binding_of("k8s-secrets", Some("restricted")),
+            Some("restricted")
+        );
+    }
+
+    #[test]
+    fn an_interface_the_component_does_not_import_wires_nothing() {
+        // A plugin exporting more than the component uses: only what the
+        // component actually imports may be defined on its linker.
+        assert!(
+            labels(
+                &importing(&[Some("restricted")]),
+                "wasmcloud:secrets/reveal@2.1.0"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_different_package_wires_nothing() {
+        assert!(labels(&importing(&[None]), "acme:kv/store@0.1.0").is_empty());
+    }
+
+    /// The plain instance is defined under the plugin's own version and
+    /// wasmtime resolves a compatible import against it, so a patch-level
+    /// skew between plugin and component must still wire.
+    #[test]
+    fn a_compatible_version_still_wires() {
+        assert_eq!(
+            labels(&importing(&[None]), "wasmcloud:secrets/store@2.1.3"),
+            vec![None]
+        );
+        assert!(labels(&importing(&[None]), "wasmcloud:secrets/store@3.0.0").is_empty());
+        let v = |s: &str| semver::Version::parse(s).unwrap();
+        assert!(versions_compatible(Some(&v("0.2.0")), Some(&v("0.2.1"))));
+        assert!(!versions_compatible(Some(&v("0.2.0")), Some(&v("0.3.0"))));
+        assert!(!versions_compatible(
+            Some(&v("0.2.0-draft")),
+            Some(&v("0.2.0"))
+        ));
+        assert!(versions_compatible(None, Some(&v("0.2.0"))));
+    }
+
     /// Compile `wat` and classify its imports the way plugin construction
     /// does, against a single native serving `test:probe/marker`.
     fn workload_facing(wat: &str, exports: &[ExportedInterface]) -> anyhow::Result<Vec<String>> {
@@ -1973,7 +2291,7 @@ mod tests {
     /// The `wasmcloud:host/workload-call` import every opted-in plugin
     /// declares, as a WAT line to paste into a test component.
     const DECLARES_WORKLOAD_CALLS: &str =
-        r#"(import "wasmcloud:host/workload-call@0.1.3" (instance))"#;
+        r#"(import "wasmcloud:host/workload-call@0.1.4" (instance))"#;
 
     /// Only an import nothing else can satisfy becomes the workload's to
     /// export. A native serving the interface wins — so introducing a built-in

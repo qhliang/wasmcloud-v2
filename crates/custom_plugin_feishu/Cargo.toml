@@ -23,7 +23,11 @@ wasmtime = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 
-reqwest = { version = "0.12" }
+# 必须走 workspace 声明（default-features = false + rustls-tls）：
+# 此前写成 `version = "0.12"` 会打开 reqwest 默认特性 → native-tls → openssl-sys，
+# 交叉编译 aarch64/x86_64-musl 时因缺该目标 OpenSSL 而构建失败（canary-binaries CI）。
+# 本插件只用 Client/json/header，无需 multipart 等额外特性。
+reqwest = { workspace = true }
 
 wash-runtime = { path = "../wash-runtime" }
 

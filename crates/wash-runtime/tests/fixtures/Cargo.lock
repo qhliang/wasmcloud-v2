@@ -93,6 +93,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "config-callee"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
+name = "config-caller"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
 name = "cpu-usage-service"
 version = "0.1.0"
 dependencies = [
@@ -113,6 +127,13 @@ name = "cron-service"
 version = "0.1.0"
 dependencies = [
  "tokio",
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
+name = "dispatch-target"
+version = "0.0.0"
+dependencies = [
  "wit-bindgen 0.60.0",
 ]
 
@@ -408,6 +429,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "http-memory-grow"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
 name = "http-sleeper"
 version = "0.0.0"
 dependencies = [
@@ -535,6 +563,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kv-plugin-implements-caller"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
 name = "kv-plugin-service"
 version = "0.0.0"
 dependencies = [
@@ -611,8 +646,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "messaging-sleeper-p3"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
 name = "msg-counter"
 version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
+name = "nats-async-handler-p3"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
+name = "nats-implements-p3"
+version = "0.1.0"
 dependencies = [
  "wit-bindgen 0.60.0",
 ]

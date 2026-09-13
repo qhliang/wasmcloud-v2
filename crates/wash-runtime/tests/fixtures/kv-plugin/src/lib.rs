@@ -29,6 +29,16 @@ use wit_bindgen::{FutureReader, StreamReader, StreamResult};
 /// lets a test prove a caller's proxy drop frees the real resource here.
 static DROPPED_BUCKETS: AtomicU64 = AtomicU64::new(0);
 
+/// How the `__chatter__` key spends its time.
+///
+/// Hops shorter than the epoch sampling window (100ms) on purpose, so the
+/// callback fires at the window's own rate and banks execution credit as fast
+/// as a pinned guest, clearing every sampling-based gate. The total must also
+/// outlast the deadline, grace and escalation combined, or the activation
+/// finishes before it could be trapped and the test proves nothing.
+const CHATTER_HOPS: u32 = 240;
+const CHATTER_HOP_MS: u64 = 50;
+
 /// A guest-owned key-value partition behind the exported `bucket` resource.
 struct BucketState {
     data: Mutex<BTreeMap<String, Vec<u8>>>,
@@ -86,6 +96,28 @@ impl Guest for Component {
     }
 
     async fn get(key: String) -> Option<Vec<u8>> {
+        // The `__spin__` key wedges this call in a loop that never yields,
+        // unreachable by any host-side timeout — and, because a non-yielding
+        // activation holds the store's guest execution, it wedges every other
+        // caller's calls with it. The plugin store's policy is WarnThenTrap,
+        // so a test can prove the wedge is escalated into a supervised restart
+        // that restores service.
+        if key == "__spin__" {
+            let mut x: u64 = 0;
+            loop {
+                x = std::hint::black_box(x.wrapping_add(1));
+            }
+        }
+        // The `__chatter__` key is the counterpart: just as slow, but spending
+        // all of it awaiting. Each hop wakes onto an expired epoch deadline, so
+        // it fires exactly as `__spin__` does and banks the same execution
+        // credit. Only the fact that it yields tells them apart. Nothing here
+        // may cost the shared plugin store its state.
+        if key == "__chatter__" {
+            for _ in 0..CHATTER_HOPS {
+                monotonic_clock::wait_for(CHATTER_HOP_MS * 1_000_000).await;
+            }
+        }
         STORE.lock().unwrap().get(&key).cloned()
     }
 
@@ -118,6 +150,10 @@ impl Guest for Component {
         let workload = bindings::wasmcloud::host::identity::get_workload_id();
         let component = bindings::wasmcloud::host::identity::get_component_id();
         format!("{workload}|{component}")
+    }
+
+    async fn whichbinding() -> Option<String> {
+        bindings::wasmcloud::host::identity::get_binding_name()
     }
 
     async fn slow(millis: u64) -> u64 {

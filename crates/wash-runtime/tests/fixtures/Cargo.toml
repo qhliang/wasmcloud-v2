@@ -10,12 +10,17 @@ members = [
     "http-webgpu",
     "cpu-usage-service",
     "messaging-handler",
+    "nats-async-handler-p3",
+    "nats-implements-p3",
     "messaging-echo",
     "messaging-echo-p3",
+    "messaging-sleeper-p3",
     "messaging-dual-handler",
     "inter-component-call-caller",
     "inter-component-call-callee",
     "inter-component-call-middleware",
+    "config-caller",
+    "config-callee",
     "http-allowed-hosts",
     "http-egress-pool",
     "http-ip-name-lookup",
@@ -24,6 +29,7 @@ members = [
     "postgres-implements",
     # P3 fixtures (wasm32-wasip1 + reactor adapter)
     "http-handler-p3",
+    "http-memory-grow",
     "http-ip-name-lookup-p3",
     "http-blobstore-p3",
     "cli-service-p3",
@@ -55,6 +61,7 @@ members = [
     "bridge-service",
     "kv-plugin",
     "kv-plugin-caller",
+    "kv-plugin-implements-caller",
     "kv-plugin-service",
     "badlifecycle",
     "secrets-caller",
@@ -64,6 +71,8 @@ members = [
     "http-egress-plugin-caller",
     "events-plugin",
     "events-caller",
+    "events-service",
+    "dispatch-target",
 ]
 
 [workspace.dependencies]

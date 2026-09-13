@@ -46,9 +46,49 @@ impl WitWorld {
             || self.exports.iter().any(|e| e.contains(interface))
     }
 
+    /// Whether this world imports or exports anything of `interface`'s package
+    /// at a compatible version.
+    fn mentions_package(&self, interface: &WitInterface) -> bool {
+        self.imports.iter().any(|im| interface.same_package(im))
+            || self.exports.iter().any(|ex| interface.same_package(ex))
+    }
+
+    /// Whether this world *uses* `interface` — imports or exports at least one
+    /// of the interfaces the entry names.
+    ///
+    /// The question a workload item asks of a host interface entry. One entry
+    /// is shared by every item, and a manifest may give a package only one
+    /// unnamed entry, so an entry names what the workload *collectively* uses
+    /// and an item that uses a subset of it still needs the plugin serving it.
+    ///
+    /// The provider side asks [`WitWorld::includes_bidirectional`] instead: a
+    /// plugin that serves part of an entry must not claim it, or the rest is
+    /// left bound by nobody.
+    pub fn uses(&self, interface: &WitInterface) -> bool {
+        // An entry naming no interface stands for its whole package, so a world
+        // uses it by using the package at all — never by saying nothing about
+        // it, which would make such an entry everyone's.
+        if interface.interfaces.is_empty() {
+            return self.mentions_package(interface);
+        }
+        interface.interfaces.iter().any(|i| {
+            self.imports
+                .iter()
+                .any(|im| interface.same_package(im) && im.interfaces.contains(i))
+                || self
+                    .exports
+                    .iter()
+                    .any(|ex| interface.same_package(ex) && ex.interfaces.contains(i))
+        })
+    }
+
     /// This function checks if the world includes a specific interface. This is
     /// different than [`WitWorld::includes`] because it considers that in one
     /// [`WitInterface`] there may be both imports and exports.
+    ///
+    /// Every interface the entry names has to be covered. Asked of a plugin's
+    /// world, that is "can this plugin serve the whole entry"; asked of a
+    /// workload item's world it is too strict — see [`WitWorld::uses`].
     pub fn includes_bidirectional(&self, interface: &WitInterface) -> bool {
         // Each requested interface must be covered by *some* import or export of
         // the same package (see [`WitInterface::same_package`]). The label/name
@@ -58,6 +98,13 @@ impl WitWorld {
         // multiple entries (e.g. `wasmcloud:postgres` imports `types` unnamed and
         // `query` under several labels), so check every entry per interface
         // rather than binding to the first package match.
+        //
+        // An entry naming no interface still has to be a package this world
+        // knows: covering everything vacuously would match every plugin, and
+        // the first by id would claim a package it does not serve.
+        if interface.interfaces.is_empty() {
+            return self.mentions_package(interface);
+        }
         interface.interfaces.iter().all(|i| {
             self.imports
                 .iter()
@@ -143,7 +190,7 @@ impl WitWorld {
 /// - `wasi:http` - Just namespace and package
 /// - `wasi:http/incoming-handler` - With a single interface
 /// - `wasi:http/incoming-handler,outgoing-handler@0.2.0` - Multiple interfaces with version
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WitInterface {
     /// The namespace of the interface (e.g., "wasi")
     pub namespace: String,
@@ -154,13 +201,47 @@ pub struct WitInterface {
     // TODO: This is a nice way to represent a version, but it doesn't account for
     // compatible versions. We should revisit this and implement https://docs.rs/semver/1.0.27/semver/struct.VersionReq.html
     /// Optional semantic version for the interface
+    #[serde(default)]
     pub version: Option<semver::Version>,
-    /// Additional configuration parameters for this interface
+    /// Additional configuration parameters for this interface. Defaulted: an
+    /// entry bound under an operator-declared binding configures nothing here.
+    #[serde(default)]
     pub config: HashMap<String, String>,
     /// Optional name identifying this specific instance when multiple entries
     /// of the same namespace:package exist. Used as the routing key in
-    /// multiplexing plugins (the `identifier` in store::open, etc.).
+    /// multiplexing plugins (the `identifier` in store::open, etc.), and as the
+    /// binding name an operator declares under a `host.plugins` entry.
+    #[serde(default)]
     pub name: Option<String>,
+}
+
+/// Config keys, never config values.
+///
+/// Once bindings resolve, `config` carries whatever the operator's `secretFrom`
+/// resolved to — creds, tokens, TLS keys — and this type is `?`-logged on
+/// several paths. A plugin that wants a value in a log names that value itself.
+impl std::fmt::Debug for WitInterface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        struct Keys<'a>(&'a HashMap<String, String>);
+        impl std::fmt::Debug for Keys<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                let mut keys: Vec<&str> = self.0.keys().map(String::as_str).collect();
+                keys.sort_unstable();
+                f.debug_map()
+                    .entries(keys.into_iter().map(|k| (k, format_args!("<redacted>"))))
+                    .finish()
+            }
+        }
+
+        f.debug_struct("WitInterface")
+            .field("namespace", &self.namespace)
+            .field("package", &self.package)
+            .field("interfaces", &self.interfaces)
+            .field("version", &self.version)
+            .field("name", &self.name)
+            .field("config", &Keys(&self.config))
+            .finish()
+    }
 }
 
 impl WitInterface {
@@ -342,6 +423,36 @@ impl From<String> for WitInterface {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+
+    /// `WitInterface` is `?`-logged on several bind paths, and after binding
+    /// resolution its config carries the operator's resolved `secretFrom`
+    /// material.
+    #[test]
+    fn debug_shows_config_keys_and_no_config_values() {
+        let interface = WitInterface {
+            namespace: "wasmcloud".to_string(),
+            package: "nats".to_string(),
+            interfaces: ["core".to_string()].into_iter().collect(),
+            version: Some(semver::Version::new(0, 1, 0)),
+            config: [
+                ("creds".to_string(), "SUPERSECRET".to_string()),
+                ("password".to_string(), "hunter2".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            name: None,
+        };
+
+        let rendered = format!("{interface:?}");
+        assert!(!rendered.contains("SUPERSECRET"), "{rendered}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        // Keys stay: which settings are present is the diagnostic value, and a
+        // key name is not the secret.
+        assert!(rendered.contains("creds"), "{rendered}");
+        assert!(rendered.contains("password"), "{rendered}");
+        assert!(rendered.contains("wasmcloud"), "{rendered}");
+    }
+
     use super::*;
     use std::collections::HashSet;
 
@@ -917,5 +1028,44 @@ mod tests {
         let prepared =
             create_interface_with_version("wasmcloud", "postgres", &["prepared"], "0.1.1");
         assert!(!world.includes_bidirectional(&prepared));
+    }
+
+    /// A host entry names what a whole workload uses, so a component using one
+    /// of its interfaces uses the entry — while a plugin has to serve all of
+    /// them to claim it.
+    #[test]
+    fn uses_asks_for_any_interface_and_includes_asks_for_all() {
+        let component = WitWorld {
+            imports: HashSet::from([create_interface("wasi", "keyvalue", &["store"])]),
+            exports: HashSet::new(),
+        };
+        let entry = create_interface("wasi", "keyvalue", &["store", "atomics"]);
+
+        assert!(
+            component.uses(&entry),
+            "the component imports one of the entry's interfaces"
+        );
+        assert!(
+            !component.includes_bidirectional(&entry),
+            "it does not cover the whole entry, which is what a provider must do"
+        );
+
+        // A package the world never mentions is neither used nor covered.
+        let unrelated = create_interface("wasi", "blobstore", &["blobstore"]);
+        assert!(!component.uses(&unrelated));
+        assert!(!component.includes_bidirectional(&unrelated));
+
+        // An entry naming no interface stands for its whole package.
+        let package_only = create_interface("wasi", "keyvalue", &[]);
+        assert!(component.uses(&package_only));
+
+        // It is still that package's, not everyone's: a world saying nothing
+        // about it neither uses nor covers it. Otherwise such an entry matches
+        // every world it is offered to — every plugin included, where the first
+        // by id would claim a package it does not serve.
+        let elsewhere = create_interface("wasi", "blobstore", &[]);
+        assert!(!component.uses(&elsewhere));
+        assert!(!component.includes_bidirectional(&elsewhere));
+        assert!(component.includes_bidirectional(&package_only));
     }
 }
