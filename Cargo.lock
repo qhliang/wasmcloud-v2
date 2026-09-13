@@ -1290,6 +1290,7 @@ checksum = "58a6d0db8759036a783bc7c3f7a07f8cef3bf9470eb1db3bc86e8bcd1c5d0fe8"
 dependencies = [
  "compression-core",
  "flate2",
+ "memchr",
 ]
 
 [[package]]
@@ -6164,10 +6165,8 @@ checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64 0.22.1",
  "bytes",
- "encoding_rs",
  "futures-core",
  "futures-util",
- "h2",
  "http",
  "http-body",
  "http-body-util",
@@ -6177,7 +6176,6 @@ dependencies = [
  "hyper-util",
  "js-sys",
  "log",
- "mime",
  "mime_guess",
  "native-tls",
  "percent-encoding",
@@ -7854,14 +7852,19 @@ version = "0.6.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4cfcf7e2740e6fc6d4d688b4ef00650406bb94adf4731e43c096c3a19fe40840"
 dependencies = [
+ "async-compression",
  "base64 0.22.1",
  "bitflags",
  "bytes",
+ "futures-core",
  "futures-util",
  "http",
  "http-body",
+ "http-body-util",
  "mime",
  "pin-project-lite",
+ "tokio",
+ "tokio-util",
  "tower 0.5.3",
  "tower-layer",
  "tower-service",
@@ -9207,9 +9210,9 @@ dependencies = [
 
 [[package]]
 name = "weixin-agent"
-version = "0.1.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c54cf38c383b6136b78f746befe1efea7f9b98d9e1de6190c4108731ff21c37"
+checksum = "44ab77d9ab8779492bd067cc42e679ffd27ed1c6d3058aebe0f505b55d43294d"
 dependencies = [
  "aes",
  "async-trait",
@@ -9219,7 +9222,7 @@ dependencies = [
  "ecb",
  "md-5 0.10.6",
  "rand 0.9.5",
- "reqwest 0.12.28",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "serde_repr",
