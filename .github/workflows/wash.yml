@@ -275,6 +275,11 @@ jobs:
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
+          # provenance 必须关掉：默认开启会在 image index 里加一个 attestation 清单
+          # （config 媒体类型 application/vnd.oci.empty.v1+json），阿里云 ACR 无法识别，
+          # 导致后续 imagetools create 同步到 ACR 时 403/unknown manifest class。
+          # fork 原版一直带此项，合入 upstream 时被删掉，遂复现。
+          provenance: false
           outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/wash,push-by-digest=true,name-canonical=true,push=true
           cache-from: |
             type=gha,scope=wash-release-arm64-${{ github.head_ref || github.ref_name }}
@@ -399,6 +404,11 @@ jobs:
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
+          # provenance 必须关掉：默认开启会在 image index 里加一个 attestation 清单
+          # （config 媒体类型 application/vnd.oci.empty.v1+json），阿里云 ACR 无法识别，
+          # 导致后续 imagetools create 同步到 ACR 时 403/unknown manifest class。
+          # fork 原版一直带此项，合入 upstream 时被删掉，遂复现。
+          provenance: false
           outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/wash,push-by-digest=true,name-canonical=true,push=true
           cache-from: |
             type=gha,scope=wash-release-amd64-${{ github.head_ref || github.ref_name }}
