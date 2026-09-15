@@ -55,6 +55,25 @@ cargo xtask build-fixtures                 # 生成 wash-runtime 集成测试所
 - **custom host plugin 子 crate 可单独更新版本**：若改动落在某个 custom host plugin 子 crate（`crates/custom_plugin_*`），可以更新该子 crate 自己的版本号（在子 crate 的 `Cargo.toml` 中声明独立 `version`，不再继承 `workspace.package`）。其余子 crate 与 workspace 根版本保持不变。
 - 仅当子 crate 即将对外发布时才需要 bump 版本；内部未发布的功能改动可暂不更新。
 
+## 镜像发布（wash host 镜像 → GHCR + 阿里云 ACR）
+
+`wash` 运行时镜像由 `.github/workflows/wash.yml` 在 main push 时构建，**同时发布到 GHCR 与阿里云
+ACR**（fork 定制）。两个 registry 的 tag 方案必须保持一致、统一用 commit sha：
+
+| registry | tag | 说明 |
+| --- | --- | --- |
+| GHCR + ACR | `sha-<40 位 commit sha>` | 多架构 manifest list，**部署按它引用**（`git rev-parse HEAD` 直接推导） |
+| GHCR + ACR | `canary` | 移动 tag，每次 main push 覆盖 |
+| 仅 ACR | `sha-<commit>-arm64` / `-amd64` | 单架构副本；`canary-publish` 有 e2e 门禁，这是未过门禁时的兜底 |
+
+- 落地位置：per-arch job 的 `Copy wash image to Aliyun ACR` 步骤落带架构后缀的单架构 tag；
+  `canary-publish` 的 `Create manifest list and push tags` 把裸 `sha-<sha>` + `canary` 一次性打到两个 registry。
+- ⚠️ **不要改回用镜像 digest 当 tag**（`${DIGEST#sha256:}` 那种）：digest 无法从 commit 推导，
+  只能翻 CI 日志或看集群现有 image。
+- ⚠️ 该定制曾在上游 v2.9.0 合并（commit `991e4ebfb`）解决冲突时被整段冲掉，随后 `f6f4a2a7a`
+  只恢复了 digest 版本，导致 ACR 上一度没有任何可用 commit 引用的 tag。**再合并 upstream 时务必
+  对照本表核对 `wash.yml` 的 tag 方案是否还在。**
+
 ## 新增/修改 custom plugin 清单
 
 **新增 custom plugin：**

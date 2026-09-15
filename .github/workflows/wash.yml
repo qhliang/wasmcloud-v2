@@ -292,13 +292,23 @@ jobs:
           username: "${{ secrets.ALIYUN_ACR_USERNAME }}"
           password: "${{ secrets.ALIYUN_ACR_PASSWORD }}"
       - name: Copy wash image to Aliyun ACR
+        # ACR 侧 tag 与 GHCR 对齐、统一用 commit sha（原来用的是镜像 digest 的 64 位
+        # hex，无法从 commit 推导，只能翻 CI 日志）。
+        # 这一层先落一个带架构后缀的单架构 tag（`sha-<sha>-arm64`），原因是：
+        #   * arm64 / amd64 两个 job 若都写裸 `sha-<sha>` 会互相覆盖——同一个 tag
+        #     被两个 job 并发 push，最终指向哪个架构不确定；
+        #   * 二者并发也就使得该 tag 在 ACR 上永远是单架构，与 GHCR 上那个多架构
+        #     manifest list 语义不符。
+        # 多架构清单（裸 `sha-<sha>` + `canary`）由 canary-publish 在两个 registry
+        # 上统一打，见该 job。这里保留一份单架构副本，是为了 e2e 门禁未通过
+        # （该 job 以 e2e 为前置）时 ACR 上仍有可直接取用的镜像。
         if: github.event_name != 'pull_request'
         env:
           DIGEST: ${{ steps.build_push.outputs.digest }}
         run: |
           set -euo pipefail
           SRC="ghcr.io/${{ github.repository_owner }}/wash@${DIGEST}"
-          DST="registry.cn-hangzhou.aliyuncs.com/big_bumblebee/wash:${DIGEST#sha256:}"
+          DST="registry.cn-hangzhou.aliyuncs.com/big_bumblebee/wash:sha-${GITHUB_SHA}-arm64"
           docker buildx imagetools create -t "${DST}" "${SRC}"
       - name: Export digest
         if: github.event_name != 'pull_request'
@@ -421,12 +431,15 @@ jobs:
           username: "${{ secrets.ALIYUN_ACR_USERNAME }}"
           password: "${{ secrets.ALIYUN_ACR_PASSWORD }}"
       - name: Copy wash image to Aliyun ACR
+        # 与 arm64 侧同理：ACR tag 统一用 commit sha（原 digest hex 无法从 commit 推导）。
+        # 带 `-amd64` 后缀是为了不和 arm64 侧抢同一个裸 `sha-<sha>`；
+        # 裸 tag（多架构清单）+ `canary` 由 canary-publish 统一打。
         env:
           DIGEST: ${{ steps.build_push.outputs.digest }}
         run: |
           set -euo pipefail
           SRC="ghcr.io/${{ github.repository_owner }}/wash@${DIGEST}"
-          DST="registry.cn-hangzhou.aliyuncs.com/big_bumblebee/wash:${DIGEST#sha256:}"
+          DST="registry.cn-hangzhou.aliyuncs.com/big_bumblebee/wash:sha-${GITHUB_SHA}-amd64"
           docker buildx imagetools create -t "${DST}" "${SRC}"
 
       - name: Export digest
@@ -672,6 +685,13 @@ jobs:
   # promotes this canary digest as the immutable vX.Y.Z release tag —
   # `canary` itself moves on every subsequent main push, so we cannot
   # rely on it.
+  #
+  # The same tag set is mirrored to Aliyun ACR in one `imagetools create`
+  # call, so both registries carry identical `canary` and `sha-<full-sha>`
+  # tags. This restores the behaviour the fork had before the upstream
+  # v2.9.0 merge dropped wash.yml's ACR customisation (commit 991e4ebfb);
+  # the 2026-09-13 restore only brought back a per-arch copy that tagged by
+  # raw digest, which left ACR without any commit-addressable handle.
   canary-publish:
     # Gate canary on the things that actually exercise the published bytes:
     # the per-arch `wash-image*` jobs are what get pushed by digest, and
@@ -712,6 +732,12 @@ jobs:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Login to Aliyun ACR
+        uses: aliyun/acr-login@v1
+        with:
+          login-server: https://registry.cn-hangzhou.aliyuncs.com
+          username: "${{ secrets.ALIYUN_ACR_USERNAME }}"
+          password: "${{ secrets.ALIYUN_ACR_PASSWORD }}"
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - name: Docker meta
@@ -746,11 +772,42 @@ jobs:
             args+=("ghcr.io/${{ github.repository_owner }}/wash@sha256:$d")
           done
           docker buildx imagetools create "${args[@]}"
+      - name: Create ACR manifest list and push tags
+        # 与 GHCR 逐字相同的两个 tag（`canary` + `sha-<full-sha>`），都用 commit sha，
+        # 于是「commit → 镜像 tag」的推导在两个 registry 上完全一致（原来 ACR 只有 per-arch
+        # 的 digest hex tag，无法从 commit 推导）。源用 ACR 本地 digest——per-arch 的
+        # `Copy wash image to Aliyun ACR` 已把清单拷过去，故这里不依赖跨 registry 拷贝；
+        # 单独一步也让 GHCR 的 tag 先落地，ACR 若出问题不牵连 GHCR。
+        working-directory: /tmp/digests
+        env:
+          ACR_IMAGE: registry.cn-hangzhou.aliyuncs.com/big_bumblebee/wash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          digests=( * )
+          shopt -u nullglob
+          if (( ${#digests[@]} == 0 )); then
+            echo "No digests downloaded. Refusing to push" >&2
+            exit 1
+          fi
+          args=(-t "${ACR_IMAGE}:canary" -t "${ACR_IMAGE}:sha-${GITHUB_SHA}")
+          for d in "${digests[@]}"; do
+            args+=("${ACR_IMAGE}@sha256:$d")
+          done
+          docker buildx imagetools create "${args[@]}"
       - name: Inspect image
         run: |
           docker buildx imagetools inspect "ghcr.io/${{ github.repository_owner }}/wash:${STEPS_META_OUTPUTS_VERSION}"
         env:
           STEPS_META_OUTPUTS_VERSION: ${{ steps.meta.outputs.version }}
+      - name: Inspect ACR image
+        # 把「ACR 上这两个 tag 确实存在」写进日志，免得等到部署时才发现没打上。
+        env:
+          ACR_IMAGE: registry.cn-hangzhou.aliyuncs.com/big_bumblebee/wash
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect "${ACR_IMAGE}:sha-${GITHUB_SHA}"
+          docker buildx imagetools inspect "${ACR_IMAGE}:canary"
 
   # Canary matrix binary build. Runs on every push to main so each commit
   # exercises the full per-target matrix (including the s390x/musl cross
