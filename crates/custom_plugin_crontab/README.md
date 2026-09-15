@@ -139,6 +139,23 @@ scheduler::remove("tick")?;
 | 回调方式 | async export，`store.run_concurrent` + accessor 调用 `handle-tick` |
 | 配置解析 | `parse_schedule_config()` 解析 `name=...;cron=...` / `name=...;delay-ms=...` |
 | 清理 | `on_workload_unbind` 取消所有 task 与 channel |
+| 重绑防护 | 组件**未经 `on_workload_unbind`** 就被再次 bind 时，先取消上一代的 `cancel_token` 再覆盖跟踪数据（`cancel_stale_generation()`），并打 `warn!` 日志；否则旧代任务永久存活且其 token 已不可达 |
+
+### 生命周期与「重绑」语义
+
+每个组件在 bind 时创建一代 `CancellationToken`（`ComponentData.cancel_token`），该代派生的所有
+cron / delay 任务持有它的 child token；`on_workload_unbind` 会取消它并删除跟踪数据。
+
+问题出在 **bind 没有配对的 unbind** 时：`WorkloadTracker::add_component` 只是覆盖跟踪项，被覆盖
+的 `ComponentData` 仅被 drop —— 而 `CancellationToken` 的 `Drop` 只递减句柄引用计数、**不会
+cancel** —— 于是上一代任务（持有仍然有效的 child token）**永久存活**，其父 token 又已不可达，
+任何代码都无法再停掉它。表现为同一次 tick 被多触发一条执行，并随重绑次数累积。
+
+因此 `on_workload_item_bind` 在覆盖前先调用 `cancel_stale_generation()`：同一组件被再次 bind 时
+先取消上一代、再登记新一代，并打一条
+`component bound again without unbind — cancelled the previous generation of schedules`
+的 `warn!`，把这条原先完全静默的路径变为可观测。健康的 unbind → bind 路径不受影响
+（无可取消对象时为 no-op）。
 
 ## 依赖
 

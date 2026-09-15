@@ -601,6 +601,33 @@ fn spawn_delay_task(
     });
 }
 
+/// Cancel the schedules of a previous generation of this component, if a
+/// previous generation is still tracked.
+///
+/// Returns `true` when a previous generation was found and cancelled.
+///
+/// A component can be bound again without an intervening `on_workload_unbind`
+/// (observed in production while the host rebound workloads around a broker
+/// outage). [`WorkloadTracker::add_component`] would then simply overwrite the
+/// tracked [`ComponentData`], and dropping the replaced value does **not**
+/// cancel its `cancel_token`: `CancellationToken`'s `Drop` only decrements a
+/// handle refcount. The cron/delay tasks spawned by that generation hold live
+/// *child* tokens, so they keep firing forever while their parent token becomes
+/// unreachable — nothing left can stop them. Cancelling explicitly before the
+/// overwrite keeps a component at one live generation.
+fn cancel_stale_generation(
+    tracker: &WorkloadTracker<(), ComponentData>,
+    component_id: &str,
+) -> bool {
+    match tracker.get_component_data(component_id) {
+        Some(data) => {
+            data.cancel_token.cancel();
+            true
+        }
+        None => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // HostPlugin implementation
 // ---------------------------------------------------------------------------
@@ -661,7 +688,21 @@ impl HostPlugin for Crontab {
             let schedule_names: HashSet<String> =
                 schedules.iter().map(|(n, _)| n.clone()).collect();
 
-            self.tracker.write().await.add_component(
+            let mut tracker = self.tracker.write().await;
+
+            // A bind without a preceding unbind leaves the previous generation's
+            // tasks running forever, because overwriting `ComponentData` below
+            // only drops its cancel token (see `cancel_stale_generation`). Cancel
+            // it first, and say so — this path used to be completely silent.
+            if cancel_stale_generation(&tracker, component_handle.id()) {
+                warn!(
+                    component_id = component_handle.id(),
+                    "component bound again without unbind — cancelled the previous generation \
+                     of schedules"
+                );
+            }
+
+            tracker.add_component(
                 component_handle,
                 ComponentData {
                     cancel_token: tokio_util::sync::CancellationToken::new(),
@@ -780,6 +821,7 @@ impl HostPlugin for Crontab {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wash_runtime::plugin::WorkloadTrackerItem;
 
     #[test]
     fn test_plugin_id() {
@@ -882,5 +924,42 @@ mod tests {
         let (name, kind) = parse_schedule_config("name=hourly;cron=0 * * * *").unwrap();
         assert_eq!(name, "hourly");
         assert!(matches!(kind, ScheduleKind::Cron(_)));
+    }
+
+    #[test]
+    fn test_rebind_cancels_the_previous_generation() {
+        let mut tracker: WorkloadTracker<(), ComponentData> = WorkloadTracker::default();
+        let token = tokio_util::sync::CancellationToken::new();
+
+        // Simulate a first bind whose `on_workload_unbind` never arrived: the
+        // generation's token is tracked, and its spawned tasks hold children of
+        // it.
+        tracker
+            .components
+            .insert("comp".to_string(), "wl".to_string());
+        tracker.workloads.insert(
+            "wl".to_string(),
+            WorkloadTrackerItem {
+                workload_data: None,
+                components: HashMap::from([(
+                    "comp".to_string(),
+                    ComponentData {
+                        cancel_token: token.clone(),
+                        names: HashSet::new(),
+                        schedules: Vec::new(),
+                        workload: None,
+                        task_tokens: HashMap::new(),
+                    },
+                )]),
+            },
+        );
+
+        assert!(!token.is_cancelled());
+        assert!(cancel_stale_generation(&tracker, "comp"));
+        assert!(token.is_cancelled());
+
+        // Healthy path (unbind before bind) leaves nothing to cancel, so it
+        // stays silent.
+        assert!(!cancel_stale_generation(&tracker, "never-tracked"));
     }
 }
