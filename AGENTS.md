@@ -67,7 +67,14 @@ ACR**（fork 定制）。两个 registry 的 tag 方案必须保持一致、统�
 | 仅 ACR | `sha-<commit>-arm64` / `-amd64` | 单架构副本；`canary-publish` 有 e2e 门禁，这是未过门禁时的兜底 |
 
 - 落地位置：per-arch job 的 `Copy wash image to Aliyun ACR` 步骤落带架构后缀的单架构 tag；
-  `canary-publish` 的 `Create manifest list and push tags` 把裸 `sha-<sha>` + `canary` 一次性打到两个 registry。
+  `canary-publish` 里 `Create manifest list and push tags` 打 GHCR 的 `sha-<sha>` + `canary`，
+  紧随其后的 `Create ACR manifest list and push tags` 打 ACR 的同名两个 tag（源用 ACR 本地 digest，
+  不依赖跨 registry 拷贝）。
+- ⚠️ **`Login to Aliyun ACR` 必须排在同一个 job 内所有 ghcr.io 操作（推送 + `imagetools inspect`）
+  之后**。`aliyun/acr-login@v1` 并不执行 `docker login`：它自己造一个只含 ACR 一条 auth 的
+  `config.json`，再把 `DOCKER_CONFIG` 重新导出指向该临时目录（`dist/index.js` 的 `run()` 末尾），
+  于是 `docker/login-action` 为 ghcr.io 写进 `~/.docker/config.json` 的凭据被整体旁路 ⇒ 其后任何
+  ghcr 操作都以 `401 Unauthorized` 失败（commit `cddc9808d07` 的 canary-publish 就是这么红的）。
 - ⚠️ **不要改回用镜像 digest 当 tag**（`${DIGEST#sha256:}` 那种）：digest 无法从 commit 推导，
   只能翻 CI 日志或看集群现有 image。
 - ⚠️ 该定制曾在上游 v2.9.0 合并（commit `991e4ebfb`）解决冲突时被整段冲掉，随后 `f6f4a2a7a`

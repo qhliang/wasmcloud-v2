@@ -732,12 +732,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Login to Aliyun ACR
-        uses: aliyun/acr-login@v1
-        with:
-          login-server: https://registry.cn-hangzhou.aliyuncs.com
-          username: "${{ secrets.ALIYUN_ACR_USERNAME }}"
-          password: "${{ secrets.ALIYUN_ACR_PASSWORD }}"
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - name: Docker meta
@@ -772,6 +766,26 @@ jobs:
             args+=("ghcr.io/${{ github.repository_owner }}/wash@sha256:$d")
           done
           docker buildx imagetools create "${args[@]}"
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect "ghcr.io/${{ github.repository_owner }}/wash:${STEPS_META_OUTPUTS_VERSION}"
+        env:
+          STEPS_META_OUTPUTS_VERSION: ${{ steps.meta.outputs.version }}
+      # ACR 登录必须排在本 job 内**所有** ghcr.io 操作（推送 + inspect）之后。
+      # 原因不是网络或顺序偏好，而是 aliyun/acr-login@v1 的实现：它并不执行
+      # `docker login`，而是自己造一个只含 ACR 一条 auth 的 config.json，再把
+      # DOCKER_CONFIG 重新导出指向该临时目录（dist/index.js 的 run() 末尾
+      # `io.mkdirP` + `fs.writeFileSync` + `core.exportVariable('DOCKER_CONFIG', …)`）。
+      # 于是 docker/login-action 为 ghcr.io 写进 ~/.docker/config.json 的凭据被整体
+      # 旁路，其后任何 ghcr 操作都以 401 失败（曾因此让 canary-publish 变红：
+      # `PUT …/manifests/sha-<sha>: 401 Unauthorized`）。
+      # per-arch 的 wash-image* job 同样遵循「先 ghcr、后 acr」的顺序。
+      - name: Login to Aliyun ACR
+        uses: aliyun/acr-login@v1
+        with:
+          login-server: https://registry.cn-hangzhou.aliyuncs.com
+          username: "${{ secrets.ALIYUN_ACR_USERNAME }}"
+          password: "${{ secrets.ALIYUN_ACR_PASSWORD }}"
       - name: Create ACR manifest list and push tags
         # 与 GHCR 逐字相同的两个 tag（`canary` + `sha-<full-sha>`），都用 commit sha，
         # 于是「commit → 镜像 tag」的推导在两个 registry 上完全一致（原来 ACR 只有 per-arch
@@ -795,11 +809,6 @@ jobs:
             args+=("${ACR_IMAGE}@sha256:$d")
           done
           docker buildx imagetools create "${args[@]}"
-      - name: Inspect image
-        run: |
-          docker buildx imagetools inspect "ghcr.io/${{ github.repository_owner }}/wash:${STEPS_META_OUTPUTS_VERSION}"
-        env:
-          STEPS_META_OUTPUTS_VERSION: ${{ steps.meta.outputs.version }}
       - name: Inspect ACR image
         # 把「ACR 上这两个 tag 确实存在」写进日志，免得等到部署时才发现没打上。
         env:
