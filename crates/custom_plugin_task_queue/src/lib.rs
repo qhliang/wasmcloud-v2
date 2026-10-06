@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -23,9 +23,7 @@ use wash_runtime::engine::workload::{ResolvedWorkload, WorkloadItem};
 use wash_runtime::plugin::{HostPlugin, WitInterfaces, WorkloadTracker};
 use wash_runtime::wit::WitInterface;
 
-use task_queue_core::config::{
-    HEARTBEAT_MAX_INFO_BYTES, HEARTBEAT_MIN_INTERVAL_MS, PAYLOAD_MAX_BYTES,
-};
+use task_queue_core::config::{HEARTBEAT_MAX_INFO_BYTES, PAYLOAD_MAX_BYTES};
 use task_queue_core::events::{
     ControlEvent, SCHEMA_VERSION as EVENT_SCHEMA_VERSION, TaskResultEvent,
 };
@@ -288,16 +286,10 @@ fn resolve_queue_configs(
     Ok((primary, configs))
 }
 
-#[derive(Default)]
-struct HeartbeatState {
-    last_heartbeat_at: Option<SystemTime>,
-}
-
 pub struct TaskQueuePlugin {
     client: Arc<async_nats::Client>,
     tracker: Arc<RwLock<WorkloadTracker<(), ComponentData>>>,
     queues: Arc<RwLock<HashMap<String, QueueHandles>>>,
-    heartbeats: Arc<Mutex<HashMap<String, HeartbeatState>>>,
     callback_tx: tokio::sync::mpsc::UnboundedSender<(String, CallbackEvent)>,
     callback_cancel: CancellationToken,
     #[allow(dead_code)]
@@ -312,7 +304,6 @@ impl TaskQueuePlugin {
             client,
             tracker: Arc::new(RwLock::new(WorkloadTracker::default())),
             queues: Arc::new(RwLock::new(HashMap::new())),
-            heartbeats: Arc::new(Mutex::new(HashMap::new())),
             callback_tx,
             callback_cancel,
             lifetime: Mutex::new(()),
@@ -997,7 +988,6 @@ impl Clone for TaskQueuePlugin {
             client: self.client.clone(),
             tracker: self.tracker.clone(),
             queues: self.queues.clone(),
-            heartbeats: Arc::clone(&self.heartbeats),
             callback_tx: self.callback_tx.clone(),
             callback_cancel: self.callback_cancel.clone(),
             lifetime: Mutex::new(()),
@@ -1266,34 +1256,14 @@ impl<'a> bindings::custom::task_queue::task_control::Host for ActiveCtx<'a> {
         let Some(queue) = queue else {
             return Ok(Err("no primary queue configured".into()));
         };
+        // 只保留体积上限，不再限制发送频率：心跳频率由业务自己掌握，插件
+        // 不替它节流。每次调用都直接排队给 observer，不做过期丢弃。
         if info.len() > HEARTBEAT_MAX_INFO_BYTES {
             return Ok(Err(format!(
                 "info exceeds {HEARTBEAT_MAX_INFO_BYTES} bytes"
             )));
         }
         if let Some(component_id) = plugin.find_producer_component(&queue).await {
-            let now = SystemTime::now();
-            let mut heartbeats = plugin.heartbeats.lock().await;
-            let accepted = match heartbeats.get_mut(&task_id) {
-                Some(state) => state.last_heartbeat_at.is_none_or(|last| {
-                    now.duration_since(last).is_ok_and(|elapsed| {
-                        elapsed >= Duration::from_millis(HEARTBEAT_MIN_INTERVAL_MS)
-                    })
-                }),
-                None => true,
-            };
-            if !accepted {
-                return Ok(Err(format!(
-                    "heartbeat exceeds minimum interval of {HEARTBEAT_MIN_INTERVAL_MS} ms"
-                )));
-            }
-            heartbeats.insert(
-                task_id.clone(),
-                HeartbeatState {
-                    last_heartbeat_at: Some(now),
-                },
-            );
-            drop(heartbeats);
             return plugin
                 .observe(
                     &component_id,

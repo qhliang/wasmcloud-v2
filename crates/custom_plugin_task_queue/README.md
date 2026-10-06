@@ -89,7 +89,7 @@ observer 导出四个回调，均为独立事件、互不搭载：
 | `retry-backoff-ms` | `1000,5000,15000,60000` | 逗号分隔的多级重试退避 |
 | `results-archive` | `true` | 是否创建并写入结果归档流 |
 
-Heartbeat 的 `info` 字符串最大为 8 KiB，同一 task 的两次 heartbeat 至少间隔 1000 ms。任务 payload 最大为 1 MiB；更大的数据应由业务方先写入对象存储，再在 payload 中传递引用。
+Heartbeat 的 `info` 字符串最大为 8 KiB，除此之外不限频率，同一 task 可在任意检查点连续上报。任务 payload 最大为 1 MiB；更大的数据应由业务方先写入对象存储，再在 payload 中传递引用。
 
 ## JetStream 资源
 

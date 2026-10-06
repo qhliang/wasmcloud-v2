@@ -79,4 +79,3 @@ impl Worker for MyWorker {
 | retry backoff | 1 s, 5 s, 15 s, 60 s |
 | payload 最大值 | 1 MiB |
 | heartbeat info 最大值 | 8 KiB |
-| heartbeat 最小间隔 | 1 s |
