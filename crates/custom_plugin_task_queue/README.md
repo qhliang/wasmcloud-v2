@@ -55,6 +55,24 @@ interface worker {
 
 插件按各组件实际导出的接口分别绑定 `observer` / `worker`，因此上述三类组件均可正常接收回调或执行任务。
 
+### 在清单里声明导出角色
+
+同一个队列上可能同时存在 producer 组件（导出 `observer`）与 worker 组件（导出 `worker`）。插件派发任务与投递回调时需要区分二者——把 producer 当成 worker 去绑定会失败，而该失败与业务错误无法区分，任务会被重试到 `max-deliver` 后以 `max-retries-exceeded` 终结。
+
+因此**请把 `observer` / `worker` 一并写进对应 hostInterfaces 条目的 `interfaces`**（与 `producer` 同一列表）：
+
+```yaml
+hostInterfaces:
+  - namespace: custom
+    package: task-queue
+    version: "0.2.0"
+    interfaces: [types, producer, observer]   # producer 与 observer 同一队列
+    config:
+      queue: agent-task
+```
+
+插件优先选择声明了对应导出的组件。若某条队列上没有任何组件声明该角色，则退回到旧行为（任一绑定该队列的组件），因此省略声明不会让既有部署失效，只是失去角色区分。
+
 ## 生命周期回调
 
 observer 导出四个回调，均为独立事件、互不搭载：
@@ -110,6 +128,7 @@ hostInterfaces:
     version: "0.2.0"
     interfaces:
       - producer
+      - observer        # 导出角色，供插件把回调投递到本组件
     config:
       queue: agent-task
   - namespace: custom
@@ -117,6 +136,7 @@ hostInterfaces:
     version: "0.2.0"
     interfaces:
       - task-control
+      - worker         # 导出角色，供插件派发任务到本组件
     config:
       queue: agent-task
       retry-backoff-ms: "1000,5000,15000,60000"
