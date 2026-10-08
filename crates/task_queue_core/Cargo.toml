@@ -17,4 +17,5 @@ bytes = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio-util = { workspace = true }
+tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }

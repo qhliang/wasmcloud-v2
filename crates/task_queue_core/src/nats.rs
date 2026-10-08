@@ -4,13 +4,20 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
 use async_nats::jetstream::consumer::pull::Config as PullConfig;
-use async_nats::jetstream::kv::Config as KvConfig;
+use async_nats::jetstream::kv::{Config as KvConfig, UpdateError, UpdateErrorKind};
 use async_nats::jetstream::stream::{Config as StreamConfig, RetentionPolicy};
 use async_nats::jetstream::{AckKind, Context as JetStreamContext};
 use bytes::Bytes;
 
 use crate::config::QueueConfig;
 use crate::types::TaskMeta;
+
+/// Metadata compare-and-swap attempts before giving up.
+///
+/// Three is enough to ride out a concurrent writer landing between our read
+/// and our write; a fourth attempt means the key is being contended by something
+/// other than ordinary task dispatch.
+const METADATA_CAS_ATTEMPTS: u32 = 3;
 
 #[derive(Clone)]
 pub struct QueueHandles {
@@ -140,6 +147,61 @@ impl QueueHandles {
             .context("failed to update task metadata")
     }
 
+    /// Applies `mutate` to a task's metadata under a KV revision compare-and-swap.
+    ///
+    /// Read-modify-write against the META bucket has two independent writers for
+    /// the same key — the dispatcher marking a task running and a producer
+    /// requesting cancellation — so a plain `put_metadata` can silently discard
+    /// the other side's field (`cancel_requested` in particular: a cancellation
+    /// would be erased by the next dispatch write and the task would run to
+    /// completion regardless).
+    ///
+    /// Only a revision conflict is retried, and that is what makes replaying
+    /// `mutate` safe: `WrongLastRevision` means the server rejected the write,
+    /// so the mutation provably did not land and can be recomputed against a
+    /// fresh snapshot. Any other failure (`TimedOut`, transport, store deleted)
+    /// leaves the write outcome unknown, so it is propagated instead of retried —
+    /// otherwise a non-idempotent `mutate` (appending to `attempts`, say) would
+    /// duplicate its effect whenever the first write did in fact land.
+    ///
+    /// `mutate` is `FnMut` because it may run once per attempt, letting callers
+    /// report which branch a replayed mutation took.
+    ///
+    /// Returns the revision the winning write produced.
+    pub async fn update_metadata_with<F>(&self, task_id: &str, mut mutate: F) -> Result<u64>
+    where
+        F: FnMut(&mut TaskMeta) -> Result<()>,
+    {
+        let key = metadata_key(&self.config.name, task_id);
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let Some((revision, mut meta)) = self.get_metadata_with_revision(task_id).await? else {
+                anyhow::bail!("task not found");
+            };
+            mutate(&mut meta)?;
+            let raw = serde_json::to_vec(&meta).context("failed to encode task metadata")?;
+            match self
+                .metadata
+                .update(key.as_str(), Bytes::from(raw), revision)
+                .await
+            {
+                Ok(next) => return Ok(next),
+                Err(err) => {
+                    if !is_retryable_update_error(&err, attempts) {
+                        return Err(anyhow::Error::new(err))
+                            .context("failed to update task metadata");
+                    }
+                    tracing::debug!(
+                        task_id = %task_id,
+                        attempts,
+                        "task metadata cas conflict; replaying mutation"
+                    );
+                }
+            }
+        }
+    }
+
     pub async fn publish_result(&self, raw: Vec<u8>, task_id: &str) -> Result<()> {
         let Some(_stream) = self.results.as_ref() else {
             return Ok(());
@@ -151,6 +213,18 @@ impl QueueHandles {
             .context("failed to publish result")?;
         Ok(())
     }
+}
+
+/// Whether a failed CAS write may be retried by replaying the mutation.
+///
+/// Only a revision conflict qualifies. `WrongLastRevision` is the server
+/// rejecting the write outright, which proves the mutation did not land and
+/// makes recomputing it against a fresh snapshot safe. Every other kind leaves
+/// the outcome unknown — a `TimedOut` write may already have been applied — so
+/// replaying could double-apply a non-idempotent mutation (an appended attempt
+/// record, say). Those are propagated instead.
+fn is_retryable_update_error(err: &UpdateError, attempts: u32) -> bool {
+    err.kind() == UpdateErrorKind::WrongLastRevision && attempts < METADATA_CAS_ATTEMPTS
 }
 
 #[derive(Debug, Clone)]
@@ -226,6 +300,36 @@ mod tests {
             metadata_key("agent-task", "0198e57c-0000-7000-8000-000000000000"),
             "agent-task.0198e57c-0000-7000-8000-000000000000"
         );
+    }
+
+    #[test]
+    fn revision_conflict_is_retryable_until_the_budget_is_spent() {
+        let conflict = UpdateError::new(UpdateErrorKind::WrongLastRevision);
+        assert!(is_retryable_update_error(&conflict, 1));
+        assert!(is_retryable_update_error(
+            &conflict,
+            METADATA_CAS_ATTEMPTS - 1
+        ));
+        // The last permitted attempt already used the write; retrying past it
+        // would mean mutating without a fresh snapshot.
+        assert!(!is_retryable_update_error(&conflict, METADATA_CAS_ATTEMPTS));
+    }
+
+    #[test]
+    fn unknown_outcome_write_errors_are_never_replayed() {
+        // A timeout or transport failure may have applied the write server-side
+        // before the client gave up, so the outcome is unknown and replaying a
+        // non-idempotent mutation could duplicate it.
+        for kind in [
+            UpdateErrorKind::TimedOut,
+            UpdateErrorKind::Other,
+            UpdateErrorKind::InvalidKey,
+        ] {
+            assert!(
+                !is_retryable_update_error(&UpdateError::new(kind), 1),
+                "{kind:?} must not be replayed"
+            );
+        }
     }
 
     #[test]

@@ -100,6 +100,28 @@ pub struct TaskMeta {
     pub attempts: Vec<AttemptFailureRecord>,
 }
 
+impl TaskMeta {
+    /// Appends `record` unless an entry for the same delivery attempt exists.
+    ///
+    /// Task execution is at-least-once, so a redelivered attempt reaches this
+    /// more than once; `attempts` is otherwise unbounded and is serialized into
+    /// a KV value capped at 1 MiB. Keyed on `attempt` because that identifies
+    /// the delivery, and one delivery produces one failure.
+    ///
+    /// Returns whether the record was appended.
+    pub fn record_attempt(&mut self, record: AttemptFailureRecord) -> bool {
+        if self
+            .attempts
+            .iter()
+            .any(|recorded| recorded.attempt == record.attempt)
+        {
+            return false;
+        }
+        self.attempts.push(record);
+        true
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskEnvelope {
     pub schema_version: u32,
@@ -395,5 +417,69 @@ mod tests {
         assert!(!TaskState::Queued.is_terminal());
         assert!(!TaskState::Running.is_terminal());
         assert!(TaskState::Cancelled.is_terminal());
+    }
+
+    #[test]
+    fn terminal_states_match_the_hand_written_plugin_list() {
+        // `cancel_task_on` used to spell this list out inline before reusing
+        // `is_terminal`; guard the six states it enumerated.
+        for state in [
+            TaskState::Succeeded,
+            TaskState::Failed,
+            TaskState::DispatchTimeout,
+            TaskState::ExecutionTimeout,
+            TaskState::Cancelled,
+            TaskState::MaxRetriesExceeded,
+        ] {
+            assert!(state.is_terminal(), "{state:?} should be terminal");
+        }
+        // These three are the ones the dispatcher and cancellation still act on.
+        for state in [
+            TaskState::Queued,
+            TaskState::Running,
+            TaskState::DispatchTimeoutPending,
+        ] {
+            assert!(!state.is_terminal(), "{state:?} should not be terminal");
+        }
+    }
+
+    fn failure(attempt: u32) -> AttemptFailureRecord {
+        AttemptFailureRecord {
+            attempt,
+            source: "guest".to_string(),
+            error: "boom".to_string(),
+            started_at_ms: Some(1),
+            failed_at_ms: Some(2),
+            duration_ms: Some(1),
+        }
+    }
+
+    #[test]
+    fn record_attempt_appends_once_per_attempt() {
+        let mut meta = TaskMeta {
+            schema_version: 1,
+            id: "task-1".to_string(),
+            queue: "agent-task".to_string(),
+            state: TaskState::Running,
+            attempt: 1,
+            created_at_ms: 0,
+            dispatched_at_ms: None,
+            completed_at_ms: None,
+            deadline_ms: 0,
+            cancel_requested: false,
+            attempts: Vec::new(),
+        };
+
+        assert!(meta.record_attempt(failure(1)));
+        // Redelivery of the same attempt must not grow the record.
+        assert!(!meta.record_attempt(failure(1)));
+        assert_eq!(meta.attempts.len(), 1);
+
+        assert!(meta.record_attempt(failure(2)));
+        assert_eq!(meta.attempts.len(), 2);
+        assert_eq!(
+            meta.attempts.iter().map(|a| a.attempt).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
     }
 }
