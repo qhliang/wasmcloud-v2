@@ -58,6 +58,32 @@ mod bindings {
 #[derive(Clone, Debug)]
 pub struct QueueId(pub String);
 
+/// Aborts a spawned lease-renewal task when dropped.
+///
+/// The renewer keeps the JetStream lease alive for as long as it runs, so an
+/// exit path that returned without stopping it would leave the message pinned:
+/// it is never redelivered, the task never reaches a terminal state, and the
+/// Tokio task leaks. Tying the renewer's lifetime to a scope makes that class
+/// of early return impossible to reintroduce.
+struct RenewGuard(Option<tokio::task::JoinHandle<()>>);
+
+impl RenewGuard {
+    fn spawn<F>(future: F) -> Self
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        Self(Some(tokio::spawn(future)))
+    }
+}
+
+impl Drop for RenewGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
 // Role-scoped binding worlds. The monolithic `task-queue` world forces every
 // bound component to export BOTH `observer` and `worker`, which breaks the
 // normal single-role components: a producer exports only `observer`, a worker
@@ -227,6 +253,20 @@ pub struct ComponentData {
     /// 以外部 worker 模式运行的队列集合（主队列 + 各 named 队列）。
     /// named 条目可独立配置 `external-worker`，与主条目互不影响。
     external_queues: HashSet<String>,
+    /// 该组件在清单里声明的导出角色（`observer` / `worker`）。
+    ///
+    /// 回调投递与任务派发需要区分角色：同一个队列上可能同时存在只导出
+    /// `observer` 的 producer 组件和只导出 `worker` 的 worker 组件，而
+    /// `find_producer_component` / `find_worker_component` 此前只判断
+    /// 「是否服务该队列」，选中谁取决于 HashMap 迭代顺序。选中错角色会在
+    /// 绑定阶段失败：producer 被当成 worker 会让任务重试到
+    /// `max-retries-exceeded`（任务被毒化），worker 被当成 producer 则
+    /// 回调反复重试后丢弃。
+    ///
+    /// 未在清单里声明对应接口时为 `false`，此时查找会退回到旧行为
+    /// （任一服务该队列的组件），因此不会让既有部署退化。
+    observer_role: bool,
+    worker_role: bool,
 }
 
 impl ComponentData {
@@ -522,7 +562,8 @@ impl TaskQueuePlugin {
         let (_task, acker) = message.clone().split();
         let acker = Arc::new(acker);
         let renew_acker = acker.clone();
-        let renew_task = tokio::spawn(async move {
+        // Held for the rest of the function so every exit path stops renewing.
+        let renew_guard = RenewGuard::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(
                 task_queue_core::config::LEASE_RENEW_INTERVAL_MS,
             ));
@@ -556,6 +597,10 @@ impl TaskQueuePlugin {
             .await
         {
             warn!(task_id = %task_id, err = %err, "failed to mark task running");
+            // No ack and no nak: dropping `renew_guard` stops the Progress
+            // renewer, so the lease lapses after `ack-wait` and JetStream
+            // redelivers the task. Acknowledging here would drop a task that
+            // never ran; keeping the renewer alive would strand it forever.
             return;
         }
 
@@ -638,7 +683,9 @@ impl TaskQueuePlugin {
                 }
             }
         }
-        renew_task.abort();
+        // Dropping `renew_guard` aborts the renewer here, after the terminal
+        // ack, so no Progress can race the ack.
+        drop(renew_guard);
     }
 
     async fn put_metadata_with<F>(
@@ -666,15 +713,27 @@ impl TaskQueuePlugin {
 
     async fn find_worker_component(&self, queue: &str) -> String {
         let tracker = self.tracker.read().await;
+        let serving = |component_id: &String| {
+            tracker
+                .get_component_data(component_id)
+                .is_some_and(|data| data.serves_queue(queue))
+        };
+        // Prefer a component that declares the `worker` export: binding a
+        // producer-only component to the worker world fails, and that failure is
+        // indistinguishable from a guest error, so the task would be retried
+        // until `max-retries-exceeded`. Falls back to any component serving the
+        // queue when no manifest declares the role, preserving prior behavior.
         tracker
             .components
             .keys()
-            .find_map(|component_id| {
-                tracker
-                    .get_component_data(component_id)
-                    .filter(|data| data.serves_queue(queue))
-                    .map(|_| component_id.clone())
+            .find(|component_id| {
+                serving(component_id)
+                    && tracker
+                        .get_component_data(component_id)
+                        .is_some_and(|data| data.worker_role)
             })
+            .or_else(|| tracker.components.keys().find(|id| serving(id)))
+            .cloned()
             .unwrap_or_default()
     }
 
@@ -733,26 +792,32 @@ impl TaskQueuePlugin {
 
     async fn find_producer_component(&self, queue: &str) -> Option<String> {
         let tracker = self.tracker.read().await;
-        let mut fallback = None;
-        for component_id in tracker.components.keys() {
-            let matches = tracker
-                .get_component_data(component_id)
-                .is_some_and(|data| data.serves_queue(queue));
-            if !matches {
-                continue;
+        // Same role split as `find_worker_component`, from the other side: a
+        // worker-only component cannot be bound to the observer world, so
+        // selecting one makes every callback fail and be retried before being
+        // dropped. Roles are preferred, not required — a manifest that declares
+        // neither keeps the previous "any component serving the queue" behavior.
+        let pick = |require_role: bool| -> Option<String> {
+            let mut fallback = None;
+            for component_id in tracker.components.keys() {
+                let Some(data) = tracker.get_component_data(component_id) else {
+                    continue;
+                };
+                if !data.serves_queue(queue) || (require_role && !data.observer_role) {
+                    continue;
+                }
+                // Prefer an already-resolved (workload-ready) component: during a
+                // rolling update the old workload is still in the tracker before it
+                // unbinds, so without this the callbacks could pin to a component
+                // that is about to go away.
+                if data.workload.is_some() {
+                    return Some(component_id.clone());
+                }
+                fallback.get_or_insert_with(|| component_id.clone());
             }
-            // 优先返回已 resolve（workload 就绪）的 observer 组件；滚动更新期间
-            // 旧 worklod 尚未解绑时，其组件会先出现在 tracker 中，避免把回调
-            // 固定到即将解绑的陈旧组件上。
-            let ready = tracker
-                .get_component_data(component_id)
-                .is_some_and(|data| data.workload.is_some());
-            if ready {
-                return Some(component_id.clone());
-            }
-            fallback.get_or_insert_with(|| component_id.clone());
-        }
-        fallback
+            fallback
+        };
+        pick(true).or_else(|| pick(false))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1453,9 +1518,19 @@ impl HostPlugin for TaskQueuePlugin {
             .map(|(name, _)| name.clone())
             .collect();
 
+        // 导出角色取自同批 hostInterfaces 条目的 `interfaces` 列表，与 `producer`
+        // 的判定方式一致。
+        let declares_role = |role: &str| {
+            tq_entries
+                .iter()
+                .any(|entry| entry.interfaces.iter().any(|i| i == role))
+        };
+        let observer_role = declares_role("observer");
+        let worker_role = declares_role("worker");
         debug!(
             component_id = %component_id,
             queue = ?primary_queue, named = ?named_queues, external = ?external_queues,
+            observer_role, worker_role,
             "task-queue: component bound"
         );
         self.tracker.write().await.add_component(
@@ -1467,6 +1542,8 @@ impl HostPlugin for TaskQueuePlugin {
                 workload: None,
                 cancel_token: CancellationToken::new(),
                 external_queues,
+                observer_role,
+                worker_role,
             },
         );
         Ok(())
@@ -1650,6 +1727,56 @@ mod tests {
         }
     }
 
+    /// 构造 `ComponentData` 用于测试：named-only 的 producer 组件，
+    /// 导出角色可按需开关。
+    fn component_data_for_test() -> ComponentData {
+        ComponentData {
+            queue: None,
+            named_queues: [("agentq".to_string(), "agent-task".to_string())]
+                .into_iter()
+                .collect(),
+            queue_configs: HashMap::new(),
+            workload: None,
+            cancel_token: CancellationToken::new(),
+            external_queues: HashSet::new(),
+            observer_role: true,
+            worker_role: false,
+        }
+    }
+
+    /// 角色判定直接取自 hostInterfaces 条目的 `interfaces` 列表。
+    #[test]
+    fn export_roles_come_from_the_declared_interfaces() {
+        let declares =
+            |entry: &WitInterface, role: &str| entry.interfaces.iter().any(|i| i == role);
+
+        let producer_only = tq_entry(None, &[("queue", "agent-task")]);
+        assert!(declares(&producer_only, "producer"));
+        assert!(!declares(&producer_only, "observer"));
+        assert!(!declares(&producer_only, "worker"));
+
+        // cloud_manager 实际的清单形态：producer + observer 同一条目。
+        let producer_and_observer = WitInterface {
+            interfaces: ["types", "producer", "observer"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            ..producer_only
+        };
+        assert!(declares(&producer_and_observer, "observer"));
+        assert!(!declares(&producer_and_observer, "worker"));
+    }
+
+    /// 只有主队列匹配不足以充当 worker——这是角色被忽略时的原故障。
+    #[test]
+    fn observer_role_is_independent_of_serving_the_queue() {
+        let data = component_data_for_test();
+        // 服务 agent-task，但只导出 observer，不能被派发任务。
+        assert!(data.serves_queue("agent-task"));
+        assert!(data.observer_role);
+        assert!(!data.worker_role);
+    }
+
     /// 只用 named producer import 的组件没有主队列——无名条目不再强制要求。
     #[test]
     fn named_only_component_has_no_primary_queue() {
@@ -1716,16 +1843,7 @@ mod tests {
     /// 没有主队列时，组件仍应通过 named 队列被识别为该队列的观察者/生产者。
     #[test]
     fn serves_queue_matches_named_queue_without_primary() {
-        let data = ComponentData {
-            queue: None,
-            named_queues: [("agentq".to_string(), "agent-task".to_string())]
-                .into_iter()
-                .collect(),
-            queue_configs: HashMap::new(),
-            workload: None,
-            cancel_token: CancellationToken::new(),
-            external_queues: HashSet::new(),
-        };
+        let data = component_data_for_test();
         assert!(data.serves_queue("agent-task"));
         assert!(!data.serves_queue("other-task"));
     }
