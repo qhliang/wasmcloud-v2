@@ -338,8 +338,21 @@ let renewer = tokio::spawn(async move {
 
 如果 worker 运行在 Kubernetes 外，需要授予 NATS 地址访问权限；开启数据面 TLS 时还必须提供可被 NATS `verify_and_map` 接受的客户端证书。不要把 Linux 容器镜像当作 wasmCloud native workload 部署；可使用独立 Kubernetes Deployment 或 wasmCloud 原生 service。
 
+## 任务元数据的状态转换
+
+同一个 META key 有两类独立写者：dispatcher 标记任务 running / 记录失败 / 写终态，以及 producer 通过 `cancel-task()` 请求取消。它们都改同一条 `TaskMeta` 记录，因此所有状态转换一律走 `QueueHandles::update_metadata_with`（见 `task_queue_core`），在 META KV 的 revision 上做 compare-and-swap：
+
+- 读快照 → 应用 mutation → 带 revision 写回；revision 冲突则**重新读取并重放** mutation（最多 3 次）。
+- **只有 `WrongLastRevision` 会重试。** 该错误说明服务端明确拒绝了这次写入，mutation 必然没有生效，因此重放安全。其他错误（超时、传输失败、bucket 被删）意味着写入结果未知，直接上抛——否则非幂等的 mutation（例如追加一条 attempt 记录）会在写入其实已生效的情况下重复生效。
+- 由此 `cancel-task()` 的 `cancel_requested` 标志不会再被并发的 dispatch 写入整条覆盖掉：dispatch 侧冲突后会基于最新快照重放，而最新快照里带着该标志。
+
+副作用记录按 delivery attempt 去重（`TaskMeta::record_attempt`），因此 at-least-once 下的重复投递不会让 `attempts` 数组无界增长（META KV 的 `max_value_size` 为 1 MiB）。
+
+`cancel-task()` 仍遵循协作式模型：任务已派发后到达的取消只设置标志，由 worker 在检查点通过 `task-control.is-cancelled`（原生 worker 见 `TaskContext::is_cancelled`）自行观察，无法中断正在执行的工作。
+
 ## 当前限制
 
 - 执行超时和取消是协作式的，不会强制中断未返回的 Wasm 调用。
-- dispatch timeout scanner、metadata CAS 和终态回调去重仍在 P0 范围内推进。
+- dispatch timeout scanner 和终态回调去重仍在 P0 范围内推进。
+- `ttl-ms`（`set-options` 的过期）不属于本插件：WASM worker 消费路径目前不使用它。
 - 任务执行语义是 at-least-once，业务副作用需要根据 task id 保证幂等。
