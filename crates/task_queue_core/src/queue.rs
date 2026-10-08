@@ -83,38 +83,6 @@ impl TaskProducer {
         };
         Ok(Some(task_info(&meta)))
     }
-
-    /// Requests cancellation using a KV revision CAS to avoid lost updates.
-    pub async fn cancel_task(&self, task_id: &str) -> Result<()> {
-        let Some((revision, mut meta)) = self.handles.get_metadata_with_revision(task_id).await?
-        else {
-            anyhow::bail!("task not found");
-        };
-        if meta.state.is_terminal() {
-            anyhow::bail!("task already completed");
-        }
-        meta.cancel_requested = true;
-        // A queued task can transition directly to terminal cancellation.
-        if meta.state == TaskState::Queued {
-            meta.state = TaskState::Cancelled;
-            meta.completed_at_ms = Some(now_ms());
-        }
-        self.handles
-            .update_metadata(&meta, revision)
-            .await
-            .context("failed to update task metadata")?;
-        if meta.state == TaskState::Cancelled {
-            let subject = task_subject(&self.handles.config.name, task_id);
-            let _ = self
-                .handles
-                .task_stream
-                .purge()
-                .filter(subject)
-                .await
-                .context("failed to purge cancelled task");
-        }
-        Ok(())
-    }
 }
 
 pub fn task_info(meta: &TaskMeta) -> TaskInfo {

@@ -365,10 +365,6 @@ impl TaskQueuePlugin {
         handles.get_metadata(task_id).await
     }
 
-    async fn put_metadata(&self, handles: &QueueHandles, meta: &TaskMeta) -> anyhow::Result<u64> {
-        handles.put_metadata(meta).await
-    }
-
     async fn observe(&self, component_id: &str, event: CallbackEvent) -> anyhow::Result<()> {
         debug!(component_id = %component_id, event = %callback_event_summary(&event), "task-queue: queueing observer callback");
         self.callback_tx
@@ -439,31 +435,51 @@ impl TaskQueuePlugin {
         let Some(handles) = handles else {
             return Ok(Err("queue not ready".into()));
         };
-        let mut meta = match self.metadata(&handles, task_id).await {
-            Ok(meta) => meta,
-            Err(err) => return Ok(Err(format!("task not found: {err}"))),
-        };
-        if matches!(
-            meta.state,
-            TaskState::Succeeded
-                | TaskState::Failed
-                | TaskState::DispatchTimeout
-                | TaskState::ExecutionTimeout
-                | TaskState::Cancelled
-                | TaskState::MaxRetriesExceeded
-        ) {
-            return Ok(Err("task already completed".into()));
-        }
-        meta.cancel_requested = true;
-        meta.state = if meta.state == TaskState::Queued {
-            TaskState::Cancelled
-        } else {
-            meta.state
-        };
-        if let Err(err) = self.put_metadata(&handles, &meta).await {
+        // Cancellation races the dispatcher's own metadata write, so the
+        // terminal check and the flag write happen inside the CAS mutation,
+        // against the snapshot the winning write actually committed. Deciding
+        // "still pending" from a read taken before the conflict window lets a
+        // dispatch write land in between, and because both sides rewrite the
+        // whole record that erases `cancel_requested` — the task then runs to
+        // completion and the caller was told cancellation was accepted.
+        //
+        // Note the flag surviving is what CAS buys here; a cancel that lands
+        // after the task is already dispatched still cannot stop execution
+        // (see the cooperative-cancellation limitation in the README).
+        let mut already_terminal = false;
+        let mut purged = false;
+        if let Err(err) = handles
+            .update_metadata_with(task_id, |meta| {
+                // Reset first: a conflict replays this closure against a fresh
+                // snapshot, and without the reset a stale `true` would describe
+                // the previous attempt's state — e.g. reporting "already
+                // completed" for a task that is in fact still pending, or
+                // purging a task the dispatcher has since started running.
+                already_terminal = false;
+                purged = false;
+                if meta.state.is_terminal() {
+                    already_terminal = true;
+                    return Ok(());
+                }
+                meta.cancel_requested = true;
+                // A still-queued task can go terminal immediately; a running one
+                // only observes the flag cooperatively via `task-control`.
+                if meta.state == TaskState::Queued {
+                    meta.state = TaskState::Cancelled;
+                    meta.completed_at_ms = Some(now_ms());
+                    purged = true;
+                }
+                Ok(())
+            })
+            .await
+        {
             return Ok(Err(format!("failed to update task metadata: {err}")));
         }
-        if meta.state == TaskState::Cancelled {
+        if already_terminal {
+            return Ok(Err("task already completed".into()));
+        }
+        if purged {
+            // Purge cannot recall a message the dispatcher already pulled.
             let subject = format!("{}.tasks.{task_id}", handles.config.name);
             let _ = handles.task_stream.purge().filter(subject).await;
         }
@@ -520,12 +536,22 @@ impl TaskQueuePlugin {
             }
         });
 
+        // Timestamps are sampled once, outside the mutation: the CAS helper replays
+        // the closure on a revision conflict, and recomputing them per replay
+        // would drift `dispatched_at_ms` / `deadline_ms` away from the moment
+        // the attempt actually started.
+        let dispatched_at_ms = now_ms();
+        // Saturating conversion, matching `task_queue_core::queue::submit`: a
+        // bare `as u64` would truncate the u128 millisecond count.
+        let execution_timeout_ms =
+            u64::try_from(handles.config.execution_timeout.as_millis()).unwrap_or(u64::MAX);
+        let deadline_ms = dispatched_at_ms.saturating_add(execution_timeout_ms);
         if let Err(err) = self
             .put_metadata_with(&handles, &task_id, |meta| {
                 meta.state = TaskState::Running;
                 meta.attempt = attempt;
-                meta.dispatched_at_ms = Some(now_ms());
-                meta.deadline_ms = now_ms() + handles.config.execution_timeout.as_millis() as u64;
+                meta.dispatched_at_ms = Some(dispatched_at_ms);
+                meta.deadline_ms = deadline_ms;
             })
             .await
         {
@@ -619,15 +645,23 @@ impl TaskQueuePlugin {
         &self,
         handles: &QueueHandles,
         task_id: &str,
-        mutate: F,
+        mut mutate: F,
     ) -> anyhow::Result<()>
     where
-        F: FnOnce(&mut TaskMeta),
+        // `FnMut`, not `FnOnce`: the CAS helper replays this closure on every
+        // revision conflict, so the mutation may run more than once.
+        F: FnMut(&mut TaskMeta),
     {
-        let mut meta = self.metadata(handles, task_id).await?;
-        mutate(&mut meta);
-        self.put_metadata(handles, &meta).await?;
-        Ok(())
+        // Forward to the CAS helper rather than a plain read-modify-write: a
+        // producer cancelling the same task concurrently must not lose its
+        // `cancel_requested` flag to this write.
+        handles
+            .update_metadata_with(task_id, |meta| {
+                mutate(meta);
+                Ok(())
+            })
+            .await
+            .map(|_| ())
     }
 
     async fn find_worker_component(&self, queue: &str) -> String {
@@ -663,15 +697,13 @@ impl TaskQueuePlugin {
             failed_at_ms: Some(now_ms()),
             duration_ms: Some(duration_ms),
         };
-        let mut meta = match self.metadata(handles, task_id).await {
-            Ok(meta) => meta,
-            Err(err) => {
-                warn!(task_id = %task_id, err = %err, "failed to read task before failure record");
-                return;
-            }
-        };
-        meta.attempts.push(failure.clone());
-        if let Err(err) = self.put_metadata(handles, &meta).await {
+        if let Err(err) = handles
+            .update_metadata_with(task_id, |meta| {
+                meta.record_attempt(failure.clone());
+                Ok(())
+            })
+            .await
+        {
             warn!(task_id = %task_id, err = %err, "failed to record attempt failure");
         }
 
@@ -734,16 +766,25 @@ impl TaskQueuePlugin {
         error: Option<String>,
         started_at_ms: u64,
     ) {
-        let mut meta = match self.metadata(handles, task_id).await {
-            Ok(meta) => meta,
-            Err(err) => {
-                warn!(task_id = %task_id, err = %err, "failed to read task before completion");
-                return;
-            }
-        };
-        meta.state = state;
-        meta.completed_at_ms = Some(now_ms());
-        if let Err(err) = self.put_metadata(handles, &meta).await {
+        // Preserves the pre-CAS behavior on an unreadable task: bail out before
+        // archiving and before the caller acks, so the delivery is not silently
+        // dropped with no terminal event ever published. CAS collapsed "read
+        // failed" and "write failed" into one result, so the read is checked
+        // separately to keep the two distinguishable. One extra KV read on
+        // completion is cheap next to the work the task just did.
+        if handles.get_metadata(task_id).await.is_err() {
+            warn!(task_id = %task_id, "failed to read task before completion");
+            return;
+        }
+        let completed_at_ms = now_ms();
+        if let Err(err) = handles
+            .update_metadata_with(task_id, |meta| {
+                meta.state = state;
+                meta.completed_at_ms = Some(completed_at_ms);
+                Ok(())
+            })
+            .await
+        {
             warn!(task_id = %task_id, err = %err, "failed to update completed metadata");
         }
 
@@ -763,7 +804,7 @@ impl TaskQueuePlugin {
             output_base64: result.output.as_deref().map(base64_encode),
             output: None,
             error: result.error.clone(),
-            completed_at_ms: meta.completed_at_ms,
+            completed_at_ms: Some(completed_at_ms),
         };
         self.archive_result(handles, &archived).await;
 
