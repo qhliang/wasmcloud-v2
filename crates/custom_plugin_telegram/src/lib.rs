@@ -371,8 +371,11 @@ impl HostPlugin for Telegram {
 
     fn world(&self) -> WitWorld {
         WitWorld {
-            imports: HashSet::from([WitInterface::from("custom:telegram/handler@0.1.0")]),
-            exports: HashSet::from([WitInterface::from("custom:telegram/sender@0.1.0")]),
+            // `sender` is served to the guest (the guest's `telegram-client`
+            // calls into it); `handler` is called on the workload. See
+            // `WitWorld::provides`.
+            imports: HashSet::from([WitInterface::from("custom:telegram/sender@0.1.0")]),
+            exports: HashSet::from([WitInterface::from("custom:telegram/handler@0.1.0")]),
         }
     }
 
@@ -482,5 +485,36 @@ impl HostPlugin for Telegram {
             .await;
         debug!(workload_id = %workload_id, "Telegram plugin unbound");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_world_imports() {
+        let plugin = Telegram::new();
+        let world = plugin.world();
+        // Assert the interface by name: a package-level check passes whichever
+        // way the entries are filed, which is how an inverted world goes
+        // unnoticed.
+        assert!(world.imports.iter().any(|i| i.namespace == "custom"
+            && i.package == "telegram"
+            && i.interfaces.contains("sender")));
+    }
+
+    #[test]
+    fn test_world_exports() {
+        let plugin = Telegram::new();
+        let world = plugin.world();
+        assert!(world.exports.iter().any(|i| i.namespace == "custom"
+            && i.package == "telegram"
+            && i.interfaces.contains("handler")));
+    }
+
+    #[test]
+    fn test_default() {
+        assert_eq!(Telegram::default().id(), PLUGIN_ID);
     }
 }

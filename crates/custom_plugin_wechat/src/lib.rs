@@ -506,8 +506,11 @@ impl HostPlugin for Wechat {
 
     fn world(&self) -> WitWorld {
         WitWorld {
-            imports: HashSet::from([WitInterface::from("custom:wechat/handler@0.1.0")]),
-            exports: HashSet::from([WitInterface::from("custom:wechat/sender@0.1.0")]),
+            // `sender` is served to the guest (the guest's `wechat-client` calls
+            // into it); `handler` is called on the workload. See
+            // `WitWorld::provides`.
+            imports: HashSet::from([WitInterface::from("custom:wechat/sender@0.1.0")]),
+            exports: HashSet::from([WitInterface::from("custom:wechat/handler@0.1.0")]),
         }
     }
 
@@ -638,24 +641,21 @@ mod tests {
     fn test_world_imports() {
         let plugin = Wechat::new();
         let world = plugin.world();
-        assert!(
-            world
-                .imports
-                .iter()
-                .any(|i| i.namespace == "custom" && i.package == "wechat")
-        );
+        // Assert the interface by name: a package-level check passes whichever
+        // way the entries are filed, which is how the inverted world below went
+        // unnoticed.
+        assert!(world.imports.iter().any(|i| i.namespace == "custom"
+            && i.package == "wechat"
+            && i.interfaces.contains("sender")));
     }
 
     #[test]
     fn test_world_exports() {
         let plugin = Wechat::new();
         let world = plugin.world();
-        assert!(
-            world
-                .exports
-                .iter()
-                .any(|i| i.namespace == "custom" && i.package == "wechat")
-        );
+        assert!(world.exports.iter().any(|i| i.namespace == "custom"
+            && i.package == "wechat"
+            && i.interfaces.contains("handler")));
     }
 
     #[test]

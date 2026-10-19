@@ -674,7 +674,9 @@ impl HostPlugin for Mail {
 
     fn world(&self) -> WitWorld {
         WitWorld {
-            exports: HashSet::from([WitInterface::from("custom:mail/sender@0.1.0")]),
+            // The plugin serves this interface to the guest, so it belongs under
+            // `imports` — see `WitWorld::provides`.
+            imports: HashSet::from([WitInterface::from("custom:mail/sender@0.1.0")]),
             ..Default::default()
         }
     }

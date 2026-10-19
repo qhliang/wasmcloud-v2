@@ -1279,8 +1279,11 @@ impl HostPlugin for Feishu {
 
     fn world(&self) -> WitWorld {
         WitWorld {
-            imports: HashSet::from([WitInterface::from("custom:feishu/handler@0.1.0")]),
-            exports: HashSet::from([WitInterface::from("custom:feishu/sender@0.1.0")]),
+            // `sender` is served to the guest (the guest's `feishu-client` calls
+            // into it); `handler` is called on the workload. See
+            // `WitWorld::provides`.
+            imports: HashSet::from([WitInterface::from("custom:feishu/sender@0.1.0")]),
+            exports: HashSet::from([WitInterface::from("custom:feishu/handler@0.1.0")]),
         }
     }
 
@@ -1429,24 +1432,21 @@ mod tests {
     fn test_world_imports() {
         let plugin = Feishu::new();
         let world = plugin.world();
-        assert!(
-            world
-                .imports
-                .iter()
-                .any(|i| i.namespace == "custom" && i.package == "feishu")
-        );
+        // Assert the interface by name: a package-level check passes whichever
+        // way the entries are filed, which is how the inverted world below went
+        // unnoticed.
+        assert!(world.imports.iter().any(|i| i.namespace == "custom"
+            && i.package == "feishu"
+            && i.interfaces.contains("sender")));
     }
 
     #[test]
     fn test_world_exports() {
         let plugin = Feishu::new();
         let world = plugin.world();
-        assert!(
-            world
-                .exports
-                .iter()
-                .any(|i| i.namespace == "custom" && i.package == "feishu")
-        );
+        assert!(world.exports.iter().any(|i| i.namespace == "custom"
+            && i.package == "feishu"
+            && i.interfaces.contains("handler")));
     }
 
     #[test]

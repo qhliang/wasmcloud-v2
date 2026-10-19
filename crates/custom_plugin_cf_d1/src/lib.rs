@@ -723,7 +723,9 @@ impl HostPlugin for CloudflareD1 {
 
     fn world(&self) -> WitWorld {
         WitWorld {
-            exports: HashSet::from([WitInterface::from("custom:cf-d1/query@0.1.0")]),
+            // The plugin serves this interface to the guest, so it belongs under
+            // `imports` — see `WitWorld::provides`.
+            imports: HashSet::from([WitInterface::from("custom:cf-d1/query@0.1.0")]),
             ..Default::default()
         }
     }
@@ -798,12 +800,14 @@ mod tests {
     fn test_world_imports() {
         let plugin = CloudflareD1::new();
         let world = plugin.world();
-        assert!(
-            world
-                .exports
-                .iter()
-                .any(|i| i.namespace == "custom" && i.package == "cf-d1")
-        );
+        // Assert the interface by name, not just the package: a package-level
+        // check passes whichever way the entry is filed, which is how an
+        // inverted world went unnoticed.
+        assert!(world.imports.iter().any(|i| i.namespace == "custom"
+            && i.package == "cf-d1"
+            && i.interfaces.contains("query")));
+        // The plugin calls nothing on the workload.
+        assert!(world.exports.is_empty());
     }
 
     #[test]
