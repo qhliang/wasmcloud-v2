@@ -1,0 +1,11 @@
+package my:d1-table;
+
+/// The plugin *provides* `table` to components, so it belongs under `imports`.
+///
+/// Some plugins in this workspace declare the same thing under `exports`
+/// (cf-d1, mail, feishu, telegram, wechat). Per `wash-runtime/src/wit.rs`,
+/// `imports` are the interfaces a plugin offers a workload; this world follows
+/// that, and the majority convention (crontab, event_monitor, task_queue).
+world d1-table {
+    import custom:d1-table/table@0.1.0;
+}

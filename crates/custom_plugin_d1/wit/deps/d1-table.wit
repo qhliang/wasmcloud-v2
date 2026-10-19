@@ -1,0 +1,268 @@
+package custom:d1-table@0.1.0;
+
+/// Shared types for the structured Cloudflare D1 table-data interface.
+///
+/// This package deliberately offers no SQL string entry point. Every operation is
+/// expressed as structured fields that the host turns into parameterised SQL, so
+/// schema statements (DDL) are unreachable by construction rather than by
+/// runtime filtering.
+interface types {
+    /// Errors a component can act on, as opposed to an infrastructure fault.
+    variant table-error {
+        /// The request was well-formed but semantically rejected (empty field
+        /// list, empty conditions, limit above the cap, and so on).
+        invalid-request(string),
+        /// A table, column or alias name did not match the accepted identifier
+        /// shape.
+        invalid-identifier(string),
+        /// Cloudflare D1 rejected the statement.
+        database-error(string),
+        /// The HTTP request to Cloudflare failed, timed out, or was refused.
+        connection-error(string),
+        /// The response could not be understood.
+        unexpected(string),
+    }
+
+    /// Configuration for a D1 client.
+    ///
+    /// Field-for-field identical to `custom:cf-d1/types.d1-config`. It is
+    /// redeclared here on purpose: that record lives *inside* cf-d1's `types`
+    /// interface, so reaching across packages would force this plugin to also
+    /// provide `custom:cf-d1/types` and make two plugins contend for one host
+    /// interface. WIT records are structural, so identical fields are wire
+    /// compatible and the redeclaration costs a guest nothing.
+    record d1-config {
+        /// Cloudflare account ID.
+        account-id: string,
+        /// Cloudflare API token with D1 permissions.
+        api-token: string,
+        /// D1 database ID.
+        database-id: string,
+    }
+
+    /// A column value in a row, or a value bound into a statement.
+    variant column-value {
+        null,
+        integer(s64),
+        real(f64),
+        text(string),
+        blob(list<u8>),
+    }
+
+    /// A single row of a result set.
+    record result-row {
+        /// Column values, in projection order.
+        values: list<column-value>,
+    }
+
+    /// Metadata about one result column.
+    record column-meta {
+        name: string,
+        /// SQLite type name, when the server reports one.
+        column-type: option<string>,
+    }
+
+    /// The outcome of one statement.
+    record query-result {
+        columns: list<column-meta>,
+        rows: list<result-row>,
+        /// Rows changed. Non-zero for write statements.
+        rows-affected: u64,
+        last-insert-rowid: option<s64>,
+    }
+
+    /// Aggregate functions available to a projection.
+    enum aggregate-fn {
+        count,
+        sum,
+        avg,
+        min,
+        max,
+    }
+
+    /// Comparisons available to a condition.
+    enum comparison-op {
+        eq,
+        ne,
+        lt,
+        le,
+        gt,
+        ge,
+        like,
+        /// Takes no value; renders as `IS NULL`.
+        is-null,
+        /// Takes no value; renders as `IS NOT NULL`.
+        not-null,
+    }
+
+    /// One predicate, always on the result-set side (no subquery).
+    record condition {
+        column: string,
+        op: comparison-op,
+        /// Must be `none` for `is-null` / `not-null`, and `some` for every other
+        /// operator.
+        value: option<column-value>,
+    }
+
+    /// A column, optionally qualified by its table.
+    record column-ref {
+        /// `none` leaves the column unqualified.
+        table: option<string>,
+        name: string,
+    }
+
+    /// An aggregate applied to one column.
+    record aggregate-projection {
+        aggregate: aggregate-fn,
+        column: column-ref,
+    }
+
+    /// What a projection item computes.
+    variant projection {
+        /// A plain column.
+        column(column-ref),
+        /// Count over all rows.
+        count-all,
+        /// An aggregate over one column.
+        aggregate(aggregate-projection),
+    }
+
+    /// One entry of the `SELECT` list.
+    record select-item {
+        expr: projection,
+        alias: option<string>,
+    }
+
+    enum join-kind {
+        inner,
+        left,
+    }
+
+    /// One `JOIN` against another table in the same database.
+    record join-clause {
+        kind: join-kind,
+        table: string,
+        /// Must be non-empty. Comma-joins are not offered, so every join states
+        /// its predicate.
+        on: list<condition>,
+    }
+
+    enum sort-direction {
+        asc,
+        desc,
+    }
+
+    record order-by {
+        column: string,
+        direction: sort-direction,
+    }
+
+    /// Result pagination.
+    record page {
+        /// Capped at 1000; a larger value is rejected rather than clamped.
+        limit: option<u32>,
+        /// Requires a limit; a bare offset renders as `LIMIT -1 OFFSET ?`.
+        offset: option<u32>,
+    }
+
+    /// A column and the value to write into it.
+    record field {
+        name: string,
+        value: column-value,
+    }
+
+    enum upsert-mode {
+        /// `ON CONFLICT (...) DO UPDATE SET ...`, preserving columns not named.
+        update,
+        /// `ON CONFLICT (...) DO NOTHING`, leaving the existing row untouched.
+        ignore,
+    }
+
+    record upsert-spec {
+        mode: upsert-mode,
+        /// The uniqueness constraint that triggers the conflict handling.
+        ///
+        /// Required and never optional. SQLite lets `DO UPDATE` omit its target,
+        /// in which case it fires on *any* unclaimed uniqueness constraint — a
+        /// behaviour that is too broad to be predictable, so the host refuses to
+        /// guess it.
+        conflict-columns: list<string>,
+        /// Columns to overwrite when `mode` is `update`. Empty means "every
+        /// column in `fields`". Must be empty when `mode` is `ignore`.
+        update-columns: list<string>,
+    }
+}
+
+/// Structured table-data access against one Cloudflare D1 database.
+interface table {
+    use types.{
+        table-error, d1-config, query-result, column-value, condition,
+        select-item, join-clause, order-by, page, field, upsert-spec,
+    };
+
+    /// A client bound to the database named by the host interface config.
+    resource d1-table-client {
+        /// Create a client.
+        ///
+        /// Takes no arguments on purpose: credentials come only from the host
+        /// interface config, so a component has no way to redirect the client at
+        /// a different account or database.
+        constructor();
+
+        /// Read rows, optionally joined, grouped and aggregated.
+        select: func(
+            table: string,
+            joins: list<join-clause>,
+            projection: list<select-item>,
+            conditions: list<condition>,
+            group-by: list<string>,
+            order-by: list<order-by>,
+            page: page,
+        ) -> result<query-result, table-error>;
+
+        /// Count rows under the same join and filter rules as `select`.
+        count: func(
+            table: string,
+            joins: list<join-clause>,
+            conditions: list<condition>,
+        ) -> result<u64, table-error>;
+
+        /// Insert one row. Fails if a uniqueness constraint is violated.
+        insert: func(
+            table: string,
+            fields: list<field>,
+        ) -> result<query-result, table-error>;
+
+        /// Insert one row, or update an existing one that violates
+        /// `conflict-columns`.
+        ///
+        /// Conflict handling applies to uniqueness constraints only. NOT NULL,
+        /// CHECK and foreign-key violations still raise, as does a `DO UPDATE`
+        /// that hits any constraint: the resolution is always `ABORT`, so the
+        /// whole statement rolls back. SQLite does not support UPSERT against
+        /// virtual tables, so this fails on FTS5 tables.
+        upsert: func(
+            table: string,
+            fields: list<field>,
+            spec: upsert-spec,
+        ) -> result<query-result, table-error>;
+
+        /// Update rows matching `conditions`. An empty list is refused rather
+        /// than treated as "every row".
+        update: func(
+            table: string,
+            fields: list<field>,
+            conditions: list<condition>,
+        ) -> result<query-result, table-error>;
+
+        /// Delete rows matching `conditions`. An empty list is refused rather
+        /// than treated as "every row".
+        delete: func(
+            table: string,
+            conditions: list<condition>,
+        ) -> result<query-result, table-error>;
+
+        /// Release the client. D1 holds no background work, so this is a no-op.
+        stop: func() -> result<_, table-error>;
+    }
+}

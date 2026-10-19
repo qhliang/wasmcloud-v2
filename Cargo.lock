@@ -1804,6 +1804,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "custom_plugin_d1"
+version = "2.9.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "indexmap 2.14.0",
+ "opentelemetry 0.31.0",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "wash-runtime",
+ "wasmtime",
+]
+
+[[package]]
 name = "custom_plugin_dingtalk_stream"
 version = "2.9.1"
 dependencies = [
@@ -8286,6 +8303,7 @@ dependencies = [
  "ctrlc",
  "custom_plugin_cf_d1",
  "custom_plugin_crontab",
+ "custom_plugin_d1",
  "custom_plugin_dingtalk_stream",
  "custom_plugin_event_monitor",
  "custom_plugin_feishu",

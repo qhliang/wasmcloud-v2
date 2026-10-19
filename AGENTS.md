@@ -28,7 +28,7 @@ cargo xtask build-fixtures                 # 生成 wash-runtime 集成测试所
   - `plugin/` — WASI 接口实现（blobstore, config, keyvalue, logging, messaging, otel, postgres, webgpu）
   - `engine/` — 引擎和组件实例化 (`ctx.rs`, `workload.rs`)
 - `crates/custom_plugin_*` — 宿主端插件，编译进宿主二进制：
-  - 存储/基础设施：`kv`, `blobstore`, `cf_d1`, `nats_utils`, `event_monitor`
+  - 存储/基础设施：`kv`, `blobstore`, `cf_d1`, `d1`, `nats_utils`, `event_monitor`
   - 通信：`mail`
   - 调度：`crontab`, `task_queue`
   - IM：`dingtalk_stream`, `feishu`, `wechat`, `telegram`

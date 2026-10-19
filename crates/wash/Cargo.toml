@@ -75,6 +75,7 @@ wasm-pkg-core = { workspace = true }
 wash-runtime = { workspace = true, features = ["washlet", "oci", "wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "wasmcloud-postgres", "wasi-otel", "wasmcloud-nats", "wasm_component_model_implements"] }
 wit-component = { workspace = true }
 custom_plugin_cf_d1 = { path = "../custom_plugin_cf_d1" }
+custom_plugin_d1 = { path = "../custom_plugin_d1" }
 custom_plugin_mail = { path = "../custom_plugin_mail" }
 custom_plugin_crontab = { path = "../custom_plugin_crontab" }
 custom_plugin_dingtalk_stream = { path = "../custom_plugin_dingtalk_stream" }

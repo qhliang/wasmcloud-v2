@@ -3,6 +3,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use anyhow::Context as _;
 use clap::Args;
 use custom_plugin_cf_d1::CloudflareD1;
+use custom_plugin_d1::D1Table;
 use custom_plugin_event_monitor::EventMonitor;
 use tracing::info;
 use wash_runtime::{
@@ -855,6 +856,10 @@ impl CliCommand for HostCommand {
         // Enable Cloudflare D1 plugin (always loaded by default)
         cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(CloudflareD1::new()))?;
         tracing::info!("Cloudflare D1 plugin enabled");
+
+        // Enable structured D1 table-data plugin (always loaded by default)
+        cluster_host_builder = cluster_host_builder.with_plugin(Arc::new(D1Table::new()))?;
+        tracing::info!("D1 table plugin enabled");
 
         // Enable crontab plugin
         cluster_host_builder =

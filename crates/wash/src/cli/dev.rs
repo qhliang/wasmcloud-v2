@@ -314,6 +314,10 @@ impl CliCommand for DevCommand {
             host_builder.with_plugin(Arc::new(custom_plugin_cf_d1::CloudflareD1::new()))?;
         debug!("Cloudflare D1 plugin enabled");
 
+        // Enable structured D1 table-data plugin (always loaded by default)
+        host_builder = host_builder.with_plugin(Arc::new(custom_plugin_d1::D1Table::new()))?;
+        debug!("D1 table plugin enabled");
+
         // Enable crontab plugin
         host_builder = host_builder.with_plugin(Arc::new(custom_plugin_crontab::Crontab::new()))?;
         debug!("Crontab plugin enabled");

@@ -6,6 +6,7 @@ members = [
     "crates/wash-runtime",
     "crates/wash",
     "crates/custom_plugin_cf_d1",
+    "crates/custom_plugin_d1",
     "crates/custom_plugin_mail",
     "crates/custom_plugin_crontab",
     "crates/custom_plugin_dingtalk_stream",
