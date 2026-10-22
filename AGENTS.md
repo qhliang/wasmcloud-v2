@@ -62,11 +62,11 @@ ACR**（fork 定制）。两个 registry 的 tag 方案必须保持一致、统�
 
 | registry | tag | 说明 |
 | --- | --- | --- |
-| GHCR + ACR | `sha-<40 位 commit sha>` | 多架构 manifest list，**部署按它引用**（`git rev-parse HEAD` 直接推导） |
+| GHCR + ACR | `sha-<40 位 commit sha>` | manifest list，**部署按它引用**（`git rev-parse HEAD` 直接推导） |
 | GHCR + ACR | `canary` | 移动 tag，每次 main push 覆盖 |
-| 仅 ACR | `sha-<commit>-arm64` / `-amd64` | 单架构副本；`canary-publish` 有 e2e 门禁，这是未过门禁时的兜底 |
+| 仅 ACR | `sha-<commit>-amd64` | 单架构副本；`canary-publish` 未过门禁时的兜底 |
 
-- 落地位置：per-arch job 的 `Copy wash image to Aliyun ACR` 步骤落带架构后缀的单架构 tag；
+- 落地位置：`wash-image-amd64` 的 `Copy wash image to Aliyun ACR` 步骤落带架构后缀的单架构 tag；
   `canary-publish` 里 `Create manifest list and push tags` 打 GHCR 的 `sha-<sha>` + `canary`，
   紧随其后的 `Create ACR manifest list and push tags` 打 ACR 的同名两个 tag（源用 ACR 本地 digest，
   不依赖跨 registry 拷贝）。
@@ -80,6 +80,32 @@ ACR**（fork 定制）。两个 registry 的 tag 方案必须保持一致、统�
 - ⚠️ 该定制曾在上游 v2.9.0 合并（commit `991e4ebfb`）解决冲突时被整段冲掉，随后 `f6f4a2a7a`
   只恢复了 digest 版本，导致 ACR 上一度没有任何可用 commit 引用的 tag。**再合并 upstream 时务必
   对照本表核对 `wash.yml` 的 tag 方案是否还在。**
+
+### CI 覆盖范围（2026-10-19 精简后）
+
+`wash.yml` 已裁剪到只剩 Linux x86_64：
+
+| job | 说明 |
+| --- | --- |
+| `changes` | PR 路径过滤 |
+| `check` | 构建 + 全量测试（**只有 ubuntu-latest**；macOS/Windows 矩阵已删） |
+| `lint` | fmt / clippy / machete |
+| `wash-image-amd64` | 构建并推送 amd64 镜像（main only） |
+| `canary-publish` | 组装 manifest，打 `canary` + `sha-<sha>`（main only） |
+| `canary-binaries` | 交叉编译发布二进制，**只有 `x86_64-unknown-linux-gnu`** |
+| `gate` | 汇总门禁 |
+
+⚠️ **代价须知**：
+
+- **不再产出 musl / aarch64 / s390x / darwin / windows 二进制**。`release-tag.yml`（当前为
+  `.not-run` 状态）用 `wash-x86_64-*` + `wash-aarch64-*` 两个 pattern 下载产物，重新启用前必须
+  改成只取 `wash-x86_64-unknown-linux-gnu`。
+- **CI 内不再有任何集群级 e2e**。原 `runtime-operator-e2e` / `e2e-fixtures` /
+  `wash-image-all-features` 三个 arm64 job 已删除，kind 集群不再被拉起，
+  `host-component-plugins` 等 all-features 特性只剩 `check`/`lint` 的**编译层**覆盖，
+  运行时行为无自动化验证。
+- **`canary` 清单退化为 amd64 单架构**。部署集群是 amd64，故当前无碍；若将来要支持 arm64
+  节点，需把 arm64 的镜像构建腿加回来。
 
 ## 新增/修改 custom plugin 清单
 
