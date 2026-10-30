@@ -1925,6 +1925,7 @@ dependencies = [
  "anyhow",
  "async-nats",
  "nkeys",
+ "wash-nats-tls",
 ]
 
 [[package]]
@@ -8345,6 +8346,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wash-nats-tls"
+version = "2.9.1"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "rustls-native-certs 0.8.4",
+]
+
+[[package]]
 name = "wash-runtime"
 version = "2.9.1"
 dependencies = [
@@ -8424,6 +8434,7 @@ dependencies = [
  "ulid",
  "url",
  "uuid",
+ "wash-nats-tls",
  "wasi-webgpu-wasmtime",
  "wasmtime",
  "wasmtime-wasi",

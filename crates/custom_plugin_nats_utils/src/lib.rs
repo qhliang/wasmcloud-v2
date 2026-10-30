@@ -12,8 +12,8 @@ const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 10;
 /// - `nats_jwt` + `nats_nkey_seed` — JWT/NKey authentication
 /// - `nats_token` — token authentication
 /// - `nats_user` + `nats_password` — username/password authentication
-/// - `nats_tls_ca` — path to CA certificate
-/// - `nats_tls_cert` + `nats_tls_key` — client certificate and key
+/// - `nats_tls_ca` — CA certificate: file path **or** PEM content
+/// - `nats_tls_cert` + `nats_tls_key` — client certificate and key: file paths **or** PEM content
 pub fn build_nats_connect_options(
     config: &HashMap<String, String>,
 ) -> anyhow::Result<async_nats::ConnectOptions> {
@@ -53,15 +53,6 @@ pub fn build_nats_connect_options(
         opts = opts.user_and_password(user.clone(), password.clone());
     }
 
-    // TLS options
-    if let Some(ca_path) = config.get("nats_tls_ca") {
-        opts = opts.add_root_certificates(ca_path.into());
-    }
-    if let (Some(cert_path), Some(key_path)) =
-        (config.get("nats_tls_cert"), config.get("nats_tls_key"))
-    {
-        opts = opts.add_client_certificate(cert_path.into(), key_path.into());
-    }
-
-    Ok(opts)
+    // TLS 选项：值可以是文件路径或 PEM 内容（Secret 直出），见 wash-nats-tls。
+    wash_nats_tls::apply_tls(config, opts)
 }

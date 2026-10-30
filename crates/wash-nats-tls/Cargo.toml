@@ -1,0 +1,18 @@
+[package]
+name = "wash-nats-tls"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+description = "Shared NATS TLS config resolution for wasmCloud host plugins (path or PEM content)"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+async-nats = { workspace = true }
+rustls-native-certs = { workspace = true }

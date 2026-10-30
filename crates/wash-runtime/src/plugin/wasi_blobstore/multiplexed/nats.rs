@@ -252,13 +252,9 @@ impl BackendProvider<BlobId> for NatsBlobProvider {
             opts = opts.user_and_password(user.clone(), password.clone());
         }
 
-        // TLS
-        if let Some(ca_path) = config.get("nats_tls_ca") {
-            opts = opts.add_root_certificates(ca_path.into());
-        }
-        if let (Some(cert), Some(key)) = (config.get("nats_tls_cert"), config.get("nats_tls_key")) {
-            opts = opts.add_client_certificate(cert.into(), key.into());
-        }
+        // TLS：键值可以是**文件路径**，也可以是 PEM 内容（Secret 直接注入）。
+        // 见 `wash-nats-tls`：混用也可以，含内容的走内存 rustls 配置。
+        let opts = wash_nats_tls::apply_tls(config, opts)?;
 
         let client = opts.connect(url).await?;
         let context = async_nats::jetstream::new(client);

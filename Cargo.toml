@@ -4,6 +4,7 @@ default-members = ["crates/wash"]
 members = [
     "crates/bench-tools",
     "crates/wash-runtime",
+    "crates/wash-nats-tls",
     "crates/wash",
     "crates/custom_plugin_cf_d1",
     "crates/custom_plugin_d1",

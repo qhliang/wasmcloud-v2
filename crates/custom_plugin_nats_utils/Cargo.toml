@@ -16,3 +16,4 @@ workspace = true
 anyhow = { workspace = true }
 async-nats = { workspace = true }
 nkeys = "0.4"
+wash-nats-tls = { path = "../wash-nats-tls" }
